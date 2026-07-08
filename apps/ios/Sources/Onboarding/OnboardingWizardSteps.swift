@@ -280,73 +280,123 @@ struct OnboardingIntroStep: View {
 }
 
 struct OnboardingWelcomeStep: View {
-    let statusLine: String
     let isConnecting: Bool
     let onScanQRCode: () -> Void
     let onManualSetup: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
-        let statusText = self.statusLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        ZStack {
+            OpenClawBrand.welcomeCanvas
+                .ignoresSafeArea()
 
-        OnboardingActivationCanvas {
-            VStack(alignment: .leading, spacing: 0) {
-                OnboardingHeroHeader(
-                    title: "Connect Gateway",
-                    subtitle: nil)
-                    .padding(.top, 18)
+            if self.colorScheme == .dark {
+                Image("OnboardingDustCloud")
+                    .resizable()
+                    .scaledToFill()
+                    .ignoresSafeArea()
+                    .accessibilityHidden(true)
 
-                VStack(spacing: 36) {
-                    VStack(spacing: 14) {
-                        OnboardingWelcomePrompt(text: "Run this on your gateway host and scan the code")
+                Image("OnboardingStars")
+                    .resizable()
+                    .scaledToFill()
+                    .ignoresSafeArea()
+                    .accessibilityHidden(true)
+            }
 
-                        OnboardingCommandChip()
+            VStack(spacing: 21) {
+                Image("openclaw mascot")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 146, height: 146)
+                    .shadow(color: OpenClawBrand.welcomeGlow, radius: 10, x: 0, y: 0)
+                    .accessibilityHidden(true)
 
+                VStack(spacing: 31) {
+                    Text("Run \u{201C}openclaw qr\u{201D} in your terminal.")
+                        .font(.system(size: 30, weight: .semibold))
+                        .foregroundStyle(Color.primary.opacity(0.9))
+                        .multilineTextAlignment(.center)
+                        .frame(width: 266)
+
+                    VStack(spacing: 13) {
                         Button(action: self.onScanQRCode) {
-                            if self.isConnecting {
-                                HStack(spacing: 8) {
+                            HStack(spacing: 7) {
+                                if self.isConnecting {
                                     ProgressView()
                                         .progressViewStyle(.circular)
-                                        .tint(OpenClawBrand.activationPrimaryActionText)
+                                        .tint(.white)
                                     Text("Connecting…")
-                                        .font(OpenClawType.subheadSemiBold)
+                                        .font(.system(size: 17))
+                                } else {
+                                    Image("QRCodeGlyph")
+                                        .renderingMode(.template)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: 24, height: 24)
+                                    Text("Scan QR Code")
+                                        .font(.system(size: 17))
                                 }
-                            } else {
-                                Text("Scan QR")
-                                    .font(OpenClawType.subheadSemiBold)
                             }
                         }
-                        .buttonStyle(OnboardingPrimaryButtonStyle())
+                        .buttonStyle(OnboardingWelcomePillButtonStyle(
+                            fill: OpenClawBrand.welcomePrimaryAction,
+                            foreground: .white))
                         .disabled(self.isConnecting)
-                    }
-
-                    VStack(spacing: 14) {
-                        OnboardingWelcomePrompt(text: "or")
 
                         Button(action: self.onManualSetup) {
-                            Text("Connect Manually")
-                                .font(OpenClawType.subheadSemiBold)
+                            Text("Set Up Manually")
+                                .font(.system(size: 17))
                         }
-                        .buttonStyle(OpenClawSecondaryActionButtonStyle(height: 54, shadowOpacity: 0.018))
+                        .buttonStyle(OnboardingWelcomePillButtonStyle(
+                            fill: OpenClawBrand.welcomeSecondaryAction,
+                            foreground: OpenClawBrand.welcomeSecondaryActionText))
                         .disabled(self.isConnecting)
                     }
                 }
-                .padding(.top, 46)
-
-                if !statusText.isEmpty {
-                    Text(verbatim: statusText)
-                        .font(OpenClawType.footnote)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 6)
-                        .padding(.top, 14)
-                        .transition(.opacity)
-                }
-
-                Spacer(minLength: 40)
             }
-            .animation(.smooth(duration: 0.18), value: statusText)
+            .padding(.horizontal, 24)
+            .frame(maxWidth: OnboardingVisual.maxWidth)
         }
+        .overlay(alignment: .bottom) {
+            Text(self.footerText)
+                .font(.system(size: 14))
+                .foregroundStyle(Color.primary.opacity(0.7))
+                .multilineTextAlignment(.center)
+                .frame(width: 289)
+                .padding(.bottom, 24)
+        }
+    }
+
+    private var footerText: AttributedString {
+        let head = AttributedString("If you don\u{2019}t understand what this means, please go ")
+        var link = AttributedString("here")
+        link.link = URL(string: "https://openclaw.ai/")
+        link.foregroundColor = OpenClawBrand.welcomeLink
+        link.underlineStyle = .single
+        let tail = AttributedString(" to install OpenClaw.")
+        return head + link + tail
+    }
+}
+
+private struct OnboardingWelcomePillButtonStyle: ButtonStyle {
+    let fill: Color
+    let foreground: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(self.foreground)
+            .frame(maxWidth: .infinity)
+            .frame(height: 50)
+            .background {
+                Capsule(style: .continuous)
+                    .fill(self.fill)
+            }
+            .contentShape(Capsule(style: .continuous))
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .animation(.smooth(duration: 0.14), value: configuration.isPressed)
     }
 }
 

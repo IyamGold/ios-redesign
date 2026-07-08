@@ -129,6 +129,14 @@ enum OpenClawBrand {
         dark: (255, 210, 205)).withAlphaComponent(0.13))
     static let activationGlow = Color(uiColor: adaptiveUIColor(light: (228, 78, 67), dark: (255, 111, 96)))
 
+    // Redesigned onboarding welcome step
+    static let welcomeCanvas = Color(uiColor: adaptiveUIColor(light: (245, 244, 250), dark: (0, 0, 0)))
+    static let welcomePrimaryAction = Color(uiColor: adaptiveUIColor(light: (195, 63, 51), dark: (195, 63, 51)))
+    static let welcomeSecondaryAction = Color(uiColor: adaptiveUIColor(light: (255, 255, 255), dark: (28, 28, 30)))
+    static let welcomeSecondaryActionText = Color(uiColor: adaptiveUIColor(light: (0, 0, 0), dark: (255, 255, 255)))
+    static let welcomeGlow = Color(red: 195 / 255, green: 63 / 255, blue: 51 / 255).opacity(0.5)
+    static let welcomeLink = Color(uiColor: adaptiveUIColor(light: (37, 99, 235), dark: (37, 99, 235)))
+
     static var sheetBackground: LinearGradient {
         LinearGradient(
             colors: [

@@ -1275,7 +1275,9 @@ extension RootTabs {
         case .none:
             self.maybeRequestLocalNetworkAccess(reason: "root_appear")
         case .onboarding:
-            self.onboardingAllowSkip = true
+            // First-run onboarding is mandatory: no close affordance until the
+            // gateway is connected. Re-opening from settings (force) allows skip.
+            self.onboardingAllowSkip = false
             self.showOnboarding = true
         case .settings:
             self.didAutoOpenSettings = true
@@ -1285,11 +1287,17 @@ extension RootTabs {
     }
 
     private func hasExistingGatewayConfig() -> Bool {
-        if self.appModel.activeGatewayConnectConfig != nil { return true }
-        if GatewaySettingsStore.activeGatewayEntry() != nil { return true }
+        if self.appModel.activeGatewayConnectConfig != nil {
+            return true
+        }
+        if GatewaySettingsStore.activeGatewayEntry() != nil {
+            return true
+        }
 
         let preferredStableID = self.preferredGatewayStableID.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !preferredStableID.isEmpty { return true }
+        if !preferredStableID.isEmpty {
+            return true
+        }
 
         let manualHost = self.manualGatewayHost.trimmingCharacters(in: .whitespacesAndNewlines)
         return self.manualGatewayEnabled && !manualHost.isEmpty
