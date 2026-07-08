@@ -702,7 +702,9 @@ struct IPadWorkboardScreen: View {
             self.errorText = nil
             return
         }
-        if self.isLoading { return }
+        if self.isLoading {
+            return
+        }
 
         self.isLoading = true
         self.errorText = nil

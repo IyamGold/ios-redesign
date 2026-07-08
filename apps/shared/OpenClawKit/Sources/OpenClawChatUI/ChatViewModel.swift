@@ -174,11 +174,13 @@ public final class OpenClawChatViewModel {
     private var latestAppliedHistoryRequestID: UInt64 = 0
     private var historyMutationGeneration: UInt64 = 0
 
+    // Pending-run timeout state is owned here but armed/cleared from
+    // ChatViewModel+PendingRunTimeout.swift, so it stays internal, not private.
     @ObservationIgnored
-    private nonisolated(unsafe) var pendingRunTimeoutTasks: [String: Task<Void, Never>] = [:]
-    private var nextPendingRunTimeoutArmID: UInt64 = 0
-    private var pendingRunTimeoutArmIDs: [String: UInt64] = [:]
-    private let pendingRunTimeoutMs: UInt64 = 120_000
+    nonisolated(unsafe) var pendingRunTimeoutTasks: [String: Task<Void, Never>] = [:]
+    var nextPendingRunTimeoutArmID: UInt64 = 0
+    var pendingRunTimeoutArmIDs: [String: UInt64] = [:]
+    let pendingRunTimeoutMs: UInt64 = 120_000
     private static let postSendRefreshDelaysMs: [UInt64] = [
         1500,
         4000,
@@ -299,7 +301,9 @@ public final class OpenClawChatViewModel {
         self.eventTask = Task { [weak self, transport] in
             let stream = transport.events()
             for await evt in stream {
-                if Task.isCancelled { return }
+                if Task.isCancelled {
+                    return
+                }
                 await MainActor.run { [weak self] in
                     self?.handleTransportEvent(evt)
                 }
@@ -454,7 +458,9 @@ public final class OpenClawChatViewModel {
             (agentChanged && self.usesMutableAgentRouting) ||
             contractRoutingChanged
         guard bootstrapIdentityChanged else {
-            if contractChanged, self.healthOK { flushOutboxIfNeeded() }
+            if contractChanged, self.healthOK {
+                flushOutboxIfNeeded()
+            }
             return
         }
         // Restart when this key depends on a changed routing value so cleared
@@ -513,7 +519,9 @@ public final class OpenClawChatViewModel {
     }
 
     private func usesMutableContractRouting(for contract: String?) -> Bool {
-        if self.usesMutableAgentRouting { return true }
+        if self.usesMutableAgentRouting {
+            return true
+        }
         let parts = self.sessionKey
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
@@ -638,7 +646,7 @@ public final class OpenClawChatViewModel {
         self.markTimelineChanged()
     }
 
-    private func logDiagnostic(_ message: String) {
+    func logDiagnostic(_ message: String) {
         self.diagnosticsLog?(message)
     }
 
@@ -1096,7 +1104,9 @@ public final class OpenClawChatViewModel {
                 return (rank, index, command)
             }
             .sorted {
-                if $0.0 != $1.0 { return $0.0 < $1.0 }
+                if $0.0 != $1.0 {
+                    return $0.0 < $1.0
+                }
                 return $0.1 < $1.1
             }
             .map(\.2)
@@ -1163,17 +1173,23 @@ public final class OpenClawChatViewModel {
 
     private func handleLocalSlashCommandIfNeeded(_ command: String, draftInput: String) async -> Bool {
         if command == "/new" {
-            if self.input == draftInput { self.input = "" }
+            if self.input == draftInput {
+                self.input = ""
+            }
             await self.performStartNewSession(worktree: false)
             return true
         }
         if Self.resetTriggers.contains(command) {
-            if self.input == draftInput { self.input = "" }
+            if self.input == draftInput {
+                self.input = ""
+            }
             await self.performReset()
             return true
         }
         if Self.compactTriggers.contains(command) {
-            if self.input == draftInput { self.input = "" }
+            if self.input == draftInput {
+                self.input = ""
+            }
             await self.performCompact()
             return true
         }
@@ -1380,7 +1396,9 @@ public final class OpenClawChatViewModel {
         self.runMessageScopesByRunID[runId] = currentRunMessageScope()
 
         // Clear input immediately for responsive UX (before network await)
-        if self.input == draftInput { self.input = "" }
+        if self.input == draftInput {
+            self.input = ""
+        }
         let sentAttachmentIDs = Set(draftAttachments.map(\.id))
         self.attachments.removeAll { sentAttachmentIDs.contains($0.id) }
 
@@ -1533,7 +1551,9 @@ public final class OpenClawChatViewModel {
     func fetchSessions(limit: Int?, sessionSnapshot: SessionSnapshot? = nil) async {
         do {
             let res = try await transport.listSessions(limit: limit, search: nil, archived: false)
-            if let sessionSnapshot, !self.isCurrentSession(sessionSnapshot) { return }
+            if let sessionSnapshot, !self.isCurrentSession(sessionSnapshot) {
+                return
+            }
             let organized = OpenClawChatSessionListOrganizer.organize(res.sessions)
             self.sessions = organized
             self.sessionDefaults = res.defaults
@@ -1679,7 +1699,9 @@ public final class OpenClawChatViewModel {
     private func fetchModels(sessionSnapshot: SessionSnapshot? = nil) async {
         do {
             let modelChoices = try await transport.listModels()
-            if let sessionSnapshot, !self.isCurrentSession(sessionSnapshot) { return }
+            if let sessionSnapshot, !self.isCurrentSession(sessionSnapshot) {
+                return
+            }
             self.modelChoices = modelChoices
             self.syncSelectedModel()
             syncThinkingLevelOptions()
@@ -2779,79 +2801,6 @@ public final class OpenClawChatViewModel {
         } catch {
             chatUILogger.error("refresh history failed \(error.localizedDescription, privacy: .public)")
             return (false, false, false, false)
-        }
-    }
-
-    private func armPendingRunTimeout(runId: String) {
-        self.pendingRunTimeoutTasks[runId]?.cancel()
-        self.nextPendingRunTimeoutArmID &+= 1
-        let armID = self.nextPendingRunTimeoutArmID
-        self.pendingRunTimeoutArmIDs[runId] = armID
-        self.pendingRunTimeoutTasks[runId] = Task { [weak self] in
-            let timeoutMs = await MainActor.run { self?.pendingRunTimeoutMs ?? 0 }
-            do {
-                try await Task.sleep(nanoseconds: timeoutMs * 1_000_000)
-            } catch {
-                // Rearming or completing a run cancels this task. Never let the
-                // retired timeout clear the still-active replacement owner.
-                return
-            }
-            guard !Task.isCancelled else { return }
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                guard self.pendingRunTimeoutArmIDs[runId] == armID else { return }
-                guard self.pendingRuns.contains(runId) else { return }
-                self.logDiagnostic(
-                    "chat.ui pending timeout sessionKey=\(self.sessionKey) "
-                        + "runId=\(runId)")
-                self.errorText = "Timed out waiting for a reply; try again or refresh."
-                self.clearPendingRun(runId, hapticEvent: .runFailed)
-            }
-        }
-    }
-
-    private func clearPendingRun(
-        _ runId: String,
-        hapticEvent: OpenClawChatHaptics.Event? = nil)
-    {
-        let wasPending = self.pendingRuns.contains(runId)
-        self.pendingRuns.remove(runId)
-        self.pendingLocalUserEchoMessageIDsByRunID[runId] = nil
-        self.pendingRunTimeoutTasks[runId]?.cancel()
-        self.pendingRunTimeoutTasks[runId] = nil
-        self.pendingRunTimeoutArmIDs[runId] = nil
-        if wasPending {
-            self.logDiagnostic(
-                "chat.ui pending cleared sessionKey=\(self.sessionKey) "
-                    + "runId=\(runId)")
-            if self.pendingRuns.isEmpty, let hapticEvent {
-                self.haptics.perform(hapticEvent)
-            }
-        }
-    }
-
-    private func clearPendingRuns(
-        reason: String?,
-        hapticEvent: OpenClawChatHaptics.Event? = nil)
-    {
-        let runIds = Array(pendingRuns)
-        for runId in self.pendingRuns {
-            self.pendingRunTimeoutTasks[runId]?.cancel()
-        }
-        self.pendingRunTimeoutTasks.removeAll()
-        self.pendingRunTimeoutArmIDs.removeAll()
-        self.pendingRuns.removeAll()
-        self.pendingLocalUserEchoMessageIDsByRunID.removeAll()
-        if !runIds.isEmpty, let hapticEvent {
-            self.haptics.perform(hapticEvent)
-        }
-        if let reason, !reason.isEmpty {
-            self.errorText = reason
-            for runId in runIds {
-                self.logDiagnostic(
-                    "chat.ui pending cleared sessionKey=\(self.sessionKey) "
-                        + "runId=\(runId) reason=\(reason)")
-            }
         }
     }
 }

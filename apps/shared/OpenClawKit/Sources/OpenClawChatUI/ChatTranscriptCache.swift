@@ -832,7 +832,9 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
     @discardableResult
     public func recoverInterruptedSends() async -> Bool {
         guard !self.isRetired else { return false }
-        if self.hasRecoveredInterruptedSends { return true }
+        if self.hasRecoveredInterruptedSends {
+            return true
+        }
         guard let db = await handle() else { return false }
         let recovered = self.execute(
             db,
@@ -1289,8 +1291,12 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
 
     private func handle() async -> OpaquePointer? {
         guard !self.isRetired else { return nil }
-        if let db { return db.raw }
-        if self.isBroken { return nil }
+        if let db {
+            return db.raw
+        }
+        if self.isBroken {
+            return nil
+        }
         #if os(iOS)
         // Complete protection intentionally makes the cache unavailable while
         // locked. Treat that as a temporary miss, never as corruption.
@@ -1621,7 +1627,9 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
         defer { sqlite3_finalize(statement) }
         while sqlite3_step(statement) == SQLITE_ROW {
             guard let name = sqlite3_column_text(statement, 1) else { continue }
-            if String(cString: name) == columnName { return true }
+            if String(cString: name) == columnName {
+                return true
+            }
         }
         return false
     }

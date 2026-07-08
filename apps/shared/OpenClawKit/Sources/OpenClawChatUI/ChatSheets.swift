@@ -103,8 +103,11 @@ struct ChatSessionsSheet: View {
                 "Rename Session",
                 isPresented: Binding(
                     get: { self.renameTarget != nil },
-                    set: { if !$0 { self.renameTarget = nil } }))
-            {
+                    set: {
+                        if !$0 {
+                            self.renameTarget = nil
+                        }
+                    })) {
                 TextField("Session name", text: self.$renameText)
                 Button("Rename") {
                     if let target = self.renameTarget {

@@ -283,8 +283,11 @@ struct SettingsProTab: View {
                 "QR Scanner Unavailable",
                 isPresented: Binding(
                     get: { self.scannerError != nil },
-                    set: { if !$0 { self.scannerError = nil } }))
-            {
+                    set: {
+                        if !$0 {
+                            self.scannerError = nil
+                        }
+                    })) {
                 Button(role: .cancel) {} label: {
                     Text("OK")
                         .font(OpenClawType.subheadSemiBold)
@@ -294,11 +297,15 @@ struct SettingsProTab: View {
                     .font(OpenClawType.subhead)
             }
             .confirmationDialog(
-                    "Forget \(self.pendingForgetGateway?.name ?? "gateway")?",
-                    isPresented: Binding(
-                        get: { self.pendingForgetGateway != nil },
-                        set: { if !$0 { self.pendingForgetGateway = nil } }),
-                    titleVisibility: .visible)
+                "Forget \(self.pendingForgetGateway?.name ?? "gateway")?",
+                isPresented: Binding(
+                    get: { self.pendingForgetGateway != nil },
+                    set: {
+                        if !$0 {
+                            self.pendingForgetGateway = nil
+                        }
+                    }),
+                titleVisibility: .visible)
             {
                 Button(role: .destructive) {
                     self.forgetPendingGateway()
@@ -312,10 +319,10 @@ struct SettingsProTab: View {
                     Text("Cancel")
                         .font(OpenClawType.subheadSemiBold)
                 }
-                } message: {
-                    Text("This removes saved credentials, device access, TLS trust, and cached chats for this gateway.")
-                        .font(OpenClawType.subhead)
-                }
+            } message: {
+                Text("This removes saved credentials, device access, TLS trust, and cached chats for this gateway.")
+                    .font(OpenClawType.subhead)
+            }
     }
 
     private func applyGatewaySetupRequestIfNeeded() {

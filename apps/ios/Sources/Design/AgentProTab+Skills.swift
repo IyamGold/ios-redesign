@@ -223,7 +223,9 @@ extension AgentProTab {
     }
 
     var skillPolicySummary: String {
-        if appModel.isAppleReviewDemoModeEnabled { return "Demo mode keeps live skill changes disabled." }
+        if appModel.isAppleReviewDemoModeEnabled {
+            return "Demo mode keeps live skill changes disabled."
+        }
         guard gatewayConnected else { return "Connect a gateway to edit skills." }
         guard let filter = agentSkillFilter else {
             return "All available skills are allowed for this agent."
@@ -277,7 +279,9 @@ extension AgentProTab {
     func sortSkills(_ lhs: SkillStatusEntryLite, _ rhs: SkillStatusEntryLite) -> Bool {
         let lhsEnabled = self.isSkillAllowed(lhs)
         let rhsEnabled = self.isSkillAllowed(rhs)
-        if lhsEnabled != rhsEnabled { return lhsEnabled && !rhsEnabled }
+        if lhsEnabled != rhsEnabled {
+            return lhsEnabled && !rhsEnabled
+        }
         return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
     }
 

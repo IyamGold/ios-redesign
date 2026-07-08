@@ -1000,56 +1000,55 @@ struct OpenClawChatComposer: View {
     }
     #endif
 
+    @ViewBuilder
     private var sendButton: some View {
-        Group {
-            if self.viewModel.pendingRunCount > 0, !self.viewModel.hasDraftToSend {
-                Button {
-                    self.viewModel.abort()
-                } label: {
-                    if self.viewModel.isAborting {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Image(systemName: "stop.fill")
-                            .font(OpenClawChatTypography.display(size: 13, weight: .semibold, relativeTo: .caption))
-                    }
+        if self.viewModel.pendingRunCount > 0, !self.viewModel.hasDraftToSend {
+            Button {
+                self.viewModel.abort()
+            } label: {
+                if self.viewModel.isAborting {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "stop.fill")
+                        .font(OpenClawChatTypography.display(size: 13, weight: .semibold, relativeTo: .caption))
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white)
-                .frame(width: self.sendButtonSize, height: self.sendButtonSize)
-                .background(
-                    RoundedRectangle(cornerRadius: self.sendButtonCornerRadius, style: .continuous)
-                        .fill(OpenClawChatTheme.danger)
-                        .frame(width: self.sendButtonVisualSize, height: self.sendButtonVisualSize))
-                .contentShape(Rectangle())
-                .accessibilityLabel("Stop response")
-                .disabled(self.viewModel.isAborting)
-            } else {
-                Button {
-                    self.sendDraftIfEnabled()
-                } label: {
-                    if self.viewModel.isSending {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Image(systemName: "arrow.up")
-                            .font(OpenClawChatTypography.display(size: 13, weight: .semibold, relativeTo: .caption))
-                    }
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(self.sendButtonForeground)
-                .frame(width: self.sendButtonSize, height: self.sendButtonSize)
-                .background(
-                    RoundedRectangle(cornerRadius: self.sendButtonCornerRadius, style: .continuous)
-                        .fill(self.canSendMessage ? self.sendButtonFill : self.disabledSendButtonFill)
-                        .frame(width: self.sendButtonVisualSize, height: self.sendButtonVisualSize))
-                .overlay(
-                    RoundedRectangle(cornerRadius: self.sendButtonCornerRadius, style: .continuous)
-                        .strokeBorder(Color.white.opacity(self.sendButtonBorderOpacity), lineWidth: 1)
-                        .frame(width: self.sendButtonVisualSize, height: self.sendButtonVisualSize))
-                .contentShape(Rectangle())
-                .accessibilityLabel("Send message")
-                .accessibilityIdentifier("chat-send-message")
-                .disabled(!self.canSendMessage)
             }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .frame(width: self.sendButtonSize, height: self.sendButtonSize)
+            .background(
+                RoundedRectangle(cornerRadius: self.sendButtonCornerRadius, style: .continuous)
+                    .fill(OpenClawChatTheme.danger)
+                    .frame(width: self.sendButtonVisualSize, height: self.sendButtonVisualSize))
+            .contentShape(Rectangle())
+            .accessibilityLabel("Stop response")
+            .disabled(self.viewModel.isAborting)
+        } else {
+            Button {
+                self.sendDraftIfEnabled()
+            } label: {
+                if self.viewModel.isSending {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "arrow.up")
+                        .font(OpenClawChatTypography.display(size: 13, weight: .semibold, relativeTo: .caption))
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(self.sendButtonForeground)
+            .frame(width: self.sendButtonSize, height: self.sendButtonSize)
+            .background(
+                RoundedRectangle(cornerRadius: self.sendButtonCornerRadius, style: .continuous)
+                    .fill(self.canSendMessage ? self.sendButtonFill : self.disabledSendButtonFill)
+                    .frame(width: self.sendButtonVisualSize, height: self.sendButtonVisualSize))
+            .overlay(
+                RoundedRectangle(cornerRadius: self.sendButtonCornerRadius, style: .continuous)
+                    .strokeBorder(Color.white.opacity(self.sendButtonBorderOpacity), lineWidth: 1)
+                    .frame(width: self.sendButtonVisualSize, height: self.sendButtonVisualSize))
+            .contentShape(Rectangle())
+            .accessibilityLabel("Send message")
+            .accessibilityIdentifier("chat-send-message")
+            .disabled(!self.canSendMessage)
         }
     }
 
@@ -1362,7 +1361,9 @@ private struct ChatComposerTextView: NSViewRepresentable {
         // coordinator never reported is programmatic (send-clear, slash
         // completion) and must reach the view even mid-edit.
         let isEcho = context.coordinator.lastReportedText == self.text
-        if isEditing, isEcho { return }
+        if isEditing, isEcho {
+            return
+        }
 
         if textView.string != self.text {
             context.coordinator.isProgrammaticUpdate = true

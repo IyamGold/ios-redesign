@@ -94,17 +94,25 @@ public enum WakeWordGate {
             guard count > 0, tokens.count > count else { continue }
             for i in 0...(tokens.count - count - 1) {
                 let matched = (0..<count).allSatisfy { tokens[i + $0].normalized == trigger.tokens[$0] }
-                if !matched { continue }
+                if !matched {
+                    continue
+                }
 
                 let triggerEnd = tokens[i + count - 1].end
                 let nextToken = tokens[i + count]
                 let gap = nextToken.start - triggerEnd
-                if gap < config.minPostTriggerGap { continue }
+                if gap < config.minPostTriggerGap {
+                    continue
+                }
 
                 let endIndex = i + count - 1
                 if let best {
-                    if endIndex < best.endIndex { continue }
-                    if endIndex == best.endIndex, count <= best.tokenCount { continue }
+                    if endIndex < best.endIndex {
+                        continue
+                    }
+                    if endIndex == best.endIndex, count <= best.tokenCount {
+                        continue
+                    }
                 }
 
                 best = MatchCandidate(
@@ -138,7 +146,9 @@ public enum WakeWordGate {
         commandWords.reserveCapacity(segments.count)
         for segment in segments where segment.start >= threshold {
             let normalized = normalizeToken(segment.text)
-            if normalized.isEmpty { continue }
+            if normalized.isEmpty {
+                continue
+            }
             commandWords.append(segment.text)
         }
         return commandWords.joined(separator: " ").trimmingCharacters(in: Self.whitespaceAndPunctuation)
@@ -149,8 +159,12 @@ public enum WakeWordGate {
         let normalized = text.lowercased()
         for trigger in triggers {
             let token = trigger.trimmingCharacters(in: self.whitespaceAndPunctuation).lowercased()
-            if token.isEmpty { continue }
-            if normalized.contains(token) { return true }
+            if token.isEmpty {
+                continue
+            }
+            if normalized.contains(token) {
+                return true
+            }
         }
         return false
     }
@@ -172,7 +186,9 @@ public enum WakeWordGate {
                 .split(whereSeparator: { $0.isWhitespace })
                 .map { self.normalizeToken(String($0)) }
                 .filter { !$0.isEmpty }
-            if tokens.isEmpty { continue }
+            if tokens.isEmpty {
+                continue
+            }
             output.append(TriggerTokens(source: tokens.joined(separator: " "), tokens: tokens))
         }
         return output

@@ -48,7 +48,9 @@ final class PhotoLibraryService: PhotosServicing {
         let formatter = ISO8601DateFormatter()
 
         assets.enumerateObjects { asset, _, stop in
-            if results.count >= limit { stop.pointee = true; return }
+            if results.count >= limit {
+                stop.pointee = true; return
+            }
             if let payload = try? Self.renderAsset(
                 asset,
                 maxWidth: maxWidth,

@@ -41,7 +41,9 @@ final class LocationService: NSObject, CLLocationManagerDelegate, LocationServic
             let updated = await self.requestAuthorization(requiresDeterminedStatus: true) {
                 self.manager.requestWhenInUseAuthorization()
             }
-            if mode != .always { return updated }
+            if mode != .always {
+                return updated
+            }
         }
 
         if mode == .always {
