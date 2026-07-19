@@ -9,19 +9,11 @@ private enum OnboardingStep: Int, CaseIterable {
     case intro
     case welcome
     case mode
-    case connect
-    case auth
+    case feedback
     case success
 
     var previous: Self? {
         Self(rawValue: rawValue - 1)
-    }
-
-    /// Progress label for the manual setup flow (mode → connect → auth → success).
-    var manualProgressTitle: String {
-        let manualSteps: [OnboardingStep] = [.mode, .connect, .auth, .success]
-        guard let idx = manualSteps.firstIndex(of: self) else { return "" }
-        return "Step \(idx + 1) of \(manualSteps.count)"
     }
 
     var title: LocalizedStringKey {
@@ -29,14 +21,14 @@ private enum OnboardingStep: Int, CaseIterable {
         case .intro: "Welcome"
         case .welcome: "Connect Gateway"
         case .mode: "Gateway Setup"
-        case .connect: "Gateway Details"
-        case .auth: "Gateway Status"
+        case .feedback: ""
         case .success: "Connected"
         }
     }
 
     var canGoBack: Bool {
         self != .intro && self != .welcome && self != .success
+            && self != .mode && self != .feedback
     }
 }
 
@@ -105,6 +97,17 @@ struct OnboardingWizardView: View {
     @State private var setupCode: String = ""
     @State private var setupCodeStatus: String?
     @State private var setupAttemptID: UUID?
+    @State private var manualEndpointOverride: (host: String, port: String)?
+    @State private var feedbackContent: OnboardingFeedbackContent = .loading
+    @State private var feedbackShownAt = Date()
+    @State private var feedbackCommitTask: Task<Void, Never>?
+    @State private var feedbackTimeoutTask: Task<Void, Never>?
+    @State private var loadingDidFail = false
+    @State private var credentialSubmitted = false
+    /// Guards the one-shot auto-resubmit that fires when the gateway reveals its auth method after a
+    /// credential was already submitted into the other slot. Reset on each fresh user submission.
+    @State private var autoRetriedAfterMethodFlip = false
+    @State private var feedbackReturnStep: OnboardingStep = .mode
     @FocusState private var focusedField: OnboardingFocusedField?
     private static let pairingAutoResumeTicker = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
 
@@ -130,6 +133,7 @@ struct OnboardingWizardView: View {
 
     private var isFullScreenStep: Bool {
         self.step == .intro || self.step == .welcome || self.step == .success
+            || self.step == .mode || self.step == .feedback
     }
 
     private var currentProblem: GatewayConnectionProblem? {
@@ -142,10 +146,26 @@ struct OnboardingWizardView: View {
                 guard newValue == ScenePhase.active else { return }
                 self.applyPendingGatewaySetupLinkIfNeeded()
                 self.attemptAutomaticPairingResumeIfNeeded()
+                if self.step == .feedback, case .installTailscale = self.feedbackContent {
+                    Task { await self.retryLastAttempt(silent: true) }
+                }
             }
             .onReceive(Self.pairingAutoResumeTicker) { _ in
                 self.attemptAutomaticPairingResumeIfNeeded()
             }
+            .onChange(of: self.issue) { _, _ in self.refreshOnboardingFeedback() }
+            .onChange(of: self.connectingGatewayID) { _, _ in self.refreshOnboardingFeedback() }
+            .onChange(of: self.gatewayController.pendingTrustPrompt == nil) { wasCleared, isCleared in
+                guard isCleared, !wasCleared else { return }
+                self.failFeedbackIfTrustPromptDismissedWithoutConnecting()
+            }
+            .onChange(of: self.feedbackContent) { oldValue, newValue in
+                self.handleFeedbackContentChange(from: oldValue, to: newValue)
+            }
+            // Host the TLS trust prompt on its own layer: SwiftUI honors only one `.alert` per view,
+            // and the scanner-error alert on `lifecycleContent` would otherwise shadow it, leaving a
+            // TLS connect parked at "Verify gateway TLS fingerprint" with no way to approve.
+            .background { Color.clear.gatewayTrustPromptAlert() }
     }
 
     private var lifecycleContent: some View {
@@ -156,43 +176,17 @@ struct OnboardingWizardView: View {
                     self.introStep
                 case .welcome:
                     self.welcomeStep
+                case .mode:
+                    self.setupStep
+                case .feedback:
+                    self.feedbackStep
                 case .success:
                     self.successStep
-                default:
-                    Form {
-                        switch self.step {
-                        case .mode:
-                            self.modeStep
-                        case .connect:
-                            self.connectStep
-                        case .auth:
-                            self.authStep
-                        default:
-                            EmptyView()
-                        }
-                    }
-                    .formStyle(.grouped)
-                    .scrollContentBackground(.hidden)
-                    .background(Color(uiColor: .systemGroupedBackground))
-                    .scrollDismissesKeyboard(.interactively)
                 }
             }
             .navigationTitle(self.isFullScreenStep ? "" : self.step.title)
             .navigationBarTitleDisplayMode(.inline)
             .tint(OpenClawBrand.activationPrimaryAction)
-            .toolbar {
-                if !self.isFullScreenStep {
-                    ToolbarItem(placement: .principal) {
-                        VStack(spacing: 2) {
-                            Text(self.step.title)
-                                .font(OpenClawType.headline)
-                            Text(self.step.manualProgressTitle)
-                                .font(OpenClawType.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
         }
         .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
             self.keyboardDismissControl
@@ -202,7 +196,6 @@ struct OnboardingWizardView: View {
                 .padding(.leading, 16)
                 .padding(.top, 10)
         }
-        .gatewayTrustPromptAlert()
         .alert("QR Scanner Unavailable", isPresented: Binding(
             get: { self.scannerError != nil },
             set: {
@@ -279,18 +272,49 @@ struct OnboardingWizardView: View {
         .onChange(of: self.appModel.gatewayStatusText) { _, newValue in
             self.updateConnectionIssue(problem: self.appModel.lastGatewayProblem, statusText: newValue)
         }
+        .onChange(of: self.gatewayAuthMethod) { oldMethod, newMethod in
+            // Only react when the gateway discloses a concrete method. Transitions to `.unknown`
+            // (pairing / success / network) must never touch the credential slots — otherwise a
+            // successful password auth moving on to pairing would migrate the password out of its slot.
+            guard newMethod != .unknown, oldMethod != newMethod else { return }
+            let wasSubmitting = self.credentialSubmitted
+            let migrated = self.migrateCredentialToDetectedMethod(requiresPassword: newMethod == .password)
+            // A submitted credential rejected only because the gateway had not yet disclosed its auth
+            // method: resend it once in the corrected slot so a correct first entry connects without the
+            // user pressing Continue again. The one-shot guard stops this from looping.
+            guard migrated, wasSubmitting, !self.autoRetriedAfterMethodFlip else { return }
+            self.autoRetriedAfterMethodFlip = true
+            self.resetFeedbackForNewAttempt(returnStep: self.feedbackReturnStep)
+            self.credentialSubmitted = true
+            Task { await self.retryLastAttempt() }
+        }
         .onChange(of: self.appModel.gatewaySetupRequestID) { _, _ in
             self.applyPendingGatewaySetupLinkIfNeeded()
         }
         .onChange(of: self.appModel.gatewayServerName) { _, newValue in
             guard newValue != nil, self.setupLinkStaging.link == nil else { return }
+            self.credentialSubmitted = false
             self.showQRScanner = false
             self.statusLine = "Connected."
-            if !self.didMarkCompleted, let selectedMode {
-                OnboardingStateStore.markCompleted(mode: selectedMode)
+            if !self.didMarkCompleted {
+                OnboardingStateStore.markCompleted(
+                    mode: self.selectedMode ?? self.inferredCompletionMode)
                 self.didMarkCompleted = true
             }
-            self.navigate(to: .success)
+            if self.step == .feedback {
+                let elapsed = Date().timeIntervalSince(self.feedbackShownAt)
+                let wait = max(0, 2.0 - elapsed)
+                self.feedbackCommitTask?.cancel()
+                self.feedbackCommitTask = Task { @MainActor in
+                    if wait > 0 {
+                        try? await Task.sleep(for: .seconds(wait))
+                    }
+                    guard !Task.isCancelled else { return }
+                    self.navigate(to: .success)
+                }
+            } else {
+                self.navigate(to: .success)
+            }
         }
     }
 
@@ -421,6 +445,46 @@ struct OnboardingWizardView: View {
         OnboardingIntroStep(onContinue: self.advanceFromIntro)
     }
 
+    private var setupStep: some View {
+        OnboardingSetupStep(
+            onBack: { self.navigate(to: .welcome) },
+            onApply: { raw, host, port in
+                self.resetFeedbackForNewAttempt(returnStep: .mode)
+                self.manualEndpointOverride = (host: host, port: port)
+                self.setupCode = raw
+                Task { await self.applySetupCodeAndConnect() }
+            })
+    }
+
+    private var feedbackStep: some View {
+        OnboardingFeedbackStep(
+            content: self.feedbackContent,
+            status: self.feedbackStatusText,
+            credential: self.gatewayCredentialBinding,
+            onBack: {
+                self.feedbackCommitTask?.cancel()
+                self.navigate(to: self.feedbackReturnStep)
+            },
+            onRetry: {
+                // Explicit retry is a clean slate: drop the sticky pairing/auth issue so the new
+                // attempt reclassifies from scratch (e.g. Tailscale turned off since → install-Tailscale).
+                // The silent auto-retry path deliberately keeps the issue sticky and is untouched.
+                self.issue = .none
+                self.pairingRequestId = nil
+                self.resetFeedbackForNewAttempt(returnStep: self.feedbackReturnStep)
+                Task { await self.retryLastAttempt() }
+            },
+            onSubmitCredentials: {
+                // Verify by connecting (shows the loading screen); a wrong credential comes back to the
+                // auth prompt with the field in its error state (credentialSubmitted stays set).
+                self.autoRetriedAfterMethodFlip = false
+                self.resetFeedbackForNewAttempt(returnStep: self.feedbackReturnStep)
+                self.credentialSubmitted = true
+                Task { await self.retryLastAttempt() }
+            },
+            onCopyRequestId: { UIPasteboard.general.string = $0 })
+    }
+
     private var welcomeStep: some View {
         OnboardingWelcomeStep(
             isConnecting: self.connectingGatewayID != nil,
@@ -478,7 +542,7 @@ struct OnboardingWizardView: View {
 
         Section {
             Button {
-                self.navigate(to: .connect)
+                self.navigate(to: .feedback)
             } label: {
                 Text("Continue")
                     .font(OpenClawType.subheadSemiBold)
@@ -537,270 +601,8 @@ struct OnboardingWizardView: View {
         }
     }
 
-    @ViewBuilder
-    private var connectStep: some View {
-        if let selectedMode {
-            Section {
-                self.onboardingLabeledContent("Mode", value: selectedMode.title)
-                self.onboardingLabeledContent("Discovery", value: self.gatewayController.discoveryStatusText)
-                self.onboardingLabeledContent("Status", value: self.appModel.gatewayDisplayStatusText)
-                self.onboardingLabeledContent("Progress", value: self.statusLine.isEmpty ? "Ready" : self.statusLine)
-            } header: {
-                Text("Status")
-                    .font(OpenClawType.footnoteSemiBold)
-            } footer: {
-                if let connectMessage {
-                    Text(connectMessage)
-                        .font(OpenClawType.footnote)
-                }
-            }
-
-            if let stagedLink = self.setupLinkStaging.link {
-                self.stagedGatewaySetupSection(stagedLink)
-            } else {
-                switch selectedMode {
-                case .homeNetwork:
-                    self.homeNetworkConnectSection
-                case .remoteDomain:
-                    self.remoteDomainConnectSection
-                case .developerLocal:
-                    self.developerConnectSection
-                }
-            }
-        } else {
-            Section {
-                Text("Choose a mode first.")
-                    .font(OpenClawType.body)
-                Button {
-                    self.navigate(to: .mode)
-                } label: {
-                    Text("Back to Mode Selection")
-                        .font(OpenClawType.subheadSemiBold)
-                }
-            }
-        }
-    }
-
-    private func stagedGatewaySetupSection(_ link: GatewayConnectDeepLink) -> some View {
-        Section {
-            self.onboardingLabeledContent("Host", value: link.host)
-            self.onboardingLabeledContent("Port", value: String(link.port))
-            self.onboardingLabeledContent("Security", value: link.tls ? "TLS" : "Plaintext (local network)")
-
-            Button {
-                Task { await self.connectStagedGatewaySetupLink() }
-            } label: {
-                if self.connectingGatewayID == "manual" {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .progressViewStyle(.circular)
-                        Text("Connecting…")
-                            .font(OpenClawType.subheadSemiBold)
-                    }
-                } else {
-                    Text("Connect")
-                        .font(OpenClawType.subheadSemiBold)
-                }
-            }
-            .font(OpenClawType.subheadSemiBold)
-            .disabled(self.connectingGatewayID != nil)
-
-            Button {
-                self.clearStagedGatewaySetupLink()
-            } label: {
-                Text("Use Manual Setup")
-                    .font(OpenClawType.subheadSemiBold)
-            }
-            .font(OpenClawType.subheadSemiBold)
-            .disabled(self.connectingGatewayID != nil)
-        } header: {
-            Text("Setup Link")
-                .font(OpenClawType.footnoteSemiBold)
-        } footer: {
-            Text(link.tls
-                ? "Review this endpoint. Credentials are applied only after you tap Connect."
-                :
-                "Plaintext may expose credentials. Continue only if you trust this local network and host.")
-                .font(OpenClawType.footnote)
-        }
-    }
-
-    @ViewBuilder
-    private var homeNetworkConnectSection: some View {
-        Section {
-            if self.gatewayController.gateways.isEmpty {
-                Text("No gateways found yet.")
-                    .font(OpenClawType.body)
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(self.gatewayController.gateways) { gateway in
-                    let hasHost = self.gatewayHasResolvableHost(gateway)
-
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(gateway.name)
-                                .font(OpenClawType.body)
-                            if let host = gateway.lanHost ?? gateway.tailnetDns {
-                                Text(host)
-                                    .font(OpenClawType.footnote)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        Spacer()
-                        Button {
-                            Task { await self.connectDiscoveredGateway(gateway) }
-                        } label: {
-                            if self.connectingGatewayID == gateway.id {
-                                ProgressView()
-                                    .progressViewStyle(.circular)
-                            } else if !hasHost {
-                                Text("Resolving…")
-                                    .font(OpenClawType.subheadSemiBold)
-                            } else {
-                                Text("Connect")
-                                    .font(OpenClawType.subheadSemiBold)
-                            }
-                        }
-                        .font(OpenClawType.subheadSemiBold)
-                        .disabled(self.connectingGatewayID != nil || !hasHost)
-                    }
-                }
-            }
-
-            Button {
-                self.gatewayController.restartDiscovery()
-            } label: {
-                Text("Restart Discovery")
-                    .font(OpenClawType.subheadSemiBold)
-            }
-            .font(OpenClawType.subheadSemiBold)
-            .disabled(self.connectingGatewayID != nil)
-        } header: {
-            Text("Discovered Gateways")
-                .font(OpenClawType.footnoteSemiBold)
-        }
-
-        self.manualConnectionFieldsSection(title: "Manual Fallback")
-    }
-
-    private var remoteDomainConnectSection: some View {
-        self.manualConnectionFieldsSection(title: "Domain Settings")
-    }
-
-    private var developerConnectSection: some View {
-        Section {
-            self.onboardingTextField("Host", text: self.manualHostBinding, focusedField: .manualHost)
-            self.onboardingTextField("Port", text: self.manualPortTextBinding, focusedField: .manualPort)
-                .keyboardType(.numberPad)
-            self.manualConnectionSecurityRows
-            self.manualConnectButton
-        } header: {
-            Text("Developer Local")
-                .font(OpenClawType.footnoteSemiBold)
-        } footer: {
-            Text("Default host is localhost. Use your Mac LAN IP if simulator networking requires it.")
-                .font(OpenClawType.footnote)
-        }
-    }
-
-    @ViewBuilder
-    private var authStep: some View {
-        Section {
-            self.onboardingSecureField(
-                "Gateway Auth Token",
-                text: self.gatewayTokenBinding,
-                focusedField: .gatewayToken)
-            self.onboardingSecureField(
-                "Gateway Password",
-                text: self.gatewayPasswordBinding,
-                focusedField: .gatewayPassword)
-
-            if let problem = self.currentProblem {
-                GatewayProblemBanner(
-                    problem: problem,
-                    primaryActionTitle: self.gatewayProblemPrimaryActionTitle(problem),
-                    onPrimaryAction: {
-                        Task { await self.handleGatewayProblemPrimaryAction(problem) }
-                    },
-                    onShowDetails: {
-                        self.showGatewayProblemDetails = true
-                    })
-            } else if self.issue.needsAuthToken {
-                Text("Gateway rejected credentials. Scan a fresh setup code or update token/password.")
-                    .font(OpenClawType.footnote)
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("OpenClaw is checking gateway and node access.")
-                    .font(OpenClawType.footnote)
-                    .foregroundStyle(.secondary)
-            }
-        } header: {
-            Text(self.gatewayStatusSectionTitle)
-                .font(OpenClawType.footnoteSemiBold)
-        }
-
-        if self.issue.needsPairing {
-            Section {
-                Button {
-                    self.resumeAfterPairingApproval()
-                } label: {
-                    Label("Resume After Approval", systemImage: "arrow.clockwise")
-                        .font(OpenClawType.subheadSemiBold)
-                }
-                .font(OpenClawType.subheadSemiBold)
-                .disabled(self.connectingGatewayID != nil)
-            } header: {
-                Text("Pairing Approval")
-                    .font(OpenClawType.footnoteSemiBold)
-            } footer: {
-                let requestLine: String = {
-                    if let id = self.currentProblem?.requestId ?? self.issue.requestId, !id.isEmpty {
-                        return "Request ID: \(id)"
-                    }
-                    return "Request ID: check `openclaw devices list`."
-                }()
-                let commandLine = self.currentProblem?.actionCommand ?? "openclaw devices approve <requestId>"
-                Text(
-                    "Approve this device on the gateway.\n"
-                        + "1) `\(commandLine)`\n"
-                        + "2) `/pair approve` in your OpenClaw chat\n"
-                        + "\(requestLine)\n"
-                        + "OpenClaw will also retry automatically when you return to this app.")
-                    .font(OpenClawType.caption)
-            }
-        }
-
-        Section {
-            Button {
-                self.openQRScannerFromOnboarding()
-            } label: {
-                Label("Scan Setup Code Again", systemImage: "qrcode.viewfinder")
-                    .font(OpenClawType.subheadSemiBold)
-            }
-            .font(OpenClawType.subheadSemiBold)
-            .disabled(self.connectingGatewayID != nil)
-
-            Button {
-                Task { await self.retryLastAttempt() }
-            } label: {
-                if self.connectingGatewayID == "retry" {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                } else {
-                    Text("Retry Connection")
-                        .font(OpenClawType.subheadSemiBold)
-                }
-            }
-            .font(OpenClawType.subheadSemiBold)
-            .disabled(self.connectingGatewayID != nil)
-        }
-    }
-
     private var successStep: some View {
-        OnboardingSuccessStep(
-            gatewayName: self.appModel.gatewayServerName ?? "gateway",
-            gatewayAddress: self.appModel.gatewayRemoteAddress,
-            onGetStarted: self.onComplete)
+        OnboardingSuccessStepView(onFinished: { self.onComplete() })
     }
 }
 
@@ -996,6 +798,192 @@ extension OnboardingWizardView {
         .disabled(!self.canConnectManual || self.connectingGatewayID != nil)
     }
 
+    /// A gateway accepts a single auth method. The problem kind tells us which — but only while it is
+    /// actively reporting an auth error. Pairing, success, and network states carry no method, so they
+    /// map to `.unknown` and must never move the credential between slots.
+    private enum DetectedGatewayAuthMethod: Equatable {
+        case token
+        case password
+        case unknown
+    }
+
+    private var gatewayAuthMethod: DetectedGatewayAuthMethod {
+        switch self.appModel.lastGatewayProblem?.kind {
+        case .gatewayAuthPasswordMissing, .gatewayAuthPasswordMismatch, .gatewayAuthPasswordNotConfigured:
+            .password
+        case .gatewayAuthTokenMissing, .gatewayAuthTokenMismatch, .gatewayAuthTokenNotConfigured:
+            .token
+        default:
+            .unknown
+        }
+    }
+
+    /// Which slot the single auth field routes into. Defaults to token until the gateway asks for a
+    /// password, so the placeholder/binding stay consistent while the field is on screen.
+    private var gatewayRequiresPassword: Bool {
+        self.gatewayAuthMethod == .password
+    }
+
+    private var desiredFeedbackContent: OnboardingFeedbackContent {
+        if self.issue.needsPairing {
+            return .awaitingApproval(requestId: self.issue.requestId ?? self.pairingRequestId)
+        }
+        if self.issue.needsAuthToken {
+            // rejected once a submitted credential comes back still needing auth (any reject kind).
+            return .passwordRequired(rejected: self.credentialSubmitted)
+        }
+        switch self.issue {
+        case .network:
+            return self.isLikelyTailnetTarget ? .installTailscale : .error
+        case .unknown:
+            return .error
+        default:
+            // A connect can end with no issue emitted — a stall, or a dismissed trust prompt. The
+            // loadingDidFail flag makes the error sticky so a later refresh does not revert to loading.
+            return self.loadingDidFail ? .error : .loading
+        }
+    }
+
+    private var isLikelyTailnetTarget: Bool {
+        // Fall back to `manualHost` (always set by applyGatewayLink) so the apply-code path — where no
+        // staged link or manual override is present — still recognizes a *.ts.net tailnet endpoint.
+        let host = (self.setupLinkStaging.link?.host
+            ?? self.manualEndpointOverride?.host
+            ?? self.manualHost).lowercased()
+        return host.hasSuffix(".ts.net")
+    }
+
+    /// Live connection stage for the feedback loading subtitle. Prefer the controller's status text
+    /// (e.g. "Connecting…", "Verify gateway TLS fingerprint", "Reconnecting…") so a stalled attempt is
+    /// legible; fall back to the onboarding-level message when the controller has not set one yet.
+    private var feedbackStatusText: String {
+        let live = self.appModel.gatewayStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !live.isEmpty {
+            return live
+        }
+        if let message = self.connectMessage, !message.isEmpty {
+            return message
+        }
+        return self.statusLine
+    }
+
+    private func refreshOnboardingFeedback() {
+        guard self.step == .feedback else { return }
+        self.setFeedbackContent(self.desiredFeedbackContent)
+    }
+
+    /// When a resolved state (pairing / password / install-Tailscale / error) transitions in over the
+    /// loading spinner, a haptic marks the arrival. Compared by case so associated-value-only updates
+    /// (e.g. `awaitingApproval`'s requestId arriving) don't re-fire the haptic.
+    private func handleFeedbackContentChange(
+        from old: OnboardingFeedbackContent,
+        to new: OnboardingFeedbackContent)
+    {
+        guard self.step == .feedback else { return }
+        if case .loading = new {
+            return
+        }
+        guard Self.feedbackCaseID(old) != Self.feedbackCaseID(new) else { return }
+        // A rejected credential arrival plays the field's own error haptic; suppress the handshake so
+        // they don't double up. Every other state arrival gets the handshake.
+        if case .passwordRequired(rejected: true) = new {
+            return
+        }
+        OpenClawHaptics.play(.secured2)
+    }
+
+    private static func feedbackCaseID(_ content: OnboardingFeedbackContent) -> Int {
+        switch content {
+        case .loading: 0
+        case .passwordRequired: 1
+        case .awaitingApproval: 2
+        case .installTailscale: 3
+        case .error: 4
+        }
+    }
+
+    /// A trust prompt dismissed without proceeding to connect (declined → gateway goes Offline) is a
+    /// terminal failure of this attempt. Fail fast to the error state instead of leaving the loading
+    /// spinner until the stall timeout. Accepting keeps a "Connecting…/Verifying…" status, so we only
+    /// fail when nothing is progressing and the attempt has not otherwise resolved.
+    private func failFeedbackIfTrustPromptDismissedWithoutConnecting() {
+        guard self.step == .feedback else { return }
+        guard self.issue == .none, self.appModel.gatewayServerName == nil else { return }
+        let status = self.appModel.gatewayStatusText.lowercased()
+        let progressing = status.contains("connect") || status.contains("verif")
+        guard !progressing else { return }
+        self.loadingDidFail = true
+        self.refreshOnboardingFeedback()
+    }
+
+    private func setFeedbackContent(_ target: OnboardingFeedbackContent) {
+        guard target != self.feedbackContent else { return }
+        // Any committed state other than loading means the attempt resolved; drop the stall timeout.
+        if case .loading = target {} else {
+            self.feedbackTimeoutTask?.cancel()
+            self.feedbackTimeoutTask = nil
+        }
+        self.feedbackCommitTask?.cancel()
+        let elapsed = Date().timeIntervalSince(self.feedbackShownAt)
+        let wait = max(0, 2.0 - elapsed)
+        self.feedbackCommitTask = Task { @MainActor in
+            if wait > 0 {
+                try? await Task.sleep(for: .seconds(wait))
+            }
+            guard !Task.isCancelled else { return }
+            withAnimation(.smooth(duration: 0.3)) { self.feedbackContent = target }
+            self.feedbackShownAt = Date()
+        }
+    }
+
+    private func resetFeedbackForNewAttempt(returnStep: OnboardingStep) {
+        self.feedbackCommitTask?.cancel()
+        self.feedbackContent = .loading
+        self.feedbackShownAt = Date()
+        self.feedbackReturnStep = returnStep
+        self.loadingDidFail = false
+        self.credentialSubmitted = false
+        self.scheduleFeedbackStallTimeout()
+    }
+
+    /// Guards against a silently hung connect: if the feedback step is still loading after two minutes
+    /// (no pairing/auth/error surfaced, no gateway response), surface the error state so the user can retry.
+    private func scheduleFeedbackStallTimeout() {
+        self.feedbackTimeoutTask?.cancel()
+        self.feedbackTimeoutTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(120))
+            guard !Task.isCancelled else { return }
+            guard self.step == .feedback, case .loading = self.feedbackContent else { return }
+            self.loadingDidFail = true
+            self.refreshOnboardingFeedback()
+        }
+    }
+
+    private var inferredCompletionMode: OnboardingConnectionMode {
+        let host = (self.setupLinkStaging.link?.host
+            ?? self.manualEndpointOverride?.host
+            ?? "").lowercased()
+        if host.hasSuffix(".local") || host.hasPrefix("192.168.") || host.hasPrefix("10.") {
+            return .homeNetwork
+        }
+        return .remoteDomain
+    }
+
+    private func applyingManualEndpointOverride(to link: GatewayConnectDeepLink) -> GatewayConnectDeepLink {
+        guard let override = self.manualEndpointOverride else { return link }
+        let host = override.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let port = Int(override.port.trimmingCharacters(in: .whitespacesAndNewlines)) ?? link.port
+        guard !host.isEmpty, host != link.host || port != link.port else { return link }
+        return GatewayConnectDeepLink(
+            host: host,
+            port: port,
+            tls: link.tls,
+            bootstrapToken: link.bootstrapToken,
+            token: link.token,
+            password: link.password,
+            fallbackEndpoints: [])
+    }
+
     private func applySetupCodeAndConnect() async {
         self.setupCodeStatus = nil
         let raw = self.setupCode.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1012,10 +1000,11 @@ extension OnboardingWizardView {
             return
         }
 
-        guard let parsedLink = GatewayConnectDeepLink.fromSetupInput(raw) else {
+        guard let scannedLink = GatewayConnectDeepLink.fromSetupInput(raw) else {
             self.setupCodeStatus = "Setup code not recognized or uses an insecure ws:// gateway URL."
             return
         }
+        let parsedLink = self.applyingManualEndpointOverride(to: scannedLink)
 
         guard let attemptID = self.beginSetupAttempt() else { return }
         defer { self.finishSetupAttempt(attemptID) }
@@ -1028,7 +1017,8 @@ extension OnboardingWizardView {
         self.connectMessage = "Connecting via setup code…"
         self.statusLine = "Setup code loaded. Connecting to \(link.host):\(link.port)…"
         await self.prepareFocusedFieldForStepTransition()
-        self.navigate(to: .connect)
+        self.resetFeedbackForNewAttempt(returnStep: .welcome)
+        self.navigate(to: .feedback)
         await self.connectManual(setupAttemptID: attemptID)
     }
 
@@ -1069,7 +1059,8 @@ extension OnboardingWizardView {
         await self.applyGatewayLink(link)
         self.connectMessage = "Connecting via setup code…"
         self.statusLine = "Setup code loaded. Connecting to \(link.host):\(link.port)…"
-        self.navigate(to: .connect)
+        self.resetFeedbackForNewAttempt(returnStep: .welcome)
+        self.navigate(to: .feedback)
         await self.connectManual(setupAttemptID: attemptID)
     }
 
@@ -1087,7 +1078,8 @@ extension OnboardingWizardView {
         self.setupCodeStatus = "Setup link loaded for \(link.host):\(link.port). Tap Connect to apply."
         self.connectMessage = nil
         self.statusLine = self.setupCodeStatus ?? ""
-        self.navigate(to: .connect)
+        self.resetFeedbackForNewAttempt(returnStep: .welcome)
+        self.navigate(to: .feedback)
     }
 
     private func connectStagedGatewaySetupLink() async {
@@ -1208,7 +1200,7 @@ extension OnboardingWizardView {
 
     private func attemptAutomaticPairingResumeIfNeeded() {
         guard self.scenePhase == .active else { return }
-        guard self.step == .auth else { return }
+        guard self.step == .feedback else { return }
         guard self.issue.needsPairing else { return }
         guard self.connectingGatewayID == nil else { return }
 
@@ -1243,7 +1235,14 @@ extension OnboardingWizardView {
         }
 
         if self.issue.needsAuthToken || self.issue.needsPairing || problem?.pauseReconnect == true {
-            self.step = .auth
+            // Route actionable outcomes into the redesigned feedback step; a background reconnect that
+            // surfaces one from .welcome/.intro resets to loading first, an in-flight attempt keeps its
+            // existing feedback timeline so the state transition stays smooth.
+            if self.step != .feedback {
+                self.resetFeedbackForNewAttempt(returnStep: self.step)
+                self.step = .feedback
+            }
+            self.refreshOnboardingFeedback()
         }
 
         if let problem {
@@ -1438,6 +1437,37 @@ extension OnboardingWizardView {
             set: { self.persistGatewayPassword($0) })
     }
 
+    /// The auth screen's single field. It reads whichever slot currently holds a value and routes new
+    /// input into the slot the gateway asks for, so a password is never sent in the token slot.
+    private var gatewayCredentialBinding: Binding<String> {
+        Binding(
+            get: { self.gatewayPassword.isEmpty ? self.gatewayToken : self.gatewayPassword },
+            set: { value in
+                if self.gatewayRequiresPassword {
+                    self.persistGatewayPassword(value)
+                } else {
+                    self.persistGatewayToken(value)
+                }
+            })
+    }
+
+    /// When the gateway discloses its auth method (e.g. a stale setup-link token is rejected and it then
+    /// reports a password is required), carry the already-typed credential into the newly detected slot
+    /// so the single field keeps it and the next connect sends it the right way. Returns whether a value
+    /// actually moved slots.
+    @discardableResult
+    private func migrateCredentialToDetectedMethod(requiresPassword: Bool) -> Bool {
+        if requiresPassword, self.gatewayPassword.isEmpty, !self.gatewayToken.isEmpty {
+            self.persistGatewayPassword(self.gatewayToken)
+            return true
+        }
+        if !requiresPassword, self.gatewayToken.isEmpty, !self.gatewayPassword.isEmpty {
+            self.persistGatewayToken(self.gatewayPassword)
+            return true
+        }
+        return false
+    }
+
     private var manualHostBinding: Binding<String> {
         Binding(
             get: { self.manualHost },
@@ -1466,30 +1496,37 @@ extension OnboardingWizardView {
 
     private func persistGatewayToken(_ value: String) {
         self.gatewayToken = value
-        let instanceId = GatewaySettingsStore.currentInstanceID()
-        guard !instanceId.isEmpty, let stableID = self.gatewayCredentialTargetStableID else { return }
-        self.gatewayCredentialFieldStableID = stableID
-        let saved = GatewaySettingsStore.updateGatewayCredentials(
-            token: value,
-            password: self.gatewayPassword,
-            gatewayStableID: stableID,
-            instanceId: instanceId)
-        self.pendingManualAuthOverride = saved
-            ? GatewayConnectionController.ManualAuthOverride.persisted(
-                instanceId: instanceId,
-                targetStableID: stableID)
-            : nil
+        // A typed token is the sole auth method for this endpoint: drop the competing password so the
+        // two single-field auth modes never send conflicting credentials.
+        self.gatewayPassword = ""
+        // Editing the credential clears the rejected/error state so the field returns to normal.
+        self.credentialSubmitted = false
+        self.persistExclusiveCredential(token: value, password: nil)
     }
 
     private func persistGatewayPassword(_ value: String) {
         self.gatewayPassword = value
+        // A typed password is the sole auth method for this endpoint. Drop the setup-link token so it
+        // cannot win the gateway's auth-frame precedence (token > bootstrap > password) and leave the
+        // password unevaluated — the gateway would keep reporting "password missing" no matter what.
+        self.gatewayToken = ""
+        // Editing the credential clears the rejected/error state so the field returns to normal.
+        self.credentialSubmitted = false
+        self.persistExclusiveCredential(token: nil, password: value)
+    }
+
+    /// Persists a single explicit credential as the only auth for this endpoint, clearing any staged
+    /// setup-link bootstrap token so the typed token/password is the sole value sent on the next connect.
+    private func persistExclusiveCredential(token: String?, password: String?) {
         let instanceId = GatewaySettingsStore.currentInstanceID()
         guard !instanceId.isEmpty, let stableID = self.gatewayCredentialTargetStableID else { return }
         self.gatewayCredentialFieldStableID = stableID
-        let saved = GatewaySettingsStore.updateGatewayCredentials(
-            token: self.gatewayToken,
-            password: value,
+        let saved = GatewaySettingsStore.saveGatewayCredentials(
+            token: token,
+            bootstrapToken: nil,
+            password: password,
             gatewayStableID: stableID,
+            suppressStoredDeviceAuth: true,
             instanceId: instanceId)
         self.pendingManualAuthOverride = saved
             ? GatewayConnectionController.ManualAuthOverride.persisted(
@@ -1691,7 +1728,8 @@ extension OnboardingWizardView {
             self.connectMessage = nil
             self.issue = .none
             self.pairingRequestId = nil
-            self.navigate(to: .connect)
+            self.resetFeedbackForNewAttempt(returnStep: .welcome)
+            self.navigate(to: .feedback)
             self.openQRScannerFromOnboarding(status: "Scan a fresh setup QR code from this gateway.")
             return
         }

@@ -403,7 +403,11 @@ final class GatewayConnectionController {
                 suppressStoredDeviceAuth: suppressStoredDeviceAuth)
             : nil)
         let stored = GatewayTLSStore.loadFingerprint(stableID: stableID)
-        if resolvedUseTLS, stored == nil {
+        // Probe on first-time connects (to capture/trust the fingerprint) and on forced reconnects.
+        // The probe has a short timeout, so it fails fast on an unreachable tailnet host — the main
+        // connect loop would otherwise stall on "Connecting…" until a long socket timeout, never
+        // surfacing the reachability error (e.g. Tailscale turned off after pairing).
+        if resolvedUseTLS, stored == nil || forceReconnect {
             guard let url = self.buildGatewayURL(host: host, port: resolvedPort, useTLS: true) else { return }
             self.appModel?.beginGatewayPreconnectVerification(statusText: "Verifying gateway TLS fingerprint…")
             guard let probeResult = await self.probeTLSFingerprint(
@@ -415,6 +419,9 @@ final class GatewayConnectionController {
             guard self.connectAttemptGeneration == connectAttempt.suppressionLease.generation else { return }
             switch probeResult {
             case let .fingerprint(fp):
+                // An already-trusted cert means the probe only confirmed reachability; fall through to
+                // connect. A first-time cert must be trusted by the user before connecting.
+                guard stored == nil else { break }
                 self.pendingTrustConnect = GatewayPendingTrustConnect(
                     url: url,
                     stableID: stableID,
@@ -433,10 +440,8 @@ final class GatewayConnectionController {
                 self.appModel?.gatewayStatusText = "Verify gateway TLS fingerprint"
                 return
             case let .failure(failure):
-                self.appModel?.gatewayStatusText = self.tlsProbeFailureMessage(
-                    failure,
-                    host: host,
-                    port: resolvedPort)
+                self.appModel?.failGatewayPreconnectVerification(
+                    self.tlsProbeFailureProblem(failure, host: host, port: resolvedPort))
                 return
             }
         }
@@ -1249,6 +1254,32 @@ final class GatewayConnectionController {
         } else {
             self.releaseAutoConnectSuppression(after: lease)
         }
+    }
+
+    /// Map a preconnect TLS-probe failure to a typed network problem, keeping the detailed message as
+    /// the status text. `.reachabilityFailed`/`.timeout` classify as `.network`, which lets onboarding
+    /// route an unreachable tailnet gateway to the install-Tailscale state instead of spinning forever.
+    private func tlsProbeFailureProblem(
+        _ failure: GatewayTLSFingerprintProbeFailure,
+        host: String,
+        port: Int) -> GatewayConnectionProblem
+    {
+        let message = self.tlsProbeFailureMessage(failure, host: host, port: port)
+        let kind: GatewayConnectionProblem.Kind = switch failure {
+        case .tlsHandshakeTimeout: .timeout
+        case .endpointUnreachable, .tlsUnavailable, .certificateUnavailable: .reachabilityFailed
+        }
+        return GatewayConnectionProblem(
+            kind: kind,
+            owner: .network,
+            title: message,
+            message: message,
+            actionLabel: "Retry",
+            actionCommand: nil,
+            docsURL: nil,
+            requestId: nil,
+            retryable: true,
+            pauseReconnect: false)
     }
 
     private func tlsProbeFailureMessage(

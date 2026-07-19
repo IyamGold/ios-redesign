@@ -2877,6 +2877,12 @@ extension NodeAppModel {
         self.gatewayStatusText = statusText
     }
 
+    /// Surface a preconnect (TLS probe) failure as a typed problem so issue detection can classify it.
+    /// Without this the controller would set only status text, leaving onboarding stuck on loading.
+    func failGatewayPreconnectVerification(_ problem: GatewayConnectionProblem) {
+        self.applyGatewayConnectionProblem(problem)
+    }
+
     private func applyGatewayConnectionProblem(_ problem: GatewayConnectionProblem) {
         guard !self.isLocalGatewayFixtureEnabled else { return }
         self.lastGatewayProblem = problem
@@ -3114,6 +3120,11 @@ extension NodeAppModel {
         stableID: String,
         routeGeneration: UInt64) async
     {
+        // An intentional teardown (disconnect / Reset Onboarding) disables auto-reconnect and then
+        // deletes credentials, which makes an in-flight handoff persist benignly fail. Do not surface a
+        // "credential save failed" problem when the app is no longer trying to stay connected; a genuine
+        // failure during a live session still reports because auto-reconnect is still enabled then.
+        guard self.gatewayAutoReconnectEnabled else { return }
         guard self.isCurrentGatewayRoute(generation: routeGeneration, stableID: stableID) else { return }
         guard self.credentialHandoffFailureGeneration != routeGeneration else { return }
         self.credentialHandoffFailureGeneration = routeGeneration
