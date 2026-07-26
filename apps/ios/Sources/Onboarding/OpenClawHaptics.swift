@@ -21,6 +21,12 @@ enum OpenClawHaptics {
     static func play(_ pattern: OpenClawHapticPattern) {
         HapticEngineHolder.shared.play(pattern)
     }
+
+    /// A light selection-style tap for discrete UI actions (e.g. attachment tray rows).
+    @MainActor
+    static func tap() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
 }
 
 @MainActor

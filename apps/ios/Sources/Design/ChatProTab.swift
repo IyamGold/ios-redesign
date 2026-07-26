@@ -22,6 +22,9 @@ struct ChatProTab: View {
     @State private var viewModelPresentationAgentBadge = "M"
     @State private var viewModelHasVerifiedOfflineRoutingIdentity = false
     @State private var speech: OpenClawChatSpeechController?
+    @State private var showsTalkMode = false
+    // One-shot guard for clearing an offline outbox the gateway can never replay (see recovery below).
+    @State private var didRecoverUndeliverableOutbox = false
     let headerLeadingAction: OpenClawSidebarHeaderAction?
     let headerTitle: String?
     let showsAgentBadge: Bool
@@ -100,47 +103,53 @@ struct ChatProTab: View {
             self.syncChatViewModel()
             self.viewModel?.refresh()
         }
+        .onChange(of: self.viewModel?.errorText) { _, errorText in
+            self.recoverUndeliverableOutbox(errorText: errorText)
+        }
+    }
+
+    /// A gateway that can't grant the queued-replay routing contract leaves offline-queued messages
+    /// permanently un-deliverable — and the failing flush pins the transport unhealthy, which blocks
+    /// even live chat (FIFO routes live sends behind the stuck queue). Purge that gateway's chat store
+    /// (drops the queued commands; the transcript re-fetches) so the rebuilt view model starts clean.
+    private func recoverUndeliverableOutbox(errorText: String?) {
+        guard errorText == OpenClawChatTransportUpgradeMessage.routingContract else { return }
+        guard !self.didRecoverUndeliverableOutbox else { return }
+        self.didRecoverUndeliverableOutbox = true
+        let gatewayID = self.appModel.chatTranscriptCacheGatewayID
+        Task { await self.appModel.purgeChatTranscriptCache(gatewayID: gatewayID) }
     }
 
     private var content: some View {
-        self.chatSurface
-            .background(Color(uiColor: .systemBackground))
-            .navigationTitle(self.headerDisplayTitle)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                if let headerLeadingAction {
-                    ToolbarItem(placement: .topBarLeading) {
-                        OpenClawSidebarRevealButton(action: headerLeadingAction)
-                    }
-                }
-                if self.showsAgentBadge {
-                    ToolbarItem(placement: .topBarLeading) {
-                        self.headerIdentityBadge
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    self.chatActionsMenu
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    self.connectionStatusButton
-                        .accessibilityIdentifier("chat-gateway-status")
-                }
+        Group {
+            if let viewModel {
+                ChatRootSurface(
+                    viewModel: viewModel,
+                    onOpenSettings: { self.openSettings?() },
+                    onOpenTalk: { self.showsTalkMode = true })
+            } else {
+                Color.clear
             }
-            .sheet(item: self.$transcriptShareItem) { item in
-                ChatTranscriptShareSheet(fileURL: item.fileURL)
-            }
-            .alert(
-                String(localized: "Unable to Export Transcript"),
-                isPresented: self.$showsTranscriptExportError)
-            {
-                Button(role: .cancel) {} label: {
-                    Text("OK")
-                        .font(OpenClawType.body)
+        }
+        .toolbar(.hidden, for: .navigationBar)
+        .fullScreenCover(isPresented: self.$showsTalkMode) {
+            ZStack(alignment: .topLeading) {
+                TalkProTab(
+                    ownsNavigationStack: true,
+                    openSettings: {},
+                    openVoiceSettings: {})
+                Button {
+                    self.showsTalkMode = false
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(Color.primary)
+                        .frame(width: 40, height: 40)
+                        .background { Circle().fill(.regularMaterial) }
                 }
-            } message: {
-                Text("OpenClaw could not prepare the Markdown file.")
-                    .font(OpenClawType.body)
+                .padding(.leading, 14)
             }
+        }
     }
 
     @ViewBuilder

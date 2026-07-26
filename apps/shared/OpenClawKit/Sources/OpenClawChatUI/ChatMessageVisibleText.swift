@@ -4,8 +4,8 @@ import Foundation
 /// in the bubble, with tool traces and non-text blocks removed. Shared by the
 /// transcript exporter and the Listen action so exported and spoken text
 /// always match the visible transcript.
-enum ChatMessageVisibleText {
-    static func visibleText(in message: OpenClawChatMessage) -> String {
+public enum ChatMessageVisibleText {
+    public static func visibleText(in message: OpenClawChatMessage) -> String {
         let text = self.primaryText(in: message)
         let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard role != "user" else { return text }
@@ -14,7 +14,7 @@ enum ChatMessageVisibleText {
             .joined(separator: "\n\n")
     }
 
-    static func hasVisibleText(in message: OpenClawChatMessage) -> Bool {
+    public static func hasVisibleText(in message: OpenClawChatMessage) -> Bool {
         !self.visibleText(in: message)
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty

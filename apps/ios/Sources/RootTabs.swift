@@ -158,61 +158,12 @@ struct RootTabs: View {
     }
 
     private var phoneTabContent: some View {
-        TabView(selection: self.phoneTabSelection) {
-            PhoneTabSettingsHost(resetRequestID: self.phoneChatSettingsResetRequestID) { openSettingsRoute in
-                ChatProTab(
-                    headerLeadingAction: self.phoneChatReturnAction,
-                    ownsNavigationStack: false,
-                    openSettings: { openSettingsRoute(.gateway) })
-            }
-            .tabItem { Label("Chat", systemImage: "bubble.left.fill") }
-            .tag(AppTab.chat)
-
-            PhoneTabSettingsHost { openSettingsRoute in
-                TalkProTab(
-                    ownsNavigationStack: false,
-                    openSettings: { openSettingsRoute(.gateway) },
-                    openVoiceSettings: { openSettingsRoute(.voice) })
-            }
-            .tabItem {
-                Label(
-                    "Talk",
-                    systemImage: self.appModel.talkMode.isEnabled ? "waveform.circle.fill" : "waveform.circle")
-                    .font(OpenClawType.captionSemiBold)
-            }
-            .tag(AppTab.talk)
-
-            RootTabsPhoneControlHub(
-                groups: Self.phoneControlGroups,
-                initialDestination: Self.requestedInitialSidebarDestination,
-                navigationRequest: self.phoneControlNavigationRequest,
-                openRootDestination: { self.selectSidebarDestination($0) },
-                openChatFromControlDetail: { self.openChatFromControlDetail($0) })
-                .tabItem { Label("Control", systemImage: "square.grid.2x2") }
-                .badge(self.appModel.pendingExecApprovalPrompt == nil ? 0 : 1)
-                .tag(AppTab.control)
-
-            PhoneTabSettingsHost { openSettingsRoute in
-                AgentProTab(
-                    directRoute: .agents,
-                    openSettings: { openSettingsRoute(.gateway) })
-            }
-            .tabItem { Label("Agent", systemImage: "person.2.fill") }
-            .tag(AppTab.agent)
-
-            SettingsProTab(
-                initialRoute: self.selectedSettingsRoute,
-                acceptsGatewaySetupRequests: !self.showOnboarding &&
-                    self.selectedTab == .settings &&
-                    self.selectedSettingsRoute == .gateway,
-                onRouteChange: self.handleSettingsRouteChange,
-                gatewaySetupRequest: self.gatewaySetupRequest,
-                onGatewaySetupRequestHandled: self.handleGatewaySetupRequest)
-                .id(self.settingsTabViewID)
-                .tabItem { Label("Settings", systemImage: "gearshape.fill") }
-                .tag(AppTab.settings)
+        PhoneTabSettingsHost(resetRequestID: self.phoneChatSettingsResetRequestID) { openSettingsRoute in
+            ChatProTab(
+                headerLeadingAction: self.phoneChatReturnAction,
+                ownsNavigationStack: false,
+                openSettings: { openSettingsRoute(.gateway) })
         }
-        .openClawTabBarBehavior()
     }
 
     private var sidebarSplitContent: some View {

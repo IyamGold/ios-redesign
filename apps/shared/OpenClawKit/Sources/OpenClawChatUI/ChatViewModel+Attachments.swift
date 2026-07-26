@@ -66,6 +66,37 @@ extension OpenClawChatViewModel {
         return (UTType(filenameExtension: ext) ?? .data).preferredMIMEType
     }
 
+    /// Stage a file attachment verbatim — no image re-encoding and no image-only guard — for documents
+    /// and animated images (GIFs) that must reach the gateway unmodified. Static photos still go through
+    /// `addImageAttachment` (JPEG normalization); this path preserves the original bytes and MIME so the
+    /// gateway can sniff/route them (image/gif stays an image; other types offload to the agent sandbox).
+    public func addFileAttachment(data: Data, fileName: String, mimeType: String) {
+        self.beginAttachmentStaging()
+        Task {
+            defer { self.endAttachmentStaging() }
+            await self.stageRawAttachment(data: data, fileName: fileName, mimeType: mimeType)
+        }
+    }
+
+    func stageRawAttachment(data: Data, fileName: String, mimeType: String) async {
+        guard data.count <= Self.maxAttachmentBytes else {
+            self.errorText = "Attachment \(fileName) exceeds 5 MB limit"
+            return
+        }
+        // Only images carry a thumbnail preview; UIImage/NSImage decodes a GIF's first frame, which is
+        // enough for the composer chip while the full animated bytes still ship to the gateway.
+        let uti = UTType(mimeType: mimeType) ?? UTType(filenameExtension: (fileName as NSString).pathExtension)
+        let preview = (uti?.conforms(to: .image) ?? false) ? Self.previewImage(data: data) : nil
+        self.attachments.append(
+            OpenClawPendingAttachment(
+                url: nil,
+                data: data,
+                fileName: fileName,
+                mimeType: mimeType,
+                type: "file",
+                preview: preview))
+    }
+
     func addImageAttachment(url: URL?, data: Data, fileName: String, mimeType: String) async {
         let uti: UTType = {
             if let url {
