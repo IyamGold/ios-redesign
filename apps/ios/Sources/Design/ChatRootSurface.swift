@@ -36,6 +36,8 @@ struct ChatRootSurface: View {
     @State private var diskCachedKeys: Set<String> = []
     /// Armed on send; fires the reply-intro haptic once when the assistant's reply first appears.
     @State private var replyIntroArmed = false
+    /// Armed on send; fires the crisp closing click once when the assistant's run completes.
+    @State private var replyEndArmed = false
 
     private static let bubbleRed = Color(red: 195 / 255, green: 63 / 255, blue: 51 / 255)
     private static let bottomAnchorID = "chat-bottom-anchor"
@@ -150,7 +152,15 @@ struct ChatRootSurface: View {
                     self.fireReplyIntroIfArmed()
                 }
             }
-            .onChange(of: self.isAssistantWorking) { _, _ in self.scrollToBottom(proxy) }
+            .onChange(of: self.isAssistantWorking) { old, new in
+                self.scrollToBottom(proxy)
+                // Run finished (pending cleared): close the reply with one crisp click.
+                if old, !new, self.replyEndArmed {
+                    self.replyEndArmed = false
+                    self.replyIntroArmed = false
+                    OpenClawHaptics.click()
+                }
+            }
         }
     }
 
@@ -158,13 +168,13 @@ struct ChatRootSurface: View {
         self.rows.reduce(0) { $0 + ($1.isUser ? 0 : 1) }
     }
 
-    /// Warning-pattern haptic that introduces an incoming reply. Armed on send and fired once by whichever
-    /// signal lands first (streamed token or a finalized assistant row), so it can't double-fire or buzz
-    /// while a transcript loads. The kit still fires its single tap when the run completes.
+    /// Two-phase reply haptics, both armed on send: a warning pattern introduces the reply (fired once by
+    /// whichever lands first — streamed token or finalized row, so it can't buzz while a transcript loads),
+    /// and a crisp click closes it out when the run completes (see the isAssistantWorking transition above).
     private func fireReplyIntroIfArmed() {
         guard self.replyIntroArmed else { return }
         self.replyIntroArmed = false
-        OpenClawHaptics.play(.warning)
+        OpenClawHaptics.play(.secured4)
     }
 
     /// User turns stay in a chat bubble; assistant turns render free (no bubble, full width) so code
@@ -601,6 +611,7 @@ struct ChatRootSurface: View {
     private func sendCurrentInput() {
         guard self.hasDraft, self.canSendLive else { return }
         self.replyIntroArmed = true
+        self.replyEndArmed = true
         self.viewModel.send()
     }
 
@@ -742,16 +753,15 @@ struct ChatRootSurface: View {
                     .scaledToFit()
                     .frame(width: 12, height: 12)
                     .foregroundStyle(.black)
-                    .padding(6)
+                    .padding(2)
                     .background { Circle().fill(.white) }
-                    // Pad the tappable area out to a comfortable target so the tap isn't lost to the
-                    // horizontal scroll gesture, but keep the visible chip small.
-                    .frame(width: 40, height: 40)
+                    // Keep the small chip pinned to the corner, but extend the tappable area inward over
+                    // the image so the tap isn't lost to the horizontal scroll gesture.
+                    .frame(width: 34, height: 34, alignment: .topTrailing)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.top, 2)
-            .padding(.trailing, 2)
+            .padding(4)
         }
     }
 

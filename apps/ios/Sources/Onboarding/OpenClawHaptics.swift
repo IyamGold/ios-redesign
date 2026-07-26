@@ -27,6 +27,19 @@ enum OpenClawHaptics {
     static func tap() {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
+
+    /// Alert-style feedback (the two-buzz warning pattern) — used to introduce an assistant reply.
+    /// Named to match `tap()`'s semantic grammar rather than exposing the raw pattern at the call site.
+    @MainActor
+    static func error() {
+        self.play(.warning)
+    }
+
+    /// One crisp click (the minimalist `secured1` pattern) — used to close out an assistant reply.
+    @MainActor
+    static func click() {
+        self.play(.secured1)
+    }
 }
 
 @MainActor
