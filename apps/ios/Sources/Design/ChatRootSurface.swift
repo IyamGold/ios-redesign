@@ -26,6 +26,8 @@ struct ChatRootSurface: View {
     @State private var showsFileImporter = false
     /// Voice-note recorder — the composer mic records an m4a clip staged as an audio attachment.
     @State private var voiceRecorder = OpenClawVoiceNoteRecorder()
+    /// On-device transcripts of staged voice notes, keyed by attachment id, sent as the message body.
+    @State private var voiceTranscripts: [OpenClawPendingAttachment.ID: String] = [:]
     /// Transcript rows are projected once whenever `messages` changes — not per body pass — so the
     /// AssistantTextParser doesn't run on every keystroke / streamed token (what kept it off 60fps).
     @State private var rows: [ChatDisplayRow] = []
@@ -34,6 +36,10 @@ struct ChatRootSurface: View {
     @State private var imageCache: [String: [UIImage]] = [:]
     /// Keys already written to the disk cache this session, so we encode/write each turn's images once.
     @State private var diskCachedKeys: Set<String> = []
+    /// Decoded audio/file chips kept (in memory) across a turn's provisional→canonical swap.
+    @State private var chipCache: [String: [ChatAttachmentChip]] = [:]
+    /// Keys whose chips are already written to the disk cache this session.
+    @State private var diskCachedChipKeys: Set<String> = []
     /// Armed on send; fires the reply-intro haptic once when the assistant's reply first appears.
     @State private var replyIntroArmed = false
     /// Armed on send; fires the crisp closing click once when the assistant's run completes.
@@ -217,10 +223,10 @@ struct ChatRootSurface: View {
             guard role == "user" || role == "assistant" else { continue }
             let decoded = Self.decodeAttachments(from: message)
             var images = decoded.images
-            let chips = decoded.chips
-            // Persist a turn's images across the provisional→canonical swap: the gateway replaces the
-            // optimistic user echo (which carries the image bytes) with a text-only "See attached." row,
-            // so cache decoded images under the stable idempotency key and reuse them once bytes vanish.
+            var chips = decoded.chips
+            // Persist a turn's attachments across the provisional→canonical swap: the gateway replaces the
+            // optimistic user echo (which carries the bytes) with a text-only "See attached." row, so cache
+            // the decoded pieces under the stable idempotency key and reuse them once the bytes vanish.
             if let key = Self.attachmentCacheKey(for: message) {
                 if !images.isEmpty {
                     self.imageCache[key] = images
@@ -239,12 +245,36 @@ struct ChatRootSurface: View {
                         images = disk
                     }
                 }
+                // Audio/file chips must be cached PAYLOAD-AWARE: unlike images (whose block is stripped
+                // entirely), the canonical audio/file row keeps a byte-LESS block, so decodeAttachments
+                // still yields a chip with a nil payload. Caching that would clobber the good bytes and
+                // break playback/thumbnails + relaunch. So only cache/persist chips that carry bytes, and
+                // recover from memory→disk whenever this render's chips lack them.
+                if chips.contains(where: { $0.payload != nil }) {
+                    self.chipCache[key] = chips
+                    if self.diskCachedChipKeys.insert(key).inserted {
+                        ChatChipDiskCache.store(chips, key: key)
+                    }
+                } else if let cachedChips = self.chipCache[key],
+                          cachedChips.contains(where: { $0.payload != nil })
+                {
+                    chips = cachedChips
+                } else {
+                    let diskChips = ChatChipDiskCache.load(key: key)
+                    if diskChips.contains(where: { $0.payload != nil }) {
+                        self.chipCache[key] = diskChips
+                        self.diskCachedChipKeys.insert(key)
+                        chips = diskChips
+                    }
+                }
             }
             var text = ChatMessageVisibleText.visibleText(in: message)
-            // When we can show the attachments themselves, drop the "See attached." placeholder the VM
-            // stamps on attachment-only sends (ChatViewModel.send) so it doesn't caption them.
-            if !images.isEmpty || !chips.isEmpty,
-               text.trimmingCharacters(in: .whitespacesAndNewlines) == "See attached."
+            // A voice note's message body is its on-device transcript (or the "See attached." placeholder);
+            // either way the audio bubble is the whole UI, so never render the text for an audio turn.
+            if chips.contains(where: { $0.kind == .audio }) {
+                text = ""
+            } else if !images.isEmpty || !chips.isEmpty,
+                      text.trimmingCharacters(in: .whitespacesAndNewlines) == "See attached."
             {
                 text = ""
             }
@@ -288,16 +318,36 @@ struct ChatRootSurface: View {
             if isImage, let image = Self.decodeImage(block) {
                 images.append(image)
             } else if mime.hasPrefix("audio/") {
-                let title = block.durationSeconds
-                    .map { "Voice note · \(Self.durationLabel($0))" } ?? "Voice note"
-                chips.append(ChatAttachmentChip(systemImage: "waveform", title: title))
+                chips.append(ChatAttachmentChip(
+                    kind: .audio,
+                    title: "Voice note",
+                    fileName: block.fileName,
+                    payload: Self.decodeData(block),
+                    durationSeconds: block.durationSeconds ?? 0))
             } else if isImage {
-                chips.append(ChatAttachmentChip(systemImage: "photo", title: block.fileName ?? "Photo"))
+                chips.append(ChatAttachmentChip(
+                    kind: .photo,
+                    title: block.fileName ?? "Photo",
+                    fileName: block.fileName,
+                    payload: nil,
+                    durationSeconds: 0))
             } else {
-                chips.append(ChatAttachmentChip(systemImage: "doc", title: block.fileName ?? "Attachment"))
+                chips.append(ChatAttachmentChip(
+                    kind: .file,
+                    title: block.fileName ?? "Attachment",
+                    fileName: block.fileName,
+                    payload: Self.decodeData(block),
+                    durationSeconds: 0))
             }
         }
         return (images, chips)
+    }
+
+    /// Decode a content block's base64 payload to raw bytes (audio for playback, files for QuickLook).
+    private static func decodeData(_ block: OpenClawChatMessageContent) -> Data? {
+        guard let raw = block.content?.value as? String else { return nil }
+        let base64 = raw.firstIndex(of: ",").map { String(raw[raw.index(after: $0)...]) } ?? raw
+        return Data(base64Encoded: base64)
     }
 
     /// Stable per-turn key for the image cache. Prefers the idempotency key, which the gateway persists
@@ -433,13 +483,19 @@ struct ChatRootSurface: View {
         // Bottom-aligned so the +/send buttons and the mic stay pinned as the field grows upward.
         HStack(alignment: .bottom, spacing: 10) {
             Button {
-                if self.showsAttachmentTray {
+                if self.voiceRecorder.isRecording {
+                    self.cancelRecording()
+                } else if let note = self.stagedVoiceNote {
+                    withAnimation(.spring(duration: 0.25)) {
+                        self.viewModel.attachments.removeAll { $0.id == note.id }
+                    }
+                } else if self.showsAttachmentTray {
                     self.closeAttachmentTray()
                 } else {
                     self.openAttachmentTray()
                 }
             } label: {
-                Image("ChatPlusGlyph")
+                Image(self.plusButtonShowsClose ? "ChatCloseGlyph" : "ChatPlusGlyph")
                     .renderingMode(.template)
                     .resizable()
                     .scaledToFit()
@@ -479,13 +535,24 @@ struct ChatRootSurface: View {
         }
     }
 
-    /// Three states: a recording readout, the plain pill input, or — when attachments are staged — a
-    /// glass panel that stacks the pending-attachment strip above the input row.
+    /// A staged voice note plays back in the field itself; otherwise a recording readout, the plain pill
+    /// input, or — when other attachments are staged — a glass panel stacking the strip over the input.
     @ViewBuilder private var composerFieldContent: some View {
         if self.voiceRecorder.isRecording {
             self.recordingField
                 .frame(minHeight: 36)
                 .background { self.fieldPillBackground }
+        } else if let voiceNote = self.stagedVoiceNote {
+            StagedVoiceNoteField(
+                data: voiceNote.data,
+                durationSeconds: voiceNote.durationSeconds ?? 0)
+                .frame(minHeight: 36)
+                .background {
+                    ChatGlassBackground(
+                        shape: RoundedRectangle(cornerRadius: 15, style: .continuous),
+                        fill: self.composerGlassFill,
+                        hairline: true)
+                }
         } else if self.viewModel.attachments.isEmpty {
             self.inputField
                 .frame(minHeight: 36)
@@ -498,6 +565,16 @@ struct ChatRootSurface: View {
             .padding(5)
             .background { ChatGlassPanel(fill: self.composerGlassFill, cornerRadius: 15) }
         }
+    }
+
+    /// The first staged audio attachment (a voice note), if any — it takes over the composer field.
+    private var stagedVoiceNote: OpenClawPendingAttachment? {
+        self.viewModel.attachments.first { $0.type == "audio" || $0.mimeType.hasPrefix("audio/") }
+    }
+
+    /// The leading button becomes a discard/cancel ✕ while recording or while a voice note is staged.
+    private var plusButtonShowsClose: Bool {
+        self.voiceRecorder.isRecording || self.stagedVoiceNote != nil
     }
 
     /// Pill while single-line; tightens to 15pt once the text wraps so a tall field isn't a stadium.
@@ -514,13 +591,17 @@ struct ChatRootSurface: View {
                 .font(.system(size: 16))
                 .lineLimit(1...4)
                 .onSubmit(self.sendCurrentInput)
-            Button(action: self.startRecording) {
-                Image("ChatMicGlyph")
-                    .renderingMode(.template)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 20, height: 20)
-                    .foregroundStyle(Color.primary.opacity(0.9))
+            // The mic only shows in the empty state — once attachments are staged the field is for a
+            // caption (or is taken over by a voice note), so recording a new note there is out of place.
+            if self.viewModel.attachments.isEmpty {
+                Button(action: self.startRecording) {
+                    Image("ChatMicGlyph")
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 20, height: 20)
+                        .foregroundStyle(Color.primary.opacity(0.9))
+                }
             }
         }
         .padding(.horizontal, 14)
@@ -528,19 +609,23 @@ struct ChatRootSurface: View {
     }
 
     private var recordingField: some View {
+        // Cancel lives on the leading composer button (turns to ✕ while recording), so the field is just
+        // the level meter + elapsed time.
         HStack(spacing: 10) {
             Circle()
                 .fill(Self.bubbleRed)
                 .frame(width: 8, height: 8)
+            // Live mic levels scroll left as they arrive (no progress — it's happening now).
+            ChatAmplitudeWaveform(
+                levels: self.voiceRecorder.liveLevels,
+                color: Color.primary.opacity(0.4))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .clipped()
             Text(Self.durationLabel(self.voiceRecorder.elapsedSeconds))
                 .font(.system(size: 16).monospacedDigit())
                 .foregroundStyle(Color.primary)
-            Spacer(minLength: 0)
-            Button(action: self.cancelRecording) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Color.primary.opacity(0.7))
-            }
+                .lineLimit(1)
+                .fixedSize()
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
@@ -610,6 +695,32 @@ struct ChatRootSurface: View {
 
     private func sendCurrentInput() {
         guard self.hasDraft, self.canSendLive else { return }
+        // A voice note with no typed caption sends its on-device transcript as the message body so
+        // OpenClaw can read it (hidden in the UI — see rebuildRows). Ensure the transcript is ready:
+        // use the one prepared on finish, else transcribe on the spot (first note may download the model).
+        if self.viewModel.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let note = self.stagedVoiceNote
+        {
+            Task { @MainActor in
+                let transcript: String? = if let cached = self.voiceTranscripts[note.id] {
+                    cached
+                } else {
+                    await VoiceNoteTranscriber.transcribe(data: note.data)
+                }
+                if let transcript, !transcript.isEmpty,
+                   self.viewModel.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   self.viewModel.attachments.contains(where: { $0.id == note.id })
+                {
+                    self.viewModel.input = transcript
+                }
+                self.armAndSend()
+            }
+            return
+        }
+        self.armAndSend()
+    }
+
+    private func armAndSend() {
         self.replyIntroArmed = true
         self.replyEndArmed = true
         self.viewModel.send()
@@ -632,6 +743,18 @@ struct ChatRootSurface: View {
             // Reset .finished -> .idle so the next take can start (start() only proceeds from .idle).
             // addVoiceNoteAttachment already consumed/removed the file, so cancel()'s cleanup is a no-op.
             self.voiceRecorder.cancel()
+            // Transcribe on-device in the background so the transcript is ready by the time we send.
+            guard let note = self.viewModel.attachments.last(where: { $0.mimeType.hasPrefix("audio/") })
+            else { return }
+            let id = note.id
+            let data = note.data
+            Task {
+                if let transcript = await VoiceNoteTranscriber.transcribe(data: data),
+                   !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                {
+                    self.voiceTranscripts[id] = transcript
+                }
+            }
         }
     }
 
@@ -728,14 +851,9 @@ struct ChatRootSurface: View {
                     Image(uiImage: preview)
                         .resizable()
                         .scaledToFill()
-                } else if attachment.mimeType.hasPrefix("audio/") {
-                    // Voice note: mic + duration instead of the temp .m4a filename.
-                    self.fileTile(
-                        systemImage: "mic.fill",
-                        caption: Self.durationLabel(attachment.durationSeconds ?? 0))
                 } else {
-                    // Non-image file: a labeled tile so multiple files stay distinguishable.
-                    self.fileTile(asset: "ChatFilesGlyph", caption: attachment.fileName)
+                    // Non-image file: a red card with its extension + name (no preview in the composer).
+                    self.fileCardTile(attachment)
                 }
             }
             .frame(width: 100, height: 100)
@@ -765,32 +883,33 @@ struct ChatRootSurface: View {
         }
     }
 
-    /// A tile for non-preview attachments: a glyph (asset or SF Symbol) over a truncated caption.
-    private func fileTile(asset: String? = nil, systemImage: String? = nil, caption: String) -> some View {
-        VStack(spacing: 3) {
-            Group {
-                if let asset {
-                    Image(asset)
-                        .renderingMode(.template)
-                        .resizable()
-                        .scaledToFit()
-                } else {
-                    Image(systemName: systemImage ?? "doc")
-                        .resizable()
-                        .scaledToFit()
-                }
-            }
-            .frame(width: 20, height: 20)
-            .foregroundStyle(Color.primary.opacity(0.7))
-            Text(caption)
-                .font(.system(size: 9))
+    /// Composer file card: a red tile showing the extension label (top) and the file's name (bottom).
+    private func fileCardTile(_ attachment: OpenClawPendingAttachment) -> some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(red: 195 / 255, green: 63 / 255, blue: 51 / 255))
+            Text(Self.fileExtensionLabel(for: attachment))
+                .font(.system(size: 16))
+                .foregroundStyle(.white.opacity(0.6))
+                .padding(.leading, 6)
+                .padding(.top, 10)
+            Text(attachment.fileName.isEmpty
+                ? "file"
+                : (attachment.fileName as NSString).deletingPathExtension)
+                .font(.system(size: 16))
+                .foregroundStyle(.white)
                 .lineLimit(1)
-                .truncationMode(.middle)
-                .foregroundStyle(Color.primary.opacity(0.7))
-                .padding(.horizontal, 4)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 8)
+                .frame(maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 11)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.primary.opacity(0.08))
+        .frame(width: 100, height: 100)
+    }
+
+    private static func fileExtensionLabel(for attachment: OpenClawPendingAttachment) -> String {
+        let ext = (attachment.fileName as NSString).pathExtension
+        return ext.isEmpty ? "FILE" : ext.uppercased()
     }
 
     // MARK: - Attachment ingestion
@@ -891,13 +1010,99 @@ private enum ChatImageDiskCache {
     }
 }
 
+/// Persists audio/file chips (metadata + raw payload) so voice notes and files survive a relaunch —
+/// the counterpart to `ChatImageDiskCache`, since the gateway drops the bytes from the canonical row.
+private enum ChatChipDiskCache {
+    private struct Entry: Codable {
+        let kind: String
+        let title: String
+        let fileName: String?
+        let durationSeconds: Double
+        let hasPayload: Bool
+    }
+
+    private static let directory: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("ChatAttachmentChips", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    private static func safe(_ key: String) -> String {
+        Data(key.utf8).base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private static func manifestURL(_ key: String) -> URL {
+        self.directory.appendingPathComponent("\(self.safe(key)).json")
+    }
+
+    private static func payloadURL(_ key: String, index: Int) -> URL {
+        self.directory.appendingPathComponent("\(self.safe(key))-\(index).bin")
+    }
+
+    static func store(_ chips: [ChatAttachmentChip], key: String) {
+        let entries = chips.map {
+            Entry(
+                kind: $0.kind.rawValue,
+                title: $0.title,
+                fileName: $0.fileName,
+                durationSeconds: $0.durationSeconds,
+                hasPayload: $0.payload != nil)
+        }
+        let payloads = chips.map(\.payload)
+        guard let manifest = try? JSONEncoder().encode(entries) else { return }
+        Task.detached(priority: .utility) {
+            try? manifest.write(to: self.manifestURL(key))
+            for (index, payload) in payloads.enumerated() {
+                if let payload {
+                    try? payload.write(to: self.payloadURL(key, index: index))
+                }
+            }
+        }
+    }
+
+    static func load(key: String) -> [ChatAttachmentChip] {
+        guard let manifest = try? Data(contentsOf: self.manifestURL(key)),
+              let entries = try? JSONDecoder().decode([Entry].self, from: manifest)
+        else { return [] }
+        return entries.enumerated().map { index, entry in
+            let payload = entry.hasPayload ? try? Data(contentsOf: self.payloadURL(key, index: index)) : nil
+            return ChatAttachmentChip(
+                kind: ChatAttachmentChip.Kind(rawValue: entry.kind) ?? .file,
+                title: entry.title,
+                fileName: entry.fileName,
+                payload: payload ?? nil,
+                durationSeconds: entry.durationSeconds)
+        }
+    }
+}
+
 // MARK: - Display model
 
-/// A non-image attachment rendered as a metadata chip (file / voice note / bytes-less photo).
+/// A non-image attachment projected for the transcript: a voice note (playable), a document (QuickLook
+/// thumbnail), or a bytes-less image. Carries the raw payload so audio can play and files can thumbnail.
 private struct ChatAttachmentChip: Identifiable {
+    enum Kind: String {
+        case audio
+        case file
+        case photo
+    }
+
     let id = UUID()
-    let systemImage: String
+    let kind: Kind
     let title: String
+    let fileName: String?
+    let payload: Data?
+    let durationSeconds: Double
+
+    var fileExtension: String? {
+        guard let name = self.fileName else { return nil }
+        let ext = (name as NSString).pathExtension
+        return ext.isEmpty ? nil : ext
+    }
 }
 
 /// Flat, pre-projected transcript row. Holding parsed text here keeps the parser off the render path.
@@ -982,14 +1187,81 @@ private struct ChatUserBubble: View {
         Group {
             if !self.row.images.isEmpty {
                 self.imageBubble
-            } else if !self.row.chips.isEmpty {
-                self.fileBubble
+            } else if let audioChip = self.audioChip {
+                self.audioStack(audioChip)
+            } else if !self.fileChips.isEmpty {
+                self.fileStack
             } else {
                 self.textBubble
             }
         }
         .frame(maxWidth: Self.maxBubbleWidth, alignment: .trailing)
         .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private var audioChip: ChatAttachmentChip? {
+        self.row.chips.first { $0.kind == .audio }
+    }
+
+    private var fileChips: [ChatAttachmentChip] {
+        self.row.chips.filter { $0.kind != .audio }
+    }
+
+    /// A voice note plays back in its own bubble; a typed caption becomes a separate bubble below it.
+    private func audioStack(_ chip: ChatAttachmentChip) -> some View {
+        VStack(alignment: .trailing, spacing: 5) {
+            self.audioBubble(data: chip.payload, durationSeconds: chip.durationSeconds)
+            if !self.row.text.isEmpty {
+                self.textBubble
+            }
+        }
+    }
+
+    /// One card per file; a typed caption becomes a separate bubble below.
+    private var fileStack: some View {
+        VStack(alignment: .trailing, spacing: 5) {
+            ForEach(self.fileChips) { chip in
+                self.fileCardBubble(chip)
+            }
+            if !self.row.text.isEmpty {
+                self.textBubble
+            }
+        }
+    }
+
+    private func audioBubble(data: Data?, durationSeconds: Double) -> some View {
+        AudioBubbleContent(
+            data: data,
+            durationSeconds: durationSeconds,
+            fill: Self.bubbleFill,
+            shape: self.bubbleShape,
+            metaRow: AnyView(self.metaRow))
+    }
+
+    /// A file card: QuickLook thumbnail on the left, name centered, meta in the corner.
+    private func fileCardBubble(_ chip: ChatAttachmentChip) -> some View {
+        ZStack(alignment: .topLeading) {
+            self.bubbleShape.fill(Self.bubbleFill)
+            HStack(spacing: 0) {
+                ChatFileThumbnail(
+                    payload: chip.payload,
+                    fileName: chip.fileName ?? chip.title,
+                    fallbackLabel: chip.fileExtension?.uppercased() ?? "FILE")
+                    .padding(.leading, 7)
+                    .padding(.vertical, 6)
+                Text(chip.title)
+                    .font(.system(size: 16))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 8)
+            }
+        }
+        .frame(width: 237, height: 87)
+        .overlay(alignment: .bottomTrailing) {
+            self.metaRow.padding(.trailing, 10).padding(.bottom, 2)
+        }
     }
 
     private var textBubble: some View {
@@ -1018,13 +1290,7 @@ private struct ChatUserBubble: View {
     private var imageBubble: some View {
         VStack(spacing: 8) {
             ZStack(alignment: .bottomTrailing) {
-                VStack(spacing: 6) {
-                    self.imageMosaic
-                    // A mixed send (image + document) shows the file chips under the mosaic.
-                    ForEach(self.row.chips) { chip in
-                        self.chipRow(chip)
-                    }
-                }
+                ChatImageMosaic(images: self.row.images)
                 if self.row.text.isEmpty {
                     self.overlayMetaChip
                         .padding(4)
@@ -1045,91 +1311,6 @@ private struct ChatUserBubble: View {
         .padding(3)
         .frame(width: 250)
         .background { self.bubbleShape.fill(Self.bubbleFill) }
-    }
-
-    @ViewBuilder
-    private var imageMosaic: some View {
-        let images = self.row.images
-        let tile = RoundedRectangle(cornerRadius: 9, style: .continuous)
-        switch images.count {
-        case 0:
-            EmptyView()
-        case 1:
-            Image(uiImage: images[0]).resizable().scaledToFill()
-                .frame(width: 244, height: 244).clipShape(tile)
-        case 2:
-            HStack(spacing: 2) {
-                Image(uiImage: images[0]).resizable().scaledToFill()
-                    .frame(width: 129, height: 244).clipShape(tile)
-                Image(uiImage: images[1]).resizable().scaledToFill()
-                    .frame(width: 113, height: 244).clipShape(tile)
-            }
-        default:
-            HStack(spacing: 2) {
-                Image(uiImage: images[0]).resizable().scaledToFill()
-                    .frame(width: 129, height: 244).clipShape(tile)
-                VStack(spacing: 2) {
-                    Image(uiImage: images[1]).resizable().scaledToFill()
-                        .frame(width: 113, height: 121).clipShape(tile)
-                    ZStack {
-                        Image(uiImage: images[2]).resizable().scaledToFill()
-                            .frame(width: 113, height: 121).clipShape(tile)
-                        if images.count > 3 {
-                            tile.fill(Color(red: 10 / 255, green: 10 / 255, blue: 10 / 255).opacity(0.5))
-                                .frame(width: 113, height: 121)
-                            Text("+ \(images.count - 3)")
-                                .font(.system(size: 24))
-                                .tracking(-2.4)
-                                .foregroundStyle(.white)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Non-image attachment turn (files, voice notes): a stack of metadata chips plus caption/meta.
-    private var fileBubble: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(self.row.chips) { chip in
-                self.chipRow(chip)
-            }
-            if !self.row.text.isEmpty {
-                Text(self.row.text)
-                    .font(.system(size: 16))
-                    .foregroundStyle(self.textColor)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            if self.showsMeta {
-                self.metaRow
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .frame(width: 230, alignment: .leading)
-        .background { self.bubbleShape.fill(Self.bubbleFill) }
-    }
-
-    private func chipRow(_ chip: ChatAttachmentChip) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: chip.systemImage)
-                .font(.system(size: 16))
-                .foregroundStyle(self.textColor)
-                .frame(width: 22)
-            Text(chip.title)
-                .font(.system(size: 14))
-                .foregroundStyle(self.textColor)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
-        .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.white.opacity(0.15))
-        }
     }
 
     private var metaRow: some View {
@@ -1185,6 +1366,66 @@ private struct ChatUserBubble: View {
     }
 }
 
+// MARK: - Audio bubble
+
+/// A sent voice note: play/pause + waveform that fills as it plays, with the elapsed/total time. Holds
+/// its own `ChatAudioPlayback` so each bubble tracks its own progress independently.
+private struct AudioBubbleContent: View {
+    let data: Data?
+    let durationSeconds: Double
+    let fill: Color
+    let shape: UnevenRoundedRectangle
+    let metaRow: AnyView
+    @State private var playback = ChatAudioPlayback()
+    @State private var levels: [Float] = []
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            HStack(spacing: 12) {
+                Button {
+                    if let data = self.data {
+                        self.playback.toggle(data: data)
+                    }
+                } label: {
+                    if self.playback.isPlaying {
+                        ChatPauseGlyph(color: .white)
+                    } else {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 18))
+                            .foregroundStyle(.white)
+                    }
+                }
+                .disabled(self.data == nil)
+                ChatAmplitudeWaveform(
+                    levels: self.levels,
+                    color: .white.opacity(0.4),
+                    activeColor: .white,
+                    progress: self.playback.progress)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .clipped()
+                Text(chatDurationLabel(
+                    self.playback.currentTime > 0
+                        ? self.playback.currentTime
+                        : self.durationSeconds))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            self.metaRow
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(width: 242)
+        .background { self.shape.fill(self.fill) }
+        .task(id: self.data) {
+            guard let data = self.data else { return }
+            self.levels = await ChatAudioEnvelope.levels(from: data, barCount: 36)
+        }
+    }
+}
+
 // MARK: - Assistant message (bubble-less)
 
 /// Assistant turns render free of any bubble: full transcript width, no timestamp, with fenced code
@@ -1195,10 +1436,16 @@ private struct ChatAssistantMessage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ChatFormattedText(
-                text: self.row.text,
-                isUser: false,
-                textColor: self.colorScheme == .dark ? .white : .black)
+            // Assistant-delivered images get the same tap → viewer → zoom → save experience as user images.
+            if !self.row.images.isEmpty {
+                ChatImageMosaic(images: self.row.images)
+            }
+            if !self.row.text.isEmpty {
+                ChatFormattedText(
+                    text: self.row.text,
+                    isUser: false,
+                    textColor: self.colorScheme == .dark ? .white : .black)
+            }
             if !self.row.isStreaming, self.row.timestamp != nil {
                 Text(chatTimeString(for: self.row.timestamp))
                     .font(.system(size: 12))

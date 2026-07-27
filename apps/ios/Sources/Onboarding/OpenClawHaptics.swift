@@ -40,6 +40,12 @@ enum OpenClawHaptics {
     static func click() {
         self.play(.secured1)
     }
+
+    /// Standard success notification — e.g. after saving an image to the photo library.
+    @MainActor
+    static func success() {
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+    }
 }
 
 @MainActor

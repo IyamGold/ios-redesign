@@ -21,6 +21,13 @@ public protocol VoiceNoteAudioCapture: AnyObject {
 
     /// Reports capture loss after a recording has started.
     func setFailureHandler(_ handler: @escaping @MainActor () -> Void)
+
+    /// Current average input power in dB (nil when metering is unavailable). Sampled for the live waveform.
+    func currentPower() -> Float?
+}
+
+public extension VoiceNoteAudioCapture {
+    func currentPower() -> Float? { nil }
 }
 
 /// A completed voice-note recording ready to stage as a chat attachment.
@@ -51,8 +58,12 @@ public final class OpenClawVoiceNoteRecorder {
 
     public private(set) var state: State = .idle
     public private(set) var elapsedSeconds: TimeInterval = 0
+    /// Rolling mic levels (0…1) sampled while recording, for a live amplitude waveform.
+    public private(set) var liveLevels: [Float] = []
 
     @ObservationIgnored public var onRecordingActiveChanged: (@MainActor (Bool) -> Void)?
+    @ObservationIgnored private let liveBarCapacity = 40
+    @ObservationIgnored private var meterTask: Task<Void, Never>?
 
     @ObservationIgnored private let capture: any VoiceNoteAudioCapture
     @ObservationIgnored private let durationLimit: TimeInterval
@@ -84,6 +95,7 @@ public final class OpenClawVoiceNoteRecorder {
 
     deinit {
         self.timerTask?.cancel()
+        self.meterTask?.cancel()
     }
 
     public var isRecording: Bool {
@@ -166,6 +178,7 @@ public final class OpenClawVoiceNoteRecorder {
 
         self.state = .recording(startedAt: self.now(), fileURL: fileURL)
         self.startTimer()
+        self.startMetering()
         return true
     }
 
@@ -174,6 +187,7 @@ public final class OpenClawVoiceNoteRecorder {
     public func finish() -> OpenClawVoiceNoteRecording? {
         guard case let .recording(_, fileURL) = self.state else { return nil }
 
+        self.stopMetering()
         self.timerTask?.cancel()
         self.timerTask = nil
         let duration = max(0, self.capture.stop())
@@ -197,6 +211,7 @@ public final class OpenClawVoiceNoteRecorder {
             nil
         }
 
+        self.stopMetering()
         self.timerTask?.cancel()
         self.timerTask = nil
         self.capture.cancel()
@@ -228,7 +243,37 @@ public final class OpenClawVoiceNoteRecorder {
         }
     }
 
+    private func startMetering() {
+        self.liveLevels = []
+        self.meterTask?.cancel()
+        self.meterTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if let db = self.capture.currentPower() {
+                    self.liveLevels.append(Self.normalizedLevel(db))
+                    if self.liveLevels.count > self.liveBarCapacity {
+                        self.liveLevels.removeFirst()
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+    }
+
+    private func stopMetering() {
+        self.meterTask?.cancel()
+        self.meterTask = nil
+        self.liveLevels = []
+    }
+
+    /// Map -50dB…0dB to 0…1 (below -50dB is effectively silence).
+    private static func normalizedLevel(_ db: Float) -> Float {
+        let clamped = max(db, -50)
+        return (clamped + 50) / 50
+    }
+
     private func fail(message: String) {
+        self.stopMetering()
         self.timerTask?.cancel()
         self.timerTask = nil
         let wasRecording = self.isRecording
@@ -317,6 +362,7 @@ public final class OpenClawVoiceNoteAudioCapture: NSObject, VoiceNoteAudioCaptur
             ]
             let recorder = try AVAudioRecorder(url: url, settings: settings)
             recorder.delegate = self
+            recorder.isMeteringEnabled = true
             guard recorder.record() else {
                 throw NSError(
                     domain: "OpenClawVoiceNoteAudioCapture",
@@ -337,6 +383,12 @@ public final class OpenClawVoiceNoteAudioCapture: NSObject, VoiceNoteAudioCaptur
         self.recorder = nil
         self.deactivateAudioSession()
         return duration
+    }
+
+    public func currentPower() -> Float? {
+        guard let recorder = self.recorder, recorder.isRecording else { return nil }
+        recorder.updateMeters()
+        return recorder.averagePower(forChannel: 0)
     }
 
     public func cancel() {
