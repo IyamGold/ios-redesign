@@ -433,6 +433,24 @@ private actor AsyncGate {
     }
 }
 
+/// Like `AsyncGate` but resumes every queued waiter, so multiple concurrent history refreshes can
+/// all hold until released without leaking a continuation.
+private actor OpenOnceGate {
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
+
+    func wait() async {
+        guard !self.isOpen else { return }
+        await withCheckedContinuation { self.waiters.append($0) }
+    }
+
+    func open() {
+        self.isOpen = true
+        for waiter in self.waiters { waiter.resume() }
+        self.waiters.removeAll()
+    }
+}
+
 private actor AsyncCounter {
     private var value: Int
 
@@ -1099,6 +1117,43 @@ struct ChatViewModelTests {
         #expect(await MainActor.run { !vm.canSend })
     }
 
+    @Test func `foreground snapshot does not regress live streamed reply`() async throws {
+        // A foreground/mid-run refresh can carry a gateway snapshot that lags the live WS deltas.
+        // Adopting it must not move the visible reply backward (or blank it) — the mid-stream
+        // "reply disappears then reappears when complete" glitch.
+        let firstHistory = historyPayload(
+            inFlightRun: OpenClawChatInFlightRun(runId: "run-active", text: "Hi"))
+        let laggingHistory = historyPayload(
+            messages: [chatTextMessage(role: "user", text: "ping", timestamp: 1, idempotencyKey: "ping:user")],
+            inFlightRun: OpenClawChatInFlightRun(runId: "run-active", text: "Hi"))
+        let historyCalls = AsyncCounter()
+        let (transport, vm) = await makeViewModel(
+            historyResponses: [firstHistory, laggingHistory],
+            requestHistoryHook: { _ in _ = await historyCalls.increment() })
+
+        try await loadAndWaitBootstrap(vm: vm)
+        try await waitUntil("initial snapshot seeded") {
+            await MainActor.run { vm.streamingAssistantText == "Hi" }
+        }
+
+        // Live deltas advance the reply well past the snapshot.
+        let liveReply = "Hi there, this is the full live reply"
+        emitAssistantText(transport: transport, runId: "run-active", text: liveReply)
+        try await waitUntil("live delta applied") {
+            await MainActor.run { vm.streamingAssistantText == liveReply }
+        }
+
+        // A foreground refresh re-delivers the STALE, shorter snapshot ("Hi").
+        await MainActor.run { vm.resumeFromForeground() }
+        // The marker row lands in the same apply pass as the in-flight snapshot, so once it is
+        // visible the snapshot has been adopted — assert deterministically after that.
+        try await waitUntil("lagging refresh applied") {
+            await MainActor.run { vm.messages.containsUserText("ping") }
+        }
+
+        #expect(await MainActor.run { vm.streamingAssistantText } == liveReply)
+    }
+
     @Test func `foreground history refreshes adopted run snapshot`() async throws {
         let firstHistory = historyPayload(
             inFlightRun: OpenClawChatInFlightRun(runId: "run-active", text: "first partial"))
@@ -1363,6 +1418,58 @@ struct ChatViewModelTests {
         try await waitUntil("live final remains scoped to current user") {
             await MainActor.run { vm.messages.count { $0.content.first?.text == "same reply" } == 2 }
         }
+    }
+
+    // Regression: the optimistic/streamed final and the canonical history row for the SAME run must
+    // collapse to one message (the canonical wins), even when their text differs slightly. Today the
+    // provisional final has no idempotency key while the gateway stamps the canonical row with
+    // "<runId>:assistant" (server-methods/chat.ts), so they never share identity and both survive —
+    // the "OpenClaw replied twice" glitch.
+    @Test func `same run optimistic and canonical assistant reply collapse to one`() async throws {
+        let releaseHistory = OpenOnceGate()
+        let (transport, vm) = await makeViewModel(
+            historyResponses: [historyPayload(messages: [])],
+            historyResponseHook: { _, _, sentRunIds in
+                guard let runId = sentRunIds.last else { return historyPayload(messages: []) }
+                // Post-run refresh: hold until the optimistic final is on-screen, then return the
+                // gateway-shaped canonical transcript (authoritative text + "<runId>:assistant" key).
+                await releaseHistory.wait()
+                return historyPayload(messages: [
+                    chatTextMessage(role: "user", text: "hi", timestamp: 1, idempotencyKey: "\(runId):user"),
+                    chatTextMessage(
+                        role: "assistant",
+                        text: "Hello, world.",
+                        timestamp: 2,
+                        idempotencyKey: "\(runId):assistant"),
+                ])
+            })
+
+        try await loadAndWaitBootstrap(vm: vm)
+        await sendUserMessage(vm, text: "hi")
+        let runId = try await waitForLastSentRunId(transport)
+
+        // Optimistic/streamed final lands first — no idempotency key, slightly different text.
+        transport.emit(
+            .chat(
+                OpenClawChatEventPayload(
+                    runId: runId,
+                    sessionKey: "main",
+                    state: "final",
+                    message: chatTextMessage(role: "assistant", text: "Hello world", timestamp: 100),
+                    errorMessage: nil)))
+        try await waitUntil("optimistic reply shown") {
+            await MainActor.run { vm.messages.contains { $0.role == "assistant" } }
+        }
+
+        await releaseHistory.open()
+        try await waitUntil("canonical reply applied") {
+            await MainActor.run { vm.messages.contains { $0.content.first?.text == "Hello, world." } }
+        }
+
+        let assistantMessages = await MainActor.run { vm.messages.filter { $0.role == "assistant" } }
+        #expect(assistantMessages.count == 1)
+        // The canonical transcript text wins; the optimistic streamed text is not left behind.
+        #expect(assistantMessages.first?.content.first?.text == "Hello, world.")
     }
 
     @Test func `global chat delta adopts only selected agent run`() async throws {

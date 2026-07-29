@@ -127,6 +127,14 @@ extension OpenClawChatViewModel {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// Idempotency keys the gateway may stamp on a run's assistant transcript row. `chat.final`
+    /// uses the "<runId>:assistant" form (server-methods/chat.ts) while reused-run/session-message
+    /// paths carry the bare run id. Reconciliation must accept either, otherwise the optimistic
+    /// reply and the canonical row share no identity and both survive — a double-posted reply.
+    static func assistantRunIdentityKeys(for runId: String) -> Set<String> {
+        [runId, "\(runId):assistant"]
+    }
+
     static func adoptingCanonicalMessage(
         _ incoming: OpenClawChatMessage,
         over existing: OpenClawChatMessage) -> OpenClawChatMessage
@@ -329,10 +337,13 @@ extension OpenClawChatViewModel {
         for existing in self.messages {
             guard let provisional = self.provisionalFinalMessagesByID[existing.id] else { continue }
             let exactRunIndex = provisional.runId.flatMap { runId in
-                reconciled.indices.last { index in
-                    !claimedIncomingIndices.contains(index) &&
-                        Self.isAssistantMessage(reconciled[index]) &&
-                        Self.normalizedIdempotencyKey(reconciled[index].idempotencyKey) == runId
+                let identityKeys = Self.assistantRunIdentityKeys(for: runId)
+                return reconciled.indices.last { index in
+                    guard !claimedIncomingIndices.contains(index),
+                          Self.isAssistantMessage(reconciled[index]),
+                          let key = Self.normalizedIdempotencyKey(reconciled[index].idempotencyKey)
+                    else { return false }
+                    return identityKeys.contains(key)
                 }
             }
             let matchingIndex = exactRunIndex ?? {

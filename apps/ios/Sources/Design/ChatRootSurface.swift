@@ -146,9 +146,15 @@ struct ChatRootSurface: View {
             }
             .defaultScrollAnchor(.bottom)
             .scrollDismissesKeyboard(.interactively)
-            .onChange(of: self.rows.count) { _, _ in self.scrollToBottom(proxy) }
+            // A newly committed message animates to the bottom once; the very first population snaps
+            // without animation so the transcript paints at the bottom instead of scrolling up on open.
+            .onChange(of: self.rows.count) { old, _ in
+                self.scrollToBottom(proxy, animated: old != 0)
+            }
+            // Streaming tokens pin the bottom WITHOUT a per-token animation, so the transcript tracks
+            // the reply smoothly instead of re-animating (and visibly repositioning) on every token.
             .onChange(of: self.viewModel.streamingAssistantText) { _, text in
-                self.scrollToBottom(proxy)
+                self.scrollToBottom(proxy, animated: false)
                 if let text, !text.isEmpty {
                     self.fireReplyIntroIfArmed()
                 }
@@ -159,7 +165,10 @@ struct ChatRootSurface: View {
                 }
             }
             .onChange(of: self.isAssistantWorking) { old, new in
-                self.scrollToBottom(proxy)
+                // Reveal the typing indicator when a run starts (no message/token change fires here yet).
+                if new {
+                    self.scrollToBottom(proxy, animated: false)
+                }
                 // Run finished (pending cleared): close the reply with one crisp click.
                 if old, !new, self.replyEndArmed {
                     self.replyEndArmed = false
@@ -208,7 +217,11 @@ struct ChatRootSurface: View {
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        guard animated else {
+            proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+            return
+        }
         withAnimation(.easeOut(duration: 0.2)) {
             proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
         }
@@ -281,14 +294,6 @@ struct ChatRootSurface: View {
             let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             guard hasText || !images.isEmpty || !chips.isEmpty else { continue }
             let isUser = role == "user"
-            // Collapse a duplicated turn a history-reconciliation miss can leave behind: the provisional
-            // streamed copy and the canonical history copy have different ids/timestamps (so the VM's
-            // dedupe misses) but identical role + visible text (and attachment counts), and land adjacent.
-            if let last = result.last, last.isUser == isUser, last.text == text,
-               last.images.count == images.count, last.chips.count == chips.count
-            {
-                continue
-            }
             result.append(ChatDisplayRow(
                 id: message.id,
                 isUser: isUser,

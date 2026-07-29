@@ -802,7 +802,9 @@ public final class OpenClawChatViewModel {
         let incomingRunIds = Set(incoming.compactMap { Self.normalizedIdempotencyKey($0.idempotencyKey) })
         return self.messages.filter { message in
             guard let provisional = provisionalFinalMessagesByID[message.id] else { return false }
-            if let runId = provisional.runId, incomingRunIds.contains(runId) {
+            if let runId = provisional.runId,
+               !Self.assistantRunIdentityKeys(for: runId).isDisjoint(with: incomingRunIds)
+            {
                 return false
             }
             guard Self.containsUserTurn(provisional.scope.latestUserTurn, in: incoming) else {
@@ -859,7 +861,11 @@ public final class OpenClawChatViewModel {
             self.runMessageScopesByRunID[runId] = currentRunMessageScope()
         }
         self.armPendingRunTimeout(runId: runId)
-        if !bufferedText.isEmpty {
+        // A gateway snapshot from a lagging history/foreground refresh can trail the live WS deltas.
+        // Streamed replies only grow, so adopt the snapshot only when it advances the visible reply;
+        // never let a stale/shorter snapshot regress or blank a reply that is mid-stream.
+        let liveStreamedText = self.streamingAssistantText ?? ""
+        if bufferedText.count > liveStreamedText.count {
             self.updateStreamingAssistantText(bufferedText)
         }
         self.logDiagnostic(
