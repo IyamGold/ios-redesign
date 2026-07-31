@@ -443,6 +443,11 @@ struct OpenClawTypographyTests {
             window.contains(".font(self.titleFont)") || window.contains(".font(self.subtitleFont)")
         case "apps/shared/OpenClawKit/Sources/OpenClawChatUI/ChatMarkdownRenderer.swift":
             window.contains(".font(self.font)")
+        case "apps/ios/Sources/Design/SettingsRootScreen.swift":
+            // The Settings title and section headers intentionally use SF Pro medium per the Figma
+            // design, not the branded Display face. Kept narrow to those two exact header fonts.
+            window.contains(".font(.system(size: 20, weight: .medium))")
+                || window.contains(".font(.system(size: 17, weight: .medium))")
         default:
             false
         }

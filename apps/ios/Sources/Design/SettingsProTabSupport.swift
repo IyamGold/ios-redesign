@@ -4,6 +4,8 @@ import SwiftUI
 import UserNotifications
 
 enum SettingsRoute: Hashable {
+    // The redesigned Settings root menu (phone). Rendered by the host, not by `SettingsProTab`.
+    case home
     case gateway
     case approvals
     case permissions

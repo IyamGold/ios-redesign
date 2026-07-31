@@ -761,6 +761,7 @@ extension SettingsProTab {
 
     func title(for route: SettingsRoute) -> String {
         switch route {
+        case .home: "Settings"
         case .gateway: "Gateway"
         case .approvals: "Approvals"
         case .permissions: "Permissions"

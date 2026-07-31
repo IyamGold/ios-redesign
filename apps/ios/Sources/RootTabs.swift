@@ -162,7 +162,7 @@ struct RootTabs: View {
             ChatProTab(
                 headerLeadingAction: self.phoneChatReturnAction,
                 ownsNavigationStack: false,
-                openSettings: { openSettingsRoute(.gateway) })
+                openSettings: { openSettingsRoute(.home) })
         }
     }
 
@@ -1342,7 +1342,16 @@ private struct PhoneTabSettingsHost<Content: View>: View {
                 self.settingsPath.append(route)
             }
             .navigationDestination(for: SettingsRoute.self) { route in
-                SettingsProTab(directRoute: route)
+                // The Settings entry (.home) opens the redesigned root menu, which pushes its rows'
+                // routes onto this same stack; every other route renders its existing screen unchanged.
+                if route == .home {
+                    SettingsRootContainer(
+                        onBack: { self.settingsPath.removeLast() },
+                        onOpenRoute: { self.settingsPath.append($0) })
+                        .toolbar(.hidden, for: .navigationBar)
+                } else {
+                    SettingsProTab(directRoute: route)
+                }
             }
         }
         .onChange(of: self.resetRequestID) { _, _ in
