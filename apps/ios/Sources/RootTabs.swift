@@ -1384,6 +1384,14 @@ private struct PhoneTabSettingsHost<Content: View>: View {
                     NotificationsScreen(onBack: { self.settingsPath.removeLast() })
                 case .channels:
                     ChannelsScreenHost(onBack: { self.settingsPath.removeLast() })
+                case .voice:
+                    VoiceSettingsScreenHost(
+                        onBack: { self.settingsPath.removeLast() },
+                        onOpenWakeWords: { self.settingsPath.append(.wakeWords) })
+                case .wakeWords:
+                    WakeWordsScreenHost(onBack: { self.settingsPath.removeLast() })
+                case .licenses:
+                    LicensesScreen(onBack: { self.settingsPath.removeLast() })
                 default:
                     SettingsProTab(directRoute: route)
                 }

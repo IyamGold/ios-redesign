@@ -80,6 +80,27 @@ struct SwiftUIRenderSmokeTests {
         }
     }
 
+    @Test @MainActor func `redesigned Licenses screen and detail build in light and dark mode`() {
+        var windows: [UIWindow] = []
+        defer { windows.forEach { $0.isHidden = true } }
+
+        let sample = LicenseDocument(
+            id: "Sample.txt",
+            title: "Sample",
+            filename: "Sample.txt",
+            body: "MIT License\n\nCopyright (c) 2026 OpenClaw")
+
+        for scheme in [ColorScheme.light, ColorScheme.dark] {
+            let list = NavigationStack { LicensesScreen(onBack: {}) }
+                .preferredColorScheme(scheme)
+            windows.append(Self.host(list, size: CGSize(width: 393, height: 852)))
+
+            let detail = NavigationStack { LicenseDocumentDetailView(document: sample) }
+                .preferredColorScheme(scheme)
+            windows.append(Self.host(detail, size: CGSize(width: 393, height: 852)))
+        }
+    }
+
     @Test @MainActor func `settings pro tab appearance row builds for all preferences`() throws {
         for preference in AppAppearancePreference.allCases {
             let suiteName = "OpenClawTests.appearance.\(preference.rawValue).\(UUID().uuidString)"

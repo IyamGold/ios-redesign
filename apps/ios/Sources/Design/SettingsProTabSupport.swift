@@ -11,6 +11,7 @@ enum SettingsRoute: Hashable {
     case permissions
     case channels
     case voice
+    case wakeWords
     case diagnostics
     case privacy
     case notifications

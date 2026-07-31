@@ -245,8 +245,9 @@ extension SettingsProTab {
                     self.aboutDestination
                 case .licenses:
                     self.licensesDestination
-                case .channels, .home:
-                    // Rendered by the host (SettingsRootContainer / SettingsChannelsDestination), never here.
+                case .channels, .home, .wakeWords:
+                    // Rendered by the host (SettingsRootContainer / SettingsChannelsDestination / the
+                    // redesigned destination screens), never here.
                     EmptyView()
                 }
             }

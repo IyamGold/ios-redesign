@@ -44,6 +44,8 @@ struct ChatRootSurface: View {
     @State private var replyIntroArmed = false
     /// Armed on send; fires the crisp closing click once when the assistant's run completes.
     @State private var replyEndArmed = false
+    /// Voice Settings master switch (same key as `setTalkEnabled`); off hides the talk affordance.
+    @AppStorage("talk.enabled") private var talkModeEnabled = false
 
     private static let bubbleRed = Color(red: 195 / 255, green: 63 / 255, blue: 51 / 255)
     private static let bottomAnchorID = "chat-bottom-anchor"
@@ -528,15 +530,19 @@ struct ChatRootSurface: View {
                 }
                 .animation(.spring(duration: 0.3), value: self.viewModel.attachments.isEmpty)
 
-            Button(action: self.trailingButtonAction) {
-                ZStack {
-                    Circle().fill(Self.bubbleRed.opacity(self.trailingButtonDisabled ? 0.5 : 1))
-                    self.trailingButtonIcon
+            // Talk mode off + nothing to send/record → hide the button entirely: the send arrow only
+            // appears with content, and the talk affordance is unreachable while the master switch is off.
+            if self.hasDraft || self.talkModeEnabled || self.voiceRecorder.isRecording {
+                Button(action: self.trailingButtonAction) {
+                    ZStack {
+                        Circle().fill(Self.bubbleRed.opacity(self.trailingButtonDisabled ? 0.5 : 1))
+                        self.trailingButtonIcon
+                    }
+                    .frame(width: 36, height: 36)
                 }
-                .frame(width: 36, height: 36)
+                .disabled(self.trailingButtonDisabled)
+                .shadow(color: .black.opacity(0.2), radius: 25, x: 0, y: 0)
             }
-            .disabled(self.trailingButtonDisabled)
-            .shadow(color: .black.opacity(0.2), radius: 25, x: 0, y: 0)
         }
     }
 

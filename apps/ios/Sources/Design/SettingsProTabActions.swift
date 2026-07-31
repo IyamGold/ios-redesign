@@ -767,6 +767,7 @@ extension SettingsProTab {
         case .permissions: "Permissions"
         case .channels: "Channels"
         case .voice: "Voice & Talk"
+        case .wakeWords: "Wake Words"
         case .diagnostics: "Diagnostics"
         case .privacy: "Privacy"
         case .notifications: "Notifications"

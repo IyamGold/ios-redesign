@@ -452,8 +452,9 @@ struct OpenClawTypographyTests {
             // Section labels + the Disconnect button use SF Pro medium per the Figma design.
             window.contains(".font(.system(size: 17, weight: .medium))")
         case "apps/ios/Sources/Design/SettingsDestinationScreens.swift":
-            // Destination titles use SF Pro medium per the Figma design, matching the Settings root.
+            // Destination titles + section headers use SF Pro medium per the Figma design.
             window.contains(".font(.system(size: 20, weight: .medium))")
+                || window.contains(".font(.system(size: 17, weight: .medium))")
         default:
             false
         }
