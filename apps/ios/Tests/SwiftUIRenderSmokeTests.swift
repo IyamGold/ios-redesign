@@ -215,7 +215,6 @@ struct SwiftUIRenderSmokeTests {
         let screens: [AnyView] = [
             AnyView(OnboardingIntroStep(onContinue: {})),
             AnyView(OnboardingWelcomeStep(
-                statusLine: "",
                 isConnecting: false,
                 onScanQRCode: {},
                 onManualSetup: {})),
