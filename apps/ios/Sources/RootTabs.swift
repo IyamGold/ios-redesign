@@ -1367,14 +1367,24 @@ private struct PhoneTabSettingsHost<Content: View>: View {
             }
             .navigationDestination(for: SettingsRoute.self) { route in
                 // The Settings entry (.home) opens the redesigned root menu, which pushes its rows'
-                // routes onto this same stack; every other route renders its existing screen unchanged.
-                if route == .home {
+                // routes onto this same stack; redesigned destinations render here, others fall back
+                // to the existing SettingsProTab screen.
+                switch route {
+                case .home:
                     SettingsRootContainer(
                         onBack: { self.settingsPath.removeLast() },
                         onOpenRoute: { self.settingsPath.append($0) },
                         onOpenConnection: self.onOpenConnection)
                         .toolbar(.hidden, for: .navigationBar)
-                } else {
+                case .approvals:
+                    ApprovalsScreen(onBack: { self.settingsPath.removeLast() })
+                case .permissions:
+                    PermissionsScreen(onBack: { self.settingsPath.removeLast() })
+                case .notifications:
+                    NotificationsScreen(onBack: { self.settingsPath.removeLast() })
+                case .channels:
+                    ChannelsScreenHost(onBack: { self.settingsPath.removeLast() })
+                default:
                     SettingsProTab(directRoute: route)
                 }
             }
