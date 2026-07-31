@@ -27,6 +27,8 @@ struct RootTabs: View {
     @State private var phoneControlNavigationRequest: PhoneControlNavigationRequest?
     @State private var phoneChatReturn: PhoneChatReturn?
     @State private var phoneChatSettingsResetRequestID: Int = 0
+    @State private var showConnectionSheet = false
+    @State private var pendingSettingsRoute: SettingsRoute?
     // Embedded Settings rows push onto the sidebar stack; clear it before
     // changing sidebar roots so stale settings detail screens cannot survive.
     @State private var sidebarNavigationPath: [SettingsRoute] = []
@@ -158,7 +160,11 @@ struct RootTabs: View {
     }
 
     private var phoneTabContent: some View {
-        PhoneTabSettingsHost(resetRequestID: self.phoneChatSettingsResetRequestID) { openSettingsRoute in
+        PhoneTabSettingsHost(
+            resetRequestID: self.phoneChatSettingsResetRequestID,
+            onOpenConnection: { self.showConnectionSheet = true },
+            pendingRoute: self.$pendingSettingsRoute)
+        { openSettingsRoute in
             ChatProTab(
                 headerLeadingAction: self.phoneChatReturnAction,
                 ownsNavigationStack: false,
@@ -866,6 +872,18 @@ struct RootTabs: View {
                         .openClawSheetChrome()
                 }
             }
+            .sheet(isPresented: self.$showConnectionSheet) {
+                ConnectionSheetHostView(
+                    onScanFullAccess: {
+                        self.showConnectionSheet = false
+                        self.pendingSettingsRoute = .gateway
+                    },
+                    onClose: { self.showConnectionSheet = false })
+                    .environment(self.appModel)
+                    .environment(self.gatewayController)
+                    .presentationCornerRadius(47)
+                    .presentationDragIndicator(.hidden)
+            }
             .fullScreenCover(isPresented: self.$showOnboarding) {
                 OnboardingWizardView(
                     allowSkip: self.onboardingAllowSkip,
@@ -1326,13 +1344,19 @@ extension RootTabs {
 private struct PhoneTabSettingsHost<Content: View>: View {
     @State private var settingsPath: [SettingsRoute] = []
     private let resetRequestID: Int
+    private let onOpenConnection: () -> Void
+    @Binding private var pendingRoute: SettingsRoute?
     private let content: (_ openSettingsRoute: @escaping (SettingsRoute) -> Void) -> Content
 
     init(
         resetRequestID: Int = 0,
+        onOpenConnection: @escaping () -> Void = {},
+        pendingRoute: Binding<SettingsRoute?> = .constant(nil),
         @ViewBuilder content: @escaping (_ openSettingsRoute: @escaping (SettingsRoute) -> Void) -> Content)
     {
         self.resetRequestID = resetRequestID
+        self.onOpenConnection = onOpenConnection
+        self._pendingRoute = pendingRoute
         self.content = content
     }
 
@@ -1347,7 +1371,8 @@ private struct PhoneTabSettingsHost<Content: View>: View {
                 if route == .home {
                     SettingsRootContainer(
                         onBack: { self.settingsPath.removeLast() },
-                        onOpenRoute: { self.settingsPath.append($0) })
+                        onOpenRoute: { self.settingsPath.append($0) },
+                        onOpenConnection: self.onOpenConnection)
                         .toolbar(.hidden, for: .navigationBar)
                 } else {
                     SettingsProTab(directRoute: route)
@@ -1356,6 +1381,12 @@ private struct PhoneTabSettingsHost<Content: View>: View {
         }
         .onChange(of: self.resetRequestID) { _, _ in
             self.settingsPath.removeAll()
+        }
+        // A root-presented sheet (Connection) requests a settings route on dismiss; push it here.
+        .onChange(of: self.pendingRoute) { _, route in
+            guard let route else { return }
+            self.settingsPath.append(route)
+            self.pendingRoute = nil
         }
     }
 }

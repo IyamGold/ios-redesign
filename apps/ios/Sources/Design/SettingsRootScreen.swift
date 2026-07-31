@@ -124,10 +124,12 @@ struct SettingsRootScreen: View {
                 Button(action: self.onBack) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 17, weight: .semibold))
-                        // Nav controls are neutral over a frosted-glass circle — not the red primary action.
+                        // Neutral glyph on a Liquid Glass circle with the same soft shadow as the chat
+                        // floating buttons, so the nav reads as glass instead of a flat material.
                         .foregroundStyle(Color.primary)
                         .frame(width: 40, height: 40)
-                        .background { Circle().fill(.regularMaterial) }
+                        .background { ChatGlassBackground(shape: Circle(), fill: self.glassFill) }
+                        .shadow(color: .black.opacity(0.15), radius: 25, x: 0, y: 0)
                 }
                 Spacer()
             }
@@ -341,6 +343,13 @@ struct SettingsRootScreen: View {
             ? Color(red: 10 / 255, green: 10 / 255, blue: 10 / 255)
             : .white
     }
+
+    /// Subtle tint under the Liquid Glass nav circle (matches the chat floating buttons).
+    private var glassFill: Color {
+        self.colorScheme == .dark
+            ? Color(red: 30 / 255, green: 30 / 255, blue: 30 / 255).opacity(0.2)
+            : Color(red: 245 / 255, green: 244 / 255, blue: 250 / 255).opacity(0.2)
+    }
 }
 
 /// Wires the redesigned Settings root menu to the app model and appearance store. It does NOT own a
@@ -351,6 +360,10 @@ struct SettingsRootContainer: View {
     @Environment(AppAppearanceModel.self) private var appearanceModel
     let onBack: () -> Void
     let onOpenRoute: (SettingsRoute) -> Void
+    /// Tapped "Connection". Presented from the window root (see phoneTabContent) so the native
+    /// page-sheet card-recede animates the app behind it — presenting from here, deep in the settings
+    /// nav stack, suppresses that recede.
+    let onOpenConnection: () -> Void
 
     var body: some View {
         SettingsRootScreen(
@@ -360,8 +373,7 @@ struct SettingsRootContainer: View {
             hasAdminScope: self.appModel.hasOperatorAdminScope,
             onSelectAgent: { self.appModel.setSelectedAgentId($0.id) },
             onBack: self.onBack,
-            // Connection has no dedicated route — it lives inside the Gateway screen.
-            onOpenConnection: { self.onOpenRoute(.gateway) },
+            onOpenConnection: self.onOpenConnection,
             onOpenApprovals: { self.onOpenRoute(.approvals) },
             onOpenPermissions: { self.onOpenRoute(.permissions) },
             onOpenNotifications: { self.onOpenRoute(.notifications) },
@@ -395,6 +407,58 @@ struct SettingsRootContainer: View {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+/// Owns the gateway wiring and renders `ConnectionSheet`. Lives at the window root (presented from
+/// phoneTabContent) so the native page-sheet card-recede animates the app behind it.
+struct ConnectionSheetHostView: View {
+    @Environment(NodeAppModel.self) private var appModel
+    @Environment(GatewayConnectionController.self) private var gatewayController
+    @State private var switchingGateway = false
+    let onScanFullAccess: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        ConnectionSheet(
+            gateways: self.connectionGatewayRows,
+            hasFullAccess: self.appModel.hasOperatorAdminScope,
+            onSelectGateway: { stableID in Task { await self.switchGateway(stableID) } },
+            onScanFullAccess: self.onScanFullAccess,
+            onDisconnect: {
+                self.onClose()
+                Task { await self.disconnect() }
+            },
+            onClose: self.onClose)
+    }
+
+    /// Read the persisted registry fresh each render — the store can be populated a beat after the app
+    /// connects, and this view re-renders on the app-model changes that accompany that, so the list
+    /// self-heals rather than showing a stale (possibly empty) snapshot.
+    private var connectionGatewayRows: [ConnectionGatewayRow] {
+        let registry = GatewaySettingsStore.loadGatewayRegistry()
+        return registry.entries.map { entry in
+            ConnectionGatewayRow(
+                id: entry.stableID,
+                name: entry.name,
+                isFocused: entry.stableID == registry.activeStableID)
+        }
+    }
+
+    /// Switch + reconnect via the controller (registry write alone does not reconnect). Toggling
+    /// `switchingGateway` re-renders, so the fresh read above reflects the new active gateway.
+    private func switchGateway(_ stableID: String) async {
+        guard !self.switchingGateway else { return }
+        self.switchingGateway = true
+        defer { self.switchingGateway = false }
+        _ = await self.gatewayController.switchToGateway(stableID: stableID)
+    }
+
+    /// Clears all gateway credentials and reopens onboarding.
+    private func disconnect() async {
+        await GatewayOnboardingReset.reset(
+            appModel: self.appModel,
+            instanceId: GatewaySettingsStore.currentInstanceID())
     }
 }
 

@@ -448,6 +448,9 @@ struct OpenClawTypographyTests {
             // design, not the branded Display face. Kept narrow to those two exact header fonts.
             window.contains(".font(.system(size: 20, weight: .medium))")
                 || window.contains(".font(.system(size: 17, weight: .medium))")
+        case "apps/ios/Sources/Design/ConnectionSheet.swift":
+            // Section labels + the Disconnect button use SF Pro medium per the Figma design.
+            window.contains(".font(.system(size: 17, weight: .medium))")
         default:
             false
         }
