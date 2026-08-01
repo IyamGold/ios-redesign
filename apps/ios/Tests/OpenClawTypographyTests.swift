@@ -455,6 +455,13 @@ struct OpenClawTypographyTests {
             // Destination titles + section headers use SF Pro medium per the Figma design.
             window.contains(".font(.system(size: 20, weight: .medium))")
                 || window.contains(".font(.system(size: 17, weight: .medium))")
+        case "apps/ios/Sources/Design/ChatDrawer.swift":
+            // Drawer wordmark, item rows, session titles, and the version chip use SF Pro sizes
+            // per the Figma design, not the branded Display face.
+            window.contains(".font(.system(size: 25.6, weight: .semibold))")
+                || window.contains(".font(.system(size: 17.13))")
+                || window.contains(".font(.system(size: 15))")
+                || window.contains(".font(.system(size: 14.46))")
         default:
             false
         }

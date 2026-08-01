@@ -1,3 +1,4 @@
+import OpenClawChatUI
 import OpenClawKit
 import OpenClawProtocol
 import SwiftUI
@@ -29,6 +30,10 @@ struct RootTabs: View {
     @State private var phoneChatSettingsResetRequestID: Int = 0
     @State private var showConnectionSheet = false
     @State private var pendingSettingsRoute: SettingsRoute?
+    // Chat drawer (WhatsApp-style side panel) — phone only.
+    @State private var isChatDrawerOpen = false
+    @State private var activeDrawerDestination: ChatDrawerDestination?
+    @State private var drawerSessions: [ChatDrawerSession] = []
     // Embedded Settings rows push onto the sidebar stack; clear it before
     // changing sidebar roots so stale settings detail screens cannot survive.
     @State private var sidebarNavigationPath: [SettingsRoute] = []
@@ -160,16 +165,85 @@ struct RootTabs: View {
     }
 
     private var phoneTabContent: some View {
-        PhoneTabSettingsHost(
-            resetRequestID: self.phoneChatSettingsResetRequestID,
-            onOpenConnection: { self.showConnectionSheet = true },
-            pendingRoute: self.$pendingSettingsRoute)
-        { openSettingsRoute in
-            ChatProTab(
-                headerLeadingAction: self.phoneChatReturnAction,
-                ownsNavigationStack: false,
-                openSettings: { openSettingsRoute(.home) })
+        ChatDrawerHost(
+            isOpen: self.$isChatDrawerOpen,
+            sessions: self.drawerSessions,
+            versionText: Self.appVersionText,
+            onSelectDestination: { self.activeDrawerDestination = $0 },
+            onSelectSession: { self.appModel.openChat(sessionKey: $0) })
+        {
+            PhoneTabSettingsHost(
+                resetRequestID: self.phoneChatSettingsResetRequestID,
+                onOpenConnection: { self.showConnectionSheet = true },
+                pendingRoute: self.$pendingSettingsRoute)
+            { openSettingsRoute in
+                ChatProTab(
+                    headerLeadingAction: self.phoneChatReturnAction,
+                    ownsNavigationStack: false,
+                    openSettings: { openSettingsRoute(.home) },
+                    onOpenDrawer: {
+                        withAnimation(.spring(duration: 0.35)) { self.isChatDrawerOpen = true }
+                    })
+            }
         }
+        .task(id: self.isChatDrawerOpen) {
+            if self.isChatDrawerOpen {
+                await self.loadDrawerSessions()
+            }
+        }
+        .fullScreenCover(item: self.$activeDrawerDestination) { destination in
+            self.drawerDestinationScreen(destination)
+        }
+    }
+
+    private static let appVersionText =
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+
+    /// Loads the app-cached recent chat sessions for the drawer, mapping to display rows.
+    private func loadDrawerSessions() async {
+        let entries = await self.appModel.loadCachedChatSessions()
+        self.drawerSessions = entries
+            .sorted { ($0.updatedAt ?? $0.lastActivityAt ?? 0) > ($1.updatedAt ?? $1.lastActivityAt ?? 0) }
+            .map { entry in
+                ChatDrawerSession(id: entry.key, title: Self.drawerSessionTitle(entry))
+            }
+    }
+
+    private static func drawerSessionTitle(_ entry: OpenClawChatSessionEntry) -> String {
+        let raw = entry.displayName ?? entry.label ?? entry.key
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? entry.key : trimmed
+    }
+
+    /// Drawer items point to their existing destinations. Agent surfaces reuse `AgentProTab`
+    /// (which owns its own overview-loading duty); Canvas hosts the shared screen controller.
+    private func drawerDestinationScreen(_ destination: ChatDrawerDestination) -> some View {
+        Group {
+            switch destination {
+            case .canvas:
+                DrawerCanvasScreen()
+            case .dreaming:
+                AgentProTab(directRoute: .dreaming, headerLeadingAction: nil, headerTitle: "Dreaming")
+            case .usage:
+                AgentProTab(directRoute: .usage, headerLeadingAction: nil, headerTitle: "Usage")
+            case .instances:
+                AgentProTab(directRoute: .instances, headerLeadingAction: nil, headerTitle: "Instances")
+            case .cron:
+                AgentProTab(directRoute: .cron, headerLeadingAction: nil, headerTitle: "Cron Jobs")
+            case .files:
+                AgentProTab(directRoute: .files, headerLeadingAction: nil, headerTitle: "Files")
+            case .skills:
+                AgentProTab(directRoute: .skills, headerLeadingAction: nil, headerTitle: "Skills")
+            }
+        }
+        // Consistent redesigned "cancel" X across all drawer destinations (matches the Connection sheet),
+        // in place of each screen's own back chevron. A top safe-area inset (not an overlay) reserves
+        // its space so the button never sits on top of the screen's content.
+        .safeAreaInset(edge: .top, alignment: .leading, spacing: 0) {
+            DrawerCloseButton(onClose: { self.activeDrawerDestination = nil })
+        }
+        .environment(self.appModel)
+        .environment(self.gatewayController)
     }
 
     private var sidebarSplitContent: some View {

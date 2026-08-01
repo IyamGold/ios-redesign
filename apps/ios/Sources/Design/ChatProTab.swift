@@ -30,19 +30,22 @@ struct ChatProTab: View {
     let showsAgentBadge: Bool
     let ownsNavigationStack: Bool
     let openSettings: (() -> Void)?
+    let onOpenDrawer: (() -> Void)?
 
     init(
         headerLeadingAction: OpenClawSidebarHeaderAction? = nil,
         headerTitle: String? = nil,
         showsAgentBadge: Bool = true,
         ownsNavigationStack: Bool = true,
-        openSettings: (() -> Void)? = nil)
+        openSettings: (() -> Void)? = nil,
+        onOpenDrawer: (() -> Void)? = nil)
     {
         self.headerLeadingAction = headerLeadingAction
         self.headerTitle = headerTitle
         self.showsAgentBadge = showsAgentBadge
         self.ownsNavigationStack = ownsNavigationStack
         self.openSettings = openSettings
+        self.onOpenDrawer = onOpenDrawer
     }
 
     var body: some View {
@@ -126,7 +129,8 @@ struct ChatProTab: View {
                 ChatRootSurface(
                     viewModel: viewModel,
                     onOpenSettings: { self.openSettings?() },
-                    onOpenTalk: { self.showsTalkMode = true })
+                    onOpenTalk: { self.showsTalkMode = true },
+                    onOpenDrawer: { self.onOpenDrawer?() })
             } else {
                 Color.clear
             }

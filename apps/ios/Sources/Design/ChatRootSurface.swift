@@ -10,6 +10,8 @@ struct ChatRootSurface: View {
     @Bindable var viewModel: OpenClawChatViewModel
     let onOpenSettings: () -> Void
     let onOpenTalk: () -> Void
+    /// Opens the chat drawer (WhatsApp-style side panel); nil when hosted without a drawer.
+    var onOpenDrawer: (() -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var inputHeight: CGFloat = 0
@@ -403,32 +405,36 @@ struct ChatRootSurface: View {
 
     private var topBar: some View {
         HStack {
-            HStack(spacing: 0) {
-                Image("ChatAvatarImage")
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 34, height: 34)
-                    .clipShape(Circle())
-                    .overlay(alignment: .bottomTrailing) {
-                        // WhatsApp-style presence badge: shown only while the transport is healthy
-                        // (live delivery possible). The ring matches the canvas so it reads as a cutout.
-                        if self.viewModel.healthOK {
-                            Circle()
-                                .fill(Self.onlineGreen)
-                                .frame(width: 11, height: 11)
-                                .overlay { Circle().stroke(self.onlineRing, lineWidth: 2) }
-                                .offset(x: 1, y: 1)
-                                .transition(.scale.combined(with: .opacity))
+            Button(action: { self.onOpenDrawer?() }) {
+                HStack(spacing: 0) {
+                    Image("ChatAvatarImage")
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 34, height: 34)
+                        .clipShape(Circle())
+                        .overlay(alignment: .bottomTrailing) {
+                            // WhatsApp-style presence badge: shown only while the transport is healthy
+                            // (live delivery possible). The ring matches the canvas so it reads as a cutout.
+                            if self.viewModel.healthOK {
+                                Circle()
+                                    .fill(Self.onlineGreen)
+                                    .frame(width: 11, height: 11)
+                                    .overlay { Circle().stroke(self.onlineRing, lineWidth: 2) }
+                                    .offset(x: 1, y: 1)
+                                    .transition(.scale.combined(with: .opacity))
+                            }
                         }
-                    }
-                    .animation(.smooth(duration: 0.25), value: self.viewModel.healthOK)
-                    .padding(3)
-                Text("OpenClaw")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(Color.primary)
-                    .padding(.trailing, 14)
+                        .animation(.smooth(duration: 0.25), value: self.viewModel.healthOK)
+                        .padding(3)
+                    Text("OpenClaw")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(Color.primary)
+                        .padding(.trailing, 14)
+                }
+                .background { self.glassCapsule }
             }
-            .background { self.glassCapsule }
+            .buttonStyle(.plain)
+            .disabled(self.onOpenDrawer == nil)
 
             Spacer()
 
