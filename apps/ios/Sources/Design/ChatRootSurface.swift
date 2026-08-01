@@ -46,7 +46,16 @@ struct ChatRootSurface: View {
     @State private var replyEndArmed = false
 
     private static let bubbleRed = Color(red: 195 / 255, green: 63 / 255, blue: 51 / 255)
+    /// Online presence dot (iOS system green) shown on the avatar while connected.
+    private static let onlineGreen = Color(red: 52 / 255, green: 199 / 255, blue: 89 / 255)
     private static let bottomAnchorID = "chat-bottom-anchor"
+
+    /// Ring around the presence dot — matches the app canvas so the badge reads as a cutout.
+    private var onlineRing: Color {
+        self.colorScheme == .dark
+            ? Color(red: 23 / 255, green: 23 / 255, blue: 23 / 255)
+            : Color(red: 245 / 255, green: 244 / 255, blue: 250 / 255)
+    }
 
     /// Pill (48pt) in the single-line default; drops to 15pt once the field grows past one line.
     private var composerFieldCornerRadius: CGFloat {
@@ -400,6 +409,19 @@ struct ChatRootSurface: View {
                     .scaledToFill()
                     .frame(width: 34, height: 34)
                     .clipShape(Circle())
+                    .overlay(alignment: .bottomTrailing) {
+                        // WhatsApp-style presence badge: shown only while the transport is healthy
+                        // (live delivery possible). The ring matches the canvas so it reads as a cutout.
+                        if self.viewModel.healthOK {
+                            Circle()
+                                .fill(Self.onlineGreen)
+                                .frame(width: 11, height: 11)
+                                .overlay { Circle().stroke(self.onlineRing, lineWidth: 2) }
+                                .offset(x: 1, y: 1)
+                                .transition(.scale.combined(with: .opacity))
+                        }
+                    }
+                    .animation(.smooth(duration: 0.25), value: self.viewModel.healthOK)
                     .padding(3)
                 Text("OpenClaw")
                     .font(.system(size: 16, weight: .semibold))
