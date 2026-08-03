@@ -8,7 +8,9 @@ private func chatTextMessage(
     text: String,
     timestamp: Double,
     contentId: String? = nil,
-    idempotencyKey: String? = nil) -> AnyCodable
+    idempotencyKey: String? = nil,
+    serverMessageId: String? = nil,
+    serverSeq: Int? = nil) -> AnyCodable
 {
     var content: [String: Any] = ["type": "text", "text": text]
     if let contentId {
@@ -19,8 +21,20 @@ private func chatTextMessage(
         "content": [content],
         "timestamp": timestamp,
     ]
+    var openclaw: [String: Any] = [:]
     if let idempotencyKey {
-        message["__openclaw"] = ["idempotencyKey": idempotencyKey]
+        openclaw["idempotencyKey"] = idempotencyKey
+    }
+    if let serverMessageId {
+        // The durable per-message id the gateway stamps as `__openclaw.id` on history + session rows.
+        openclaw["id"] = serverMessageId
+    }
+    if let serverSeq {
+        // The session-global monotonic transcript position, stamped as `__openclaw.seq`.
+        openclaw["seq"] = serverSeq
+    }
+    if !openclaw.isEmpty {
+        message["__openclaw"] = openclaw
     }
     return AnyCodable(message)
 }
@@ -29,7 +43,8 @@ private func chatTextModelMessage(
     role: String,
     text: String,
     timestamp: Double,
-    idempotencyKey: String? = nil) -> OpenClawChatMessage
+    idempotencyKey: String? = nil,
+    serverMessageId: String? = nil) -> OpenClawChatMessage
 {
     OpenClawChatMessage(
         role: role,
@@ -42,7 +57,8 @@ private func chatTextModelMessage(
                 content: nil),
         ],
         timestamp: timestamp,
-        idempotencyKey: idempotencyKey)
+        idempotencyKey: idempotencyKey,
+        serverMessageId: serverMessageId)
 }
 
 private func chatErrorMessage(role: String, errorMessage: String, timestamp: Double) -> AnyCodable {
@@ -1470,6 +1486,279 @@ struct ChatViewModelTests {
         #expect(assistantMessages.count == 1)
         // The canonical transcript text wins; the optimistic streamed text is not left behind.
         #expect(assistantMessages.first?.content.first?.text == "Hello, world.")
+    }
+
+    @Test @MainActor func `dedupe collapses assistant rows that share a server message id`() {
+        // Two representations of ONE reply that share NOTHING a heuristic could use — different text,
+        // different idempotency-key form (bare run id vs the media variant), different timestamps — but
+        // the same durable server id. Only identity-by-server-id collapses them; keying on idempotency
+        // or text would keep both (and merging the media variant by suffix would be wrong).
+        let a = chatTextModelMessage(
+            role: "assistant", text: "one", timestamp: 1,
+            idempotencyKey: "run-x", serverMessageId: "srv-1")
+        let b = chatTextModelMessage(
+            role: "assistant", text: "two", timestamp: 2,
+            idempotencyKey: "run-x:assistant-media", serverMessageId: "srv-1")
+        #expect(OpenClawChatViewModel.dedupeMessages([a, b]).count == 1)
+
+        // And a genuinely different reply (different server id) is NOT collapsed.
+        let c = chatTextModelMessage(
+            role: "assistant", text: "three", timestamp: 3,
+            idempotencyKey: "run-y", serverMessageId: "srv-2")
+        #expect(OpenClawChatViewModel.dedupeMessages([a, c]).count == 2)
+    }
+
+    @Test @MainActor func `message identity prefers the server message id`() {
+        let withServerId = chatTextModelMessage(
+            role: "assistant", text: "hi", timestamp: 1,
+            idempotencyKey: "run-x", serverMessageId: "srv-1")
+        #expect(OpenClawChatViewModel.messageIdentityKey(for: withServerId) == "assistant|serverid|srv-1")
+    }
+
+    @Test func `optimistic, session-message, and history collapse on the server message id`() async throws {
+        // The real end-to-end shape: three representations of one reply, each with DIFFERENT text and
+        // MIXED idempotency-key forms, but sharing the gateway's durable per-message id (`__openclaw.id`
+        // on history, top-level `messageId` on session.message). Identity-based reconciliation must
+        // collapse them to one — the fix for the persistent triple-reply.
+        let releaseHistory = OpenOnceGate()
+        let (transport, vm) = await makeViewModel(
+            historyResponses: [historyPayload(messages: [])],
+            historyResponseHook: { _, _, sentRunIds in
+                guard let runId = sentRunIds.last else { return historyPayload(messages: []) }
+                await releaseHistory.wait()
+                // History carries the durable id in `__openclaw.id`, a THIRD differing text, and a
+                // bare-runId idempotency key that alone would NOT collapse onto the canonical row.
+                return historyPayload(messages: [
+                    chatTextMessage(
+                        role: "user", text: "hi", timestamp: 1,
+                        idempotencyKey: "\(runId):user", serverMessageId: "srv-user"),
+                    chatTextMessage(
+                        role: "assistant", text: "Hey there.", timestamp: 2,
+                        idempotencyKey: runId, serverMessageId: "srv-1"),
+                ])
+            })
+
+        try await loadAndWaitBootstrap(vm: vm)
+        await sendUserMessage(vm, text: "hi")
+        let runId = try await waitForLastSentRunId(transport)
+
+        // (1) Optimistic final — no server id, first text.
+        transport.emit(
+            .chat(
+                OpenClawChatEventPayload(
+                    runId: runId,
+                    sessionKey: "main",
+                    state: "final",
+                    message: chatTextMessage(role: "assistant", text: "Hey", timestamp: 100),
+                    errorMessage: nil)))
+        try await waitUntil("optimistic reply shown") {
+            await MainActor.run { vm.messages.contains { $0.role == "assistant" } }
+        }
+
+        // (2) Canonical session.message — carries the durable id top-level as `messageId: "srv-1"`,
+        // ":assistant" key, second text. It should adopt the optimistic row and stamp it with srv-1.
+        transport.emit(
+            .sessionMessage(
+                OpenClawSessionMessageEventPayload(
+                    sessionKey: "main",
+                    message: chatTextModelMessage(
+                        role: "assistant", text: "Hey.", timestamp: 2,
+                        idempotencyKey: "\(runId):assistant"),
+                    messageId: "srv-1",
+                    messageSeq: 2)))
+        try await waitUntil("canonical adopted the server id") {
+            await MainActor.run { vm.messages.contains { $0.serverMessageId == "srv-1" } }
+        }
+
+        // (3) History refresh — same server id, third text, bare-runId key.
+        await releaseHistory.open()
+        try await waitUntil("history applied") {
+            await MainActor.run { vm.messages.contains { $0.idempotencyKey == "\(runId):user" } }
+        }
+
+        let assistants = await MainActor.run { vm.messages.filter { $0.role == "assistant" } }
+        #expect(assistants.count == 1)
+        #expect(assistants.first?.serverMessageId == "srv-1")
+    }
+
+    @Test func `two consecutive assistant replies with no intervening user turn both land in order`() async throws {
+        // The user-reported breakage: user → reply → reply (second run, NO new user turn). The reconciler
+        // must produce exactly two assistant rows in order, not drop/duplicate/reorder the second one.
+        let releaseHistory = OpenOnceGate()
+        let (transport, vm) = await makeViewModel(
+            historyResponses: [historyPayload(messages: [])],
+            historyResponseHook: { _, _, sentRunIds in
+                guard let runId1 = sentRunIds.last else { return historyPayload(messages: []) }
+                await releaseHistory.wait()
+                return historyPayload(messages: [
+                    chatTextMessage(
+                        role: "user", text: "go", timestamp: 1,
+                        idempotencyKey: "\(runId1):user", serverMessageId: "srv-u"),
+                    chatTextMessage(
+                        role: "assistant", text: "reply one", timestamp: 2,
+                        idempotencyKey: runId1, serverMessageId: "srv-1"),
+                    chatTextMessage(
+                        role: "assistant", text: "reply two", timestamp: 3,
+                        idempotencyKey: "run-2", serverMessageId: "srv-2"),
+                ])
+            })
+
+        try await loadAndWaitBootstrap(vm: vm)
+        await sendUserMessage(vm, text: "go")
+        let runId1 = try await waitForLastSentRunId(transport)
+
+        // Reply 1 (the run the client owns).
+        transport.emit(
+            .chat(OpenClawChatEventPayload(
+                runId: runId1, sessionKey: "main", state: "final",
+                message: chatTextMessage(role: "assistant", text: "reply one", timestamp: 100),
+                errorMessage: nil)))
+        transport.emit(
+            .sessionMessage(OpenClawSessionMessageEventPayload(
+                sessionKey: "main",
+                message: chatTextModelMessage(role: "assistant", text: "reply one", timestamp: 2, idempotencyKey: "\(runId1):assistant"),
+                messageId: "srv-1", messageSeq: 2)))
+        try await waitUntil("reply one shown") {
+            await MainActor.run { vm.messages.contains { $0.serverMessageId == "srv-1" } }
+        }
+
+        // Reply 2 — a SECOND run with no intervening user turn (system/agent-triggered).
+        transport.emit(
+            .chat(OpenClawChatEventPayload(
+                runId: "run-2", sessionKey: "main", state: "final",
+                message: chatTextMessage(role: "assistant", text: "reply two", timestamp: 200),
+                errorMessage: nil)))
+        transport.emit(
+            .sessionMessage(OpenClawSessionMessageEventPayload(
+                sessionKey: "main",
+                message: chatTextModelMessage(role: "assistant", text: "reply two", timestamp: 3, idempotencyKey: "run-2:assistant"),
+                messageId: "srv-2", messageSeq: 3)))
+        try await waitUntil("reply two shown") {
+            await MainActor.run { vm.messages.contains { $0.serverMessageId == "srv-2" } }
+        }
+
+        await releaseHistory.open()
+        try await waitUntil("history applied") {
+            await MainActor.run { vm.messages.contains { $0.idempotencyKey == "srv-u" || $0.serverMessageId == "srv-u" } }
+        }
+
+        let assistants = await MainActor.run { vm.messages.filter { $0.role == "assistant" } }
+        #expect(assistants.count == 2)
+        #expect(assistants.map { $0.serverMessageId } == ["srv-1", "srv-2"])
+    }
+
+    @Test func `canonical session-message before optimistic final does not duplicate even when text differs`() async throws {
+        // Exact device repro: the durable session.message (server id, NO idempotency key) arrives while
+        // the run is pending, BEFORE chat.final — and the optimistic final's text differs from it. Neither
+        // idempotency nor content can correlate them; only the run-pending timing can. Must stay one row.
+        let (transport, vm) = await makeViewModel(historyResponses: [historyPayload(messages: [])])
+        try await loadAndWaitBootstrap(vm: vm)
+        await sendUserMessage(vm, text: "go")
+        let runId = try await waitForLastSentRunId(transport)
+
+        // A streaming delta establishes the pending run (as on device: deltas precede session.message).
+        transport.emit(
+            .chat(OpenClawChatEventPayload(
+                runId: runId, sessionKey: "main", state: "delta",
+                message: chatTextMessage(role: "assistant", text: "Reply 2/2 — can", timestamp: 1),
+                errorMessage: nil)))
+        try await waitUntil("run pending") { await MainActor.run { vm.pendingRunCount == 1 } }
+
+        // Canonical arrives first, during the pending run: server id present, idempotency key nil.
+        transport.emit(
+            .sessionMessage(OpenClawSessionMessageEventPayload(
+                sessionKey: "main",
+                message: chatTextModelMessage(role: "assistant", text: "Reply 2/2 — canonical text", timestamp: 2),
+                messageId: "srv-1", messageSeq: 2)))
+        try await waitUntil("canonical shown") {
+            await MainActor.run { vm.messages.contains { $0.serverMessageId == "srv-1" } }
+        }
+
+        // Optimistic final for the same run arrives after, with DIFFERENT text and no server id.
+        transport.emit(
+            .chat(OpenClawChatEventPayload(
+                runId: runId, sessionKey: "main", state: "final",
+                message: chatTextMessage(role: "assistant", text: "Reply 2/2 — optimistic text (differs)", timestamp: 100),
+                errorMessage: nil)))
+        try await Task.sleep(for: .milliseconds(80))
+
+        let assistants = await MainActor.run { vm.messages.filter { $0.role == "assistant" } }
+        #expect(assistants.count == 1)
+        #expect(assistants.first?.serverMessageId == "srv-1")
+    }
+
+    @Test func `orderedBySequence sorts by gateway seq and pins seq-less rows in place`() {
+        func msg(_ text: String, seq: Int?, role: String = "assistant") -> OpenClawChatMessage {
+            OpenClawChatMessage(
+                role: role,
+                content: [OpenClawChatMessageContent(
+                    type: "text", text: text, mimeType: nil, fileName: nil, content: nil)],
+                timestamp: 1,
+                serverSeq: seq)
+        }
+        func texts(_ messages: [OpenClawChatMessage]) -> [String?] { messages.map { $0.content.first?.text } }
+
+        // Canonical rows delivered out of arrival order sort by their gateway seq.
+        let reordered = OpenClawChatViewModel.orderedBySequence([msg("reply 2/2", seq: 3), msg("routed 1/2", seq: 2)])
+        #expect(texts(reordered) == ["routed 1/2", "reply 2/2"])
+
+        // A just-typed, seq-less user echo before a seq'd assistant reply must NOT invert: with no
+        // preceding seq it carries Int.min forward and stays on top.
+        let noInvert = OpenClawChatViewModel.orderedBySequence([
+            msg("typed just now", seq: nil, role: "user"), msg("assistant reply", seq: 5),
+        ])
+        #expect(texts(noInvert) == ["typed just now", "assistant reply"])
+
+        // A seq-less in-flight row after a seq'd row holds its trailing position (carry-forward).
+        let trailing = OpenClawChatViewModel.orderedBySequence([
+            msg("user", seq: 1, role: "user"), msg("finished reply", seq: 2), msg("streaming next", seq: nil),
+        ])
+        #expect(texts(trailing) == ["user", "finished reply", "streaming next"])
+
+        // Idempotent for already-ordered input; untouched when no row carries a seq.
+        let ordered = OpenClawChatViewModel.orderedBySequence([msg("a", seq: 1), msg("b", seq: 2)])
+        #expect(texts(OpenClawChatViewModel.orderedBySequence(ordered)) == ["a", "b"])
+        #expect(texts(OpenClawChatViewModel.orderedBySequence([msg("x", seq: nil), msg("y", seq: nil)])) == ["x", "y"])
+    }
+
+    @Test func `a routed reply that lands after the turn reply but has a lower seq renders before it`() async throws {
+        // Device repro of the ordering bug: 2/2 (the normal turn reply) is delivered first; 1/2 (routed
+        // via sessions_send) lands afterwards but was persisted earlier, so it carries a LOWER seq.
+        // Render order must follow the gateway seq, not arrival — 1/2 above 2/2.
+        let (transport, vm) = await makeViewModel(historyResponses: [historyPayload(messages: [])])
+        try await loadAndWaitBootstrap(vm: vm)
+        await sendUserMessage(vm, text: "go")
+        let runId = try await waitForLastSentRunId(transport)
+
+        // The turn reply (2/2) completes first: optimistic final adopted by canonical session.message seq 3.
+        transport.emit(
+            .chat(OpenClawChatEventPayload(
+                runId: runId, sessionKey: "main", state: "final",
+                message: chatTextMessage(role: "assistant", text: "reply 2/2", timestamp: 100),
+                errorMessage: nil)))
+        transport.emit(
+            .sessionMessage(OpenClawSessionMessageEventPayload(
+                sessionKey: "main",
+                message: chatTextModelMessage(
+                    role: "assistant", text: "reply 2/2", timestamp: 3, idempotencyKey: "\(runId):assistant"),
+                messageId: "srv-2", messageSeq: 3)))
+        try await waitUntil("2/2 shown") {
+            await MainActor.run { vm.messages.contains { $0.serverMessageId == "srv-2" } }
+        }
+
+        // The routed reply (1/2) lands afterwards, but was persisted earlier → lower seq 2.
+        transport.emit(
+            .sessionMessage(OpenClawSessionMessageEventPayload(
+                sessionKey: "main",
+                message: chatTextModelMessage(role: "assistant", text: "routed 1/2", timestamp: 2),
+                messageId: "srv-1", messageSeq: 2)))
+        try await waitUntil("1/2 shown") {
+            await MainActor.run { vm.messages.contains { $0.serverMessageId == "srv-1" } }
+        }
+
+        let assistants = await MainActor.run { vm.messages.filter { $0.role == "assistant" } }
+        #expect(assistants.map { $0.serverMessageId } == ["srv-1", "srv-2"])
+        #expect(assistants.map { $0.content.first?.text } == ["routed 1/2", "reply 2/2"])
     }
 
     @Test func `global chat delta adopts only selected agent run`() async throws {

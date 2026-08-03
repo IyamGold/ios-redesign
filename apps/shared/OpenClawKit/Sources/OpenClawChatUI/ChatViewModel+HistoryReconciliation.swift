@@ -38,11 +38,63 @@ extension OpenClawChatViewModel {
             content: sanitizedContent,
             timestamp: message.timestamp,
             idempotencyKey: message.idempotencyKey,
+            serverMessageId: message.serverMessageId,
+            serverSeq: message.serverSeq,
             toolCallId: message.toolCallId,
             toolName: message.toolName,
             usage: message.usage,
             stopReason: message.stopReason,
             errorMessage: message.errorMessage)
+    }
+
+    /// Ensures a message carries the durable server id and transcript position. `session.message`
+    /// delivers both top-level (`messageId`/`messageSeq`); use those when the body's `__openclaw`
+    /// metadata wasn't present so identity/order never depend on which surface they arrived on.
+    static func message(
+        _ message: OpenClawChatMessage,
+        attachingServerMessageId serverMessageId: String?,
+        serverSeq: Int? = nil) -> OpenClawChatMessage
+    {
+        let resolvedServerMessageId = message.serverMessageId ?? normalizedIdempotencyKey(serverMessageId)
+        let resolvedServerSeq = message.serverSeq ?? serverSeq
+        guard resolvedServerMessageId != message.serverMessageId ||
+            resolvedServerSeq != message.serverSeq
+        else {
+            return message
+        }
+        return OpenClawChatMessage(
+            id: message.id,
+            role: message.role,
+            content: message.content,
+            timestamp: message.timestamp,
+            idempotencyKey: message.idempotencyKey,
+            serverMessageId: resolvedServerMessageId,
+            serverSeq: resolvedServerSeq,
+            toolCallId: message.toolCallId,
+            toolName: message.toolName,
+            usage: message.usage,
+            stopReason: message.stopReason,
+            errorMessage: message.errorMessage)
+    }
+
+    /// Canonical render order. The gateway assigns every persisted row a session-global monotonic
+    /// `serverSeq`, so it — not network arrival order — is the source of truth (a `sessions_send`
+    /// reply routed into this session gets a lower seq than a later turn reply even if it lands after).
+    /// Transient rows without a seq (optimistic echo, in-flight stream) carry the preceding row's seq
+    /// forward and tie-break on original index, so they hold their position instead of jumping to an
+    /// edge. Stable and idempotent: a fully-seq'd, already-ordered list is returned unchanged.
+    nonisolated static func orderedBySequence(_ messages: [OpenClawChatMessage]) -> [OpenClawChatMessage] {
+        guard messages.contains(where: { $0.serverSeq != nil }) else { return messages }
+        var carriedSeq = Int.min
+        let keyed = messages.enumerated().map { index, message -> (seq: Int, index: Int, message: OpenClawChatMessage) in
+            if let seq = message.serverSeq { carriedSeq = seq }
+            return (carriedSeq, index, message)
+        }
+        return keyed
+            .sorted { lhs, rhs in
+                lhs.seq != rhs.seq ? lhs.seq < rhs.seq : lhs.index < rhs.index
+            }
+            .map(\.message)
     }
 
     static func messageContentFingerprint(for message: OpenClawChatMessage) -> String {
@@ -67,6 +119,13 @@ extension OpenClawChatViewModel {
     static func messageIdentityKey(for message: OpenClawChatMessage) -> String? {
         let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !role.isEmpty else { return nil }
+
+        // The durable server message id is unique per row and stable across session.message and
+        // history, so it's the strongest identity — prefer it above everything. This is what makes
+        // the canonical row and the history-refresh row reconcile to one instead of duplicating.
+        if let serverMessageId = Self.normalizedIdempotencyKey(message.serverMessageId) {
+            return [role, "serverid", serverMessageId].joined(separator: "|")
+        }
 
         // The gateway persists this key with the canonical user row. Prefer it
         // so a server timestamp change cannot replace the optimistic row's ID.
@@ -147,6 +206,12 @@ extension OpenClawChatViewModel {
                 from: existing.content),
             timestamp: incoming.timestamp ?? existing.timestamp,
             idempotencyKey: incoming.idempotencyKey,
+            // Upgrade the (optimistic) row to the canonical server id so every later history/session
+            // event reconciles onto it by identity — the key to killing the duplicate/rearrange.
+            serverMessageId: incoming.serverMessageId ?? existing.serverMessageId,
+            // Adopt the canonical transcript position so the row sorts to its true slot the moment the
+            // seq arrives — this is what corrects a late-landing routed reply's order.
+            serverSeq: incoming.serverSeq ?? existing.serverSeq,
             toolCallId: incoming.toolCallId,
             toolName: incoming.toolName,
             usage: incoming.usage,
@@ -315,6 +380,18 @@ extension OpenClawChatViewModel {
                     Self.normalizedIdempotencyKey(existing.idempotencyKey) == runId
             }
         }
+        // A non-provisional row that already carries a durable server id AND the same final content is
+        // definitively the canonical version of this reply — it arrived first via session.message/history.
+        // Skip the optimistic regardless of user-turn scope; turn-based scoping breaks for a second
+        // consecutive assistant reply and let the optimistic duplicate it.
+        if self.messages.contains(where: { existing in
+            existing.serverMessageId != nil &&
+                self.provisionalFinalMessagesByID[existing.id] == nil &&
+                Self.finalMessageReconciliationKey(for: existing) == key
+        }) {
+            return true
+        }
+
         let searchRange = Self.messageRange(after: scope.latestUserTurn, in: self.messages)
         guard !searchRange.isEmpty else { return false }
 
@@ -499,7 +576,12 @@ extension OpenClawChatViewModel {
         guard let matchIndex = messages.indices.last(where: { index in
             let existing = self.messages[index]
             guard let provisional = self.provisionalFinalMessagesByID[existing.id] else { return false }
-            if let incomingRunId, provisional.runId == incomingRunId {
+            // The optimistic row stores the bare run id; the canonical session.message arrives keyed
+            // "<runId>:assistant". Match on the run-identity key set (not raw equality) so the optimistic
+            // row is adopted — and thereby stamped with the canonical server id — instead of duplicated.
+            if let incomingRunId, let provisionalRunId = provisional.runId,
+               Self.assistantRunIdentityKeys(for: provisionalRunId).contains(incomingRunId)
+            {
                 return true
             }
             return provisional.reconciliationKey == incomingKey &&
@@ -672,6 +754,12 @@ extension OpenClawChatViewModel {
     }
 
     static func dedupeKey(for message: OpenClawChatMessage) -> String? {
+        // The durable server id is unique per row, so it's the correct collapse key — and it keeps
+        // a run's distinct rows (e.g. a text reply vs its media row) separate, which the run-derived
+        // idempotency key cannot always do.
+        if let serverMessageId = normalizedIdempotencyKey(message.serverMessageId) {
+            return "\(message.role)|serverid|\(serverMessageId)"
+        }
         if let idempotencyKey = normalizedIdempotencyKey(message.idempotencyKey) {
             return "\(message.role)|idempotency|\(idempotencyKey)"
         }

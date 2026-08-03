@@ -14,8 +14,12 @@ extension OpenClawChatViewModel {
     }
 
     func replaceMessages(_ messages: [OpenClawChatMessage]) {
-        guard self.messages != messages else { return }
-        self.messages = messages
+        // Single ordering choke point: every mutation lands here, so enforcing the gateway's canonical
+        // transcript order once means late-arriving rows (a routed reply, a history refresh) slot into
+        // their true position instead of appending at the tail. Idempotent for already-ordered input.
+        let ordered = Self.orderedBySequence(messages)
+        guard self.messages != ordered else { return }
+        self.messages = ordered
         markTimelineChanged()
     }
 

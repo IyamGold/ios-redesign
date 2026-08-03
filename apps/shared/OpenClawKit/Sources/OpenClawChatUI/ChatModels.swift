@@ -189,7 +189,9 @@ public struct OpenClawChatMessageContent: Codable, Hashable, Sendable {
 
 public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
     private struct OpenClawMetadata: Codable {
+        let id: String?
         let idempotencyKey: String?
+        let seq: Int?
     }
 
     public var id: UUID = .init()
@@ -197,6 +199,17 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
     public let content: [OpenClawChatMessageContent]
     public let timestamp: Double?
     public let idempotencyKey: String?
+    /// Durable per-message id assigned by the gateway (the transcript record's `__openclaw.id`, echoed
+    /// as `session.message.messageId`). It's the one identity stable across chat.final / session.message /
+    /// history for the same row; nil on the optimistic streaming row until the canonical row adopts it.
+    /// Reconciliation keys on this so the three representations of one reply collapse to a single bubble.
+    public let serverMessageId: String?
+    /// Session-global monotonic transcript position assigned by the gateway (`__openclaw.seq`, echoed as
+    /// `session.message.messageSeq`). Every persisted row — user, assistant, and `sessions_send`-routed
+    /// replies — shares one counter, so it's the authoritative render order. nil on transient rows
+    /// (optimistic echo / in-flight stream) until the canonical row carries it; ordering carries the
+    /// preceding row's seq forward for those so they hold position instead of jumping.
+    public let serverSeq: Int?
     public let toolCallId: String?
     public let toolName: String?
     public let usage: OpenClawChatUsage?
@@ -208,6 +221,8 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
         case content
         case timestamp
         case idempotencyKey
+        case serverMessageId
+        case serverSeq
         case openClaw = "__openclaw"
         case toolCallId
         case tool_call_id
@@ -228,6 +243,8 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
         content: [OpenClawChatMessageContent],
         timestamp: Double?,
         idempotencyKey: String? = nil,
+        serverMessageId: String? = nil,
+        serverSeq: Int? = nil,
         toolCallId: String? = nil,
         toolName: String? = nil,
         usage: OpenClawChatUsage? = nil,
@@ -239,6 +256,8 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
         self.content = content
         self.timestamp = timestamp
         self.idempotencyKey = idempotencyKey
+        self.serverMessageId = serverMessageId
+        self.serverSeq = serverSeq
         self.toolCallId = toolCallId
         self.toolName = toolName
         self.usage = usage
@@ -253,6 +272,14 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
         let decodedOpenClaw = try container.decodeIfPresent(OpenClawMetadata.self, forKey: .openClaw)
         let decodedIdempotencyKey = try decodedOpenClaw?.idempotencyKey ??
             container.decodeIfPresent(String.self, forKey: .idempotencyKey)
+        // The durable server id lives in `__openclaw.id` on the wire (history + session.message); the
+        // top-level key is the local transcript-cache round-trip form.
+        let decodedServerMessageId = try decodedOpenClaw?.id ??
+            container.decodeIfPresent(String.self, forKey: .serverMessageId)
+        // Same story for the transcript position: it rides in `__openclaw.seq` on the wire and the
+        // top-level key on transcript-cache round-trips.
+        let decodedServerSeq = try decodedOpenClaw?.seq ??
+            container.decodeIfPresent(Int.self, forKey: .serverSeq)
         let decodedToolCallId =
             try container.decodeIfPresent(String.self, forKey: .toolCallId) ??
             container.decodeIfPresent(String.self, forKey: .tool_call_id)
@@ -266,6 +293,8 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
         self.role = decodedRole
         self.timestamp = decodedTimestamp
         self.idempotencyKey = decodedIdempotencyKey
+        self.serverMessageId = decodedServerMessageId
+        self.serverSeq = decodedServerSeq
         self.toolCallId = decodedToolCallId
         self.toolName = decodedToolName
         self.usage = decodedUsage
@@ -363,6 +392,8 @@ public struct OpenClawChatMessage: Codable, Hashable, Identifiable, Sendable {
         try container.encode(self.role, forKey: .role)
         try container.encodeIfPresent(self.timestamp, forKey: .timestamp)
         try container.encodeIfPresent(self.idempotencyKey, forKey: .idempotencyKey)
+        try container.encodeIfPresent(self.serverMessageId, forKey: .serverMessageId)
+        try container.encodeIfPresent(self.serverSeq, forKey: .serverSeq)
         try container.encodeIfPresent(self.toolCallId, forKey: .toolCallId)
         try container.encodeIfPresent(self.toolName, forKey: .toolName)
         try container.encodeIfPresent(self.usage, forKey: .usage)

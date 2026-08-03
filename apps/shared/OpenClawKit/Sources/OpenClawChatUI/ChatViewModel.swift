@@ -166,6 +166,11 @@ public final class OpenClawChatViewModel {
     // answer in the same session does not adopt or suppress the wrong row.
     var runMessageScopesByRunID: [String: RunMessageScope] = [:]
     var provisionalFinalMessagesByID: [UUID: ProvisionalFinalMessage] = [:]
+    // Runs whose canonical assistant reply already arrived via `session.message` while the run was
+    // pending. The gateway can deliver that durable row (with a server id but no idempotency key)
+    // BEFORE `chat.final`, and its text may differ from the optimistic final — so this run-correlated
+    // marker, not content, is what stops the optimistic final from appending a duplicate row.
+    var runsWithDeliveredCanonicalReply: Set<String> = []
     private var sessionGeneration: UInt64 = 0
     private var bootstrapGeneration: UInt64 = 0
     // A newer same-session history request only invalidates older responses after it applies.
@@ -1807,6 +1812,7 @@ public final class OpenClawChatViewModel {
         self.pendingLocalUserEchoMessageIDsByRunID.removeAll()
         self.runMessageScopesByRunID.removeAll()
         self.provisionalFinalMessagesByID.removeAll()
+        self.runsWithDeliveredCanonicalReply.removeAll()
         resetOutboxPresentationForSessionSwitch()
         self.sessionId = nil
         self.pendingToolCallsById = [:]
@@ -2194,7 +2200,10 @@ public final class OpenClawChatViewModel {
 
     private func handleSessionMessageEvent(_ payload: OpenClawSessionMessageEventPayload) {
         guard let message = payload.message else { return }
-        let sanitized = Self.stripInboundMetadata(from: message)
+        let sanitized = Self.message(
+            Self.stripInboundMetadata(from: message),
+            attachingServerMessageId: payload.messageId,
+            serverSeq: payload.messageSeq)
         let isCurrentSession = payload.sessionKey.map {
             self.matchesCurrentSessionKey(incoming: $0, agentId: payload.agentId, current: self.sessionKey)
         } ?? true
@@ -2203,6 +2212,17 @@ public final class OpenClawChatViewModel {
         // still retire its durable row before this handler returns early.
         confirmOutboxCommands(in: [sanitized])
         guard isCurrentSession else { return }
+
+        // Canonical assistant reply for the run that's currently streaming: mark the run so its later
+        // (redundant) optimistic chat.final doesn't append a duplicate — the two can carry different
+        // text and, on some gateways, no idempotency key, so run correlation is the only reliable link.
+        if Self.isAssistantMessage(sanitized),
+           sanitized.serverMessageId != nil,
+           self.pendingRuns.count == 1,
+           let pendingRun = self.pendingRuns.first
+        {
+            self.runsWithDeliveredCanonicalReply.insert(pendingRun)
+        }
 
         self.invalidateHistorySnapshots()
         // The active client also receives the gateway's echo of the user turn it
@@ -2340,6 +2360,13 @@ public final class OpenClawChatViewModel {
         let scope = runMessageScope(for: runId)
         guard self.isCurrentSession(scope.session) else { return }
         guard let reconciliationKey = Self.finalMessageReconciliationKey(for: message) else { return }
+        // The canonical row for this run already arrived via session.message — the optimistic final is
+        // redundant and would duplicate it (content match can't be trusted across the two surfaces).
+        if let runId, self.runsWithDeliveredCanonicalReply.contains(runId) {
+            self.runsWithDeliveredCanonicalReply.remove(runId)
+            self.runMessageScopesByRunID.removeValue(forKey: runId)
+            return
+        }
         if let runId, hasRecordedFinalMessage(runId: runId) {
             return
         }
@@ -2375,6 +2402,8 @@ public final class OpenClawChatViewModel {
             content: message.content,
             timestamp: Date().timeIntervalSince1970 * 1000,
             idempotencyKey: message.idempotencyKey,
+            serverMessageId: message.serverMessageId,
+            serverSeq: message.serverSeq,
             toolCallId: message.toolCallId,
             toolName: message.toolName,
             usage: message.usage,

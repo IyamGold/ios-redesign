@@ -1156,6 +1156,10 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
                 },
                 timestamp: message.timestamp,
                 idempotencyKey: message.idempotencyKey,
+                // Scalars, not payloads: keep the durable id + transcript position so a cold-open
+                // cache paint dedupes against live history and renders in canonical order.
+                serverMessageId: message.serverMessageId,
+                serverSeq: message.serverSeq,
                 toolCallId: message.toolCallId,
                 toolName: message.toolName,
                 usage: message.usage,
