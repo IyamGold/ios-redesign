@@ -17,6 +17,10 @@ struct ChatDrawerHost<ChatContent: View>: View {
     @Binding var isOpen: Bool
     let sessions: [ChatDrawerSession]
     let versionText: String
+    /// Gates drag-to-open. The drawer belongs to the chat surface only, so when another surface (e.g. a
+    /// pushed Settings screen) covers the chat, opening must be disabled — otherwise the left-edge strip
+    /// would still pull the drawer out from under it.
+    var allowsOpen: Bool = true
     let onSelectDestination: (ChatDrawerDestination) -> Void
     let onSelectSession: (String) -> Void
     @ViewBuilder let chatContent: ChatContent
@@ -77,8 +81,8 @@ struct ChatDrawerHost<ChatContent: View>: View {
 
                 // Left-edge pan-to-open catcher (closed only). The chat is interactive when closed, so a
                 // gesture on the panel itself loses to its scroll view; a dedicated edge strip reliably
-                // starts the open drag.
-                if !self.isOpen {
+                // starts the open drag. Omitted when opening is disallowed (e.g. Settings is up).
+                if !self.isOpen, self.allowsOpen {
                     Color.clear
                         .frame(width: 20)
                         .frame(maxHeight: .infinity)
@@ -129,7 +133,7 @@ struct ChatDrawerHost<ChatContent: View>: View {
     /// Closed drags only engage from the left edge so mid-screen chat gestures aren't hijacked;
     /// open drags engage anywhere on the panel.
     private func dragEngaged(_ value: DragGesture.Value) -> Bool {
-        self.isOpen || value.startLocation.x <= 60
+        self.isOpen || (self.allowsOpen && value.startLocation.x <= 60)
     }
 
     private func close() {

@@ -622,7 +622,7 @@ struct ChatRootSurface: View {
         HStack(alignment: .bottom, spacing: 8) {
             TextField(self.composerPlaceholder, text: self.$viewModel.input, axis: .vertical)
                 .font(.system(size: 16))
-                .lineLimit(1...4)
+                .lineLimit(1...8)
                 .onSubmit(self.sendCurrentInput)
             // The mic only shows in the empty state — once attachments are staged the field is for a
             // caption (or is taken over by a voice note), so recording a new note there is out of place.

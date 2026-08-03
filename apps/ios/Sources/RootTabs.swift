@@ -34,6 +34,8 @@ struct RootTabs: View {
     @State private var isChatDrawerOpen = false
     @State private var activeDrawerDestination: ChatDrawerDestination?
     @State private var drawerSessions: [ChatDrawerSession] = []
+    /// True while a Settings route is pushed over the phone chat; disables the drawer's drag-to-open.
+    @State private var isPhoneSettingsPresented = false
     // Embedded Settings rows push onto the sidebar stack; clear it before
     // changing sidebar roots so stale settings detail screens cannot survive.
     @State private var sidebarNavigationPath: [SettingsRoute] = []
@@ -169,13 +171,16 @@ struct RootTabs: View {
             isOpen: self.$isChatDrawerOpen,
             sessions: self.drawerSessions,
             versionText: Self.appVersionText,
+            // The drawer is a chat-surface control; disable drag-to-open while Settings covers the chat.
+            allowsOpen: !self.isPhoneSettingsPresented,
             onSelectDestination: { self.activeDrawerDestination = $0 },
             onSelectSession: { self.appModel.openChat(sessionKey: $0) })
         {
             PhoneTabSettingsHost(
                 resetRequestID: self.phoneChatSettingsResetRequestID,
                 onOpenConnection: { self.showConnectionSheet = true },
-                pendingRoute: self.$pendingSettingsRoute)
+                pendingRoute: self.$pendingSettingsRoute,
+                isPresentingSettings: self.$isPhoneSettingsPresented)
             { openSettingsRoute in
                 ChatProTab(
                     headerLeadingAction: self.phoneChatReturnAction,
@@ -1420,17 +1425,22 @@ private struct PhoneTabSettingsHost<Content: View>: View {
     private let resetRequestID: Int
     private let onOpenConnection: () -> Void
     @Binding private var pendingRoute: SettingsRoute?
+    /// Mirrors "a Settings route is pushed over the chat root" so the surrounding shell can disable the
+    /// chat drawer's drag-to-open while Settings is visible.
+    @Binding private var isPresentingSettings: Bool
     private let content: (_ openSettingsRoute: @escaping (SettingsRoute) -> Void) -> Content
 
     init(
         resetRequestID: Int = 0,
         onOpenConnection: @escaping () -> Void = {},
         pendingRoute: Binding<SettingsRoute?> = .constant(nil),
+        isPresentingSettings: Binding<Bool> = .constant(false),
         @ViewBuilder content: @escaping (_ openSettingsRoute: @escaping (SettingsRoute) -> Void) -> Content)
     {
         self.resetRequestID = resetRequestID
         self.onOpenConnection = onOpenConnection
         self._pendingRoute = pendingRoute
+        self._isPresentingSettings = isPresentingSettings
         self.content = content
     }
 
@@ -1470,6 +1480,9 @@ private struct PhoneTabSettingsHost<Content: View>: View {
                     SettingsProTab(directRoute: route)
                 }
             }
+        }
+        .onChange(of: self.settingsPath.isEmpty) { _, isEmpty in
+            self.isPresentingSettings = !isEmpty
         }
         .onChange(of: self.resetRequestID) { _, _ in
             self.settingsPath.removeAll()
