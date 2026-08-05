@@ -106,11 +106,11 @@ struct PermissionsScreen: View {
                     self.divider
                     self.row("PermissionsContactGlyph", "Contacts", self.statuses.contacts)
                     self.divider
-                    self.row("ChatMicGlyph", "Microphone", self.statuses.microphone)
+                    self.row("PermissionsMicGlyph", "Microphone", self.statuses.microphone)
                     self.divider
                     self.row("PermissionsImageGlyph", "Photos", self.statuses.photos)
                     self.divider
-                    self.row("ChatCameraGlyph", "Camera", self.statuses.camera)
+                    self.row("PermissionsCameraGlyph", "Camera", self.statuses.camera)
                 }
                 .padding(.vertical, 14)
                 .padding(.horizontal, 12)
