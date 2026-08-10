@@ -316,6 +316,20 @@ final class NodeAppModel {
         self.operatorGateway
     }
 
+    /// Capability-scoped canvas host base URL from the node connect response (e.g.
+    /// `https://host:port/__openclaw__/cap/<token>`). Used to resolve `[embed]` canvas document paths
+    /// into authenticated, phone-loadable absolute URLs.
+    func canvasHostURL() async -> String? {
+        await self.nodeGateway.currentCanvasHostUrl()
+    }
+
+    /// Refresh the canvas host URL before loading a canvas — the capability token has a short TTL, so a
+    /// stored value can expire between sends.
+    @discardableResult
+    func refreshCanvasHostURL() async -> String? {
+        await self.nodeGateway.refreshCanvasHostUrl()
+    }
+
     var isTalkCaptureActive: Bool {
         // PTT owns its Voice Wake lease before permission and audio setup.
         // Count that pending interval so Chat cannot race another mic owner.

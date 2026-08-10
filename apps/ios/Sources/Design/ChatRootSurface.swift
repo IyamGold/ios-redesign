@@ -46,6 +46,10 @@ struct ChatRootSurface: View {
     @State private var replyIntroArmed = false
     /// Armed on send; fires the crisp closing click once when the assistant's run completes.
     @State private var replyEndArmed = false
+    /// The `[embed]` canvas open in the viewer panel (tapped from an inline card).
+    @State private var openEmbed: CanvasEmbed?
+    /// App model — used to resolve `[embed]` canvas docs against the gateway's capability-scoped host URL.
+    @Environment(NodeAppModel.self) private var appModel
 
     private static let bubbleRed = Color(red: 195 / 255, green: 63 / 255, blue: 51 / 255)
     /// Online presence dot (iOS system green) shown on the avatar while connected.
@@ -97,6 +101,20 @@ struct ChatRootSurface: View {
         }
         .onChange(of: self.viewModel.messages, initial: true) { _, _ in
             self.rebuildRows()
+        }
+        // The `[embed]` canvas viewer, opened from an inline embed card. Resolves against a freshly
+        // refreshed capability-scoped host URL (the token is short-lived).
+        .sheet(item: self.$openEmbed) { embed in
+            CanvasEmbedPanel(
+                embed: embed,
+                canvasHostProvider: {
+                    if let refreshed = await self.appModel.refreshCanvasHostURL() {
+                        return refreshed
+                    }
+                    return await self.appModel.canvasHostURL()
+                },
+                onClose: { self.openEmbed = nil })
+                .presentationCornerRadius(47)
         }
         // Kick the view model's bootstrap (history + health poll) on appear and whenever the model
         // instance changes. The shared kit view did this in its own `.onAppear`; without it the health
@@ -207,7 +225,9 @@ struct ChatRootSurface: View {
     /// blocks and wide content aren't boxed in.
     @ViewBuilder
     private func messageView(for row: ChatDisplayRow) -> some View {
-        if row.isUser {
+        if let embed = row.canvasEmbed {
+            CanvasEmbedCard(embed: embed, onOpen: { self.openEmbed = embed })
+        } else if row.isUser {
             ChatUserBubble(row: row, colorScheme: self.colorScheme)
         } else {
             ChatAssistantMessage(row: row, colorScheme: self.colorScheme)
@@ -242,6 +262,7 @@ struct ChatRootSurface: View {
     /// time per message (the parser is the expensive part) instead of twice on every render.
     private func rebuildRows() {
         var result: [ChatDisplayRow] = []
+        var allEmbeds: [CanvasEmbed] = []
         for message in self.viewModel.messages {
             let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard role == "user" || role == "assistant" else { continue }
@@ -302,19 +323,36 @@ struct ChatRootSurface: View {
             {
                 text = ""
             }
+            // Extract [embed] canvas shortcodes from assistant turns; they render as cards, not raw text.
+            var embeds: [CanvasEmbed] = []
+            if role == "assistant" {
+                let parsed = CanvasEmbedParser.parse(messageID: message.id.uuidString, text: text)
+                text = parsed.text
+                embeds = parsed.embeds
+            }
             let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            guard hasText || !images.isEmpty || !chips.isEmpty else { continue }
+            guard hasText || !images.isEmpty || !chips.isEmpty || !embeds.isEmpty else { continue }
             let isUser = role == "user"
-            result.append(ChatDisplayRow(
-                id: message.id,
-                isUser: isUser,
-                text: text,
-                timestamp: message.timestamp,
-                isError: message.errorMessage != nil,
-                images: images,
-                chips: chips))
+            // Canvas cards render ABOVE the reply text so they read as part of the reply, not as a
+            // detached row beneath the text + timestamp.
+            for embed in embeds {
+                result.append(ChatDisplayRow(canvasEmbed: embed, timestamp: message.timestamp))
+            }
+            if hasText || !images.isEmpty || !chips.isEmpty {
+                result.append(ChatDisplayRow(
+                    id: message.id,
+                    isUser: isUser,
+                    text: text,
+                    timestamp: message.timestamp,
+                    isError: message.errorMessage != nil,
+                    images: images,
+                    chips: chips))
+            }
+            allEmbeds.append(contentsOf: embeds)
         }
         self.rows = result
+        // Feed the drawer's Canvas archive from the same source as the inline cards.
+        CanvasEmbedIndex.shared.update(fromTranscriptOrder: allEmbeds)
     }
 
     /// Project a message's attachment content blocks into renderable pieces, once, off the render path.
@@ -1151,6 +1189,8 @@ private struct ChatDisplayRow: Identifiable, Equatable {
     let images: [UIImage]
     /// Non-image attachments (files, voice notes, bytes-less images) shown as metadata chips.
     let chips: [ChatAttachmentChip]
+    /// Set for a `[embed]` canvas card projected from an assistant message; nil otherwise.
+    let canvasEmbed: CanvasEmbed?
 
     init(
         id: UUID,
@@ -1169,6 +1209,7 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.isStreaming = false
         self.images = images
         self.chips = chips
+        self.canvasEmbed = nil
     }
 
     init(streamingText: String) {
@@ -1180,15 +1221,29 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.isStreaming = true
         self.images = []
         self.chips = []
+        self.canvasEmbed = nil
+    }
+
+    init(canvasEmbed: CanvasEmbed, timestamp: Double?) {
+        self.id = canvasEmbed.id
+        self.isUser = false
+        self.text = ""
+        self.timestamp = timestamp
+        self.isError = false
+        self.isStreaming = false
+        self.images = []
+        self.chips = []
+        self.canvasEmbed = canvasEmbed
     }
 
     /// UIImage/chip aren't Equatable, so compare their derived counts; the row id + text already capture
-    /// material message changes for SwiftUI diffing.
+    /// material message changes for SwiftUI diffing. The artifact's updatedAt captures live canvas edits.
     static func == (lhs: ChatDisplayRow, rhs: ChatDisplayRow) -> Bool {
         lhs.id == rhs.id && lhs.isUser == rhs.isUser && lhs.text == rhs.text
             && lhs.timestamp == rhs.timestamp && lhs.isError == rhs.isError
             && lhs.isStreaming == rhs.isStreaming && lhs.images.count == rhs.images.count
             && lhs.chips.count == rhs.chips.count
+            && lhs.canvasEmbed?.id == rhs.canvasEmbed?.id
     }
 }
 

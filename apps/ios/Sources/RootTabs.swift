@@ -36,6 +36,8 @@ struct RootTabs: View {
     @State private var drawerSessions: [ChatDrawerSession] = []
     /// True while a Settings route is pushed over the phone chat; disables the drawer's drag-to-open.
     @State private var isPhoneSettingsPresented = false
+    /// The canvas embed currently open in the viewer panel (opened from the archive page).
+    @State private var selectedCanvasEmbed: CanvasEmbed?
     // Embedded Settings rows push onto the sidebar stack; clear it before
     // changing sidebar roots so stale settings detail screens cannot survive.
     @State private var sidebarNavigationPath: [SettingsRoute] = []
@@ -226,7 +228,9 @@ struct RootTabs: View {
         Group {
             switch destination {
             case .canvas:
-                DrawerCanvasScreen()
+                CanvasArchiveScreen(
+                    onClose: { self.activeDrawerDestination = nil },
+                    onOpenEmbed: { self.selectedCanvasEmbed = $0 })
             case .dreaming:
                 AgentProTab(directRoute: .dreaming, headerLeadingAction: nil, headerTitle: "Dreaming")
             case .usage:
@@ -243,9 +247,25 @@ struct RootTabs: View {
         }
         // Consistent redesigned "cancel" X across all drawer destinations (matches the Connection sheet),
         // in place of each screen's own back chevron. A top safe-area inset (not an overlay) reserves
-        // its space so the button never sits on top of the screen's content.
+        // its space so the button never sits on top of the screen's content. Canvas draws its own header
+        // + close, so it opts out of the shared button.
         .safeAreaInset(edge: .top, alignment: .leading, spacing: 0) {
-            DrawerCloseButton(onClose: { self.activeDrawerDestination = nil })
+            if destination != .canvas {
+                DrawerCloseButton(onClose: { self.activeDrawerDestination = nil })
+            }
+        }
+        // The canvas viewer panel, opened from the archive page's rows.
+        .sheet(item: self.$selectedCanvasEmbed) { embed in
+            CanvasEmbedPanel(
+                embed: embed,
+                canvasHostProvider: {
+                    if let refreshed = await self.appModel.refreshCanvasHostURL() {
+                        return refreshed
+                    }
+                    return await self.appModel.canvasHostURL()
+                },
+                onClose: { self.selectedCanvasEmbed = nil })
+                .presentationCornerRadius(47)
         }
         .environment(self.appModel)
         .environment(self.gatewayController)
