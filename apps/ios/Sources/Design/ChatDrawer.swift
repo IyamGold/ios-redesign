@@ -38,6 +38,10 @@ struct ChatDrawerHost<ChatContent: View>: View {
     /// Suppresses the open/close click when the drawer closes as a side effect of picking an item —
     /// the click is for opening/dismissing the drawer, not for selection.
     @State private var suppressCloseHaptic = false
+    /// Per-gesture latch for the closed-state open swipe: nil until the first significant movement, then
+    /// true (a rightward, horizontally-dominant swipe → open) or false (vertical/leftward → yield to the
+    /// transcript scroll). Latching once prevents a mid-drag direction change from flipping the decision.
+    @State private var openSwipeEngaged: Bool?
 
     private static var openOffset: CGFloat {
         305
@@ -83,18 +87,10 @@ struct ChatDrawerHost<ChatContent: View>: View {
                         color: .black.opacity(self.isOpen ? 0.25 : 0),
                         radius: 15, x: -5, y: 0)
                     .offset(x: self.currentOffset(open: openOffset))
-                    .gesture(self.panelDrag(open: openOffset))
-
-                // Left-edge pan-to-open catcher (closed only). The chat is interactive when closed, so a
-                // gesture on the panel itself loses to its scroll view; a dedicated edge strip reliably
-                // starts the open drag. Omitted when opening is disallowed (e.g. Settings is up).
-                if !self.isOpen, self.allowsOpen {
-                    Color.clear
-                        .frame(width: 20)
-                        .frame(maxHeight: .infinity)
-                        .contentShape(Rectangle())
-                        .gesture(self.panelDrag(open: openOffset))
-                }
+                    // Simultaneous (not `.gesture`) so it coexists with the transcript scroll: the drag only
+                    // moves the drawer for a rightward, horizontally-dominant swipe (see `panelDrag`), so the
+                    // open-swipe can start anywhere across the chat while vertical scrolling still works.
+                    .simultaneousGesture(self.panelDrag(open: openOffset))
             }
         }
         // Crisp minimal click when the drawer opens or is dismissed — but not when it closes because
@@ -115,16 +111,29 @@ struct ChatDrawerHost<ChatContent: View>: View {
         return max(0, min(open, base + self.dragOffset))
     }
 
-    /// Drag opens (from the left edge when closed) and closes (any drag on the panel when open).
-    /// The release decision uses the projected resting position so a quick flick commits.
+    /// Opens from a left→right swipe starting ANYWHERE across the chat (not just the edge), and closes on
+    /// any drag while open. Runs as a `.simultaneousGesture` so it shares touches with the transcript's
+    /// vertical scroll: a rightward, horizontally-dominant swipe opens the drawer; vertical (or leftward)
+    /// drags fall through and scroll normally. The release decision uses the projected resting position so
+    /// a quick flick commits.
     private func panelDrag(open: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 12)
             .onChanged { value in
-                guard self.dragEngaged(value) else { return }
-                self.dragOffset = value.translation.width
+                if self.isOpen {
+                    self.dragOffset = value.translation.width
+                    return
+                }
+                guard self.allowsOpen else { return }
+                if self.openSwipeEngaged == nil {
+                    self.openSwipeEngaged = value.translation.width > 0
+                        && abs(value.translation.width) > abs(value.translation.height)
+                }
+                if self.openSwipeEngaged == true {
+                    self.dragOffset = max(0, value.translation.width)
+                }
             }
             .onEnded { value in
-                let engaged = self.dragEngaged(value)
+                let engaged = self.isOpen || self.openSwipeEngaged == true
                 let base: CGFloat = self.isOpen ? open : 0
                 let projected = base + value.predictedEndTranslation.width
                 withAnimation(.spring(duration: 0.35)) {
@@ -133,13 +142,8 @@ struct ChatDrawerHost<ChatContent: View>: View {
                     }
                     self.dragOffset = 0
                 }
+                self.openSwipeEngaged = nil
             }
-    }
-
-    /// Closed drags only engage from the left edge so mid-screen chat gestures aren't hijacked;
-    /// open drags engage anywhere on the panel.
-    private func dragEngaged(_ value: DragGesture.Value) -> Bool {
-        self.isOpen || (self.allowsOpen && value.startLocation.x <= 60)
     }
 
     private func close() {

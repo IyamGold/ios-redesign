@@ -1478,6 +1478,10 @@ extension RootTabs {
 /// (deep links, onboarding, problem banner) jump to the canonical Settings tab.
 private struct PhoneTabSettingsHost<Content: View>: View {
     @State private var settingsPath: [SettingsRoute] = []
+    /// True while a left→right back-swipe is engaged. Row taps are gated on this so a swipe that passes
+    /// over a grouped-list item doesn't ALSO open that item (which pushed a route while the swipe popped
+    /// the stack — leaving a dangling destination whose back went straight to chat).
+    @State private var swipeBackActive = false
     private let resetRequestID: Int
     private let onOpenConnection: () -> Void
     @Binding private var pendingRoute: SettingsRoute?
@@ -1508,33 +1512,49 @@ private struct PhoneTabSettingsHost<Content: View>: View {
             .navigationDestination(for: SettingsRoute.self) { route in
                 // The Settings entry (.home) opens the redesigned root menu, which pushes its rows'
                 // routes onto this same stack; redesigned destinations render here, others fall back
-                // to the existing SettingsProTab screen.
-                switch route {
-                case .home:
-                    SettingsRootContainer(
-                        onBack: { self.settingsPath.removeLast() },
-                        onOpenRoute: { self.settingsPath.append($0) },
-                        onOpenConnection: self.onOpenConnection)
-                        .toolbar(.hidden, for: .navigationBar)
-                case .approvals:
-                    ApprovalsScreen(onBack: { self.settingsPath.removeLast() })
-                case .permissions:
-                    PermissionsScreen(onBack: { self.settingsPath.removeLast() })
-                case .notifications:
-                    NotificationsScreen(onBack: { self.settingsPath.removeLast() })
-                case .channels:
-                    ChannelsScreenHost(onBack: { self.settingsPath.removeLast() })
-                case .voice:
-                    VoiceSettingsScreenHost(
-                        onBack: { self.settingsPath.removeLast() },
-                        onOpenWakeWords: { self.settingsPath.append(.wakeWords) })
-                case .wakeWords:
-                    WakeWordsScreenHost(onBack: { self.settingsPath.removeLast() })
-                case .licenses:
-                    LicensesScreen(onBack: { self.settingsPath.removeLast() })
-                default:
-                    SettingsProTab(directRoute: route)
+                // to the existing SettingsProTab screen. Every destination gets a left→right
+                // swipe-to-go-back (mirrors the chat drawer gesture) that pops this stack from anywhere.
+                Group {
+                    switch route {
+                    case .home:
+                        SettingsRootContainer(
+                            onBack: { self.settingsPath.removeLast() },
+                            onOpenRoute: {
+                                if !self.swipeBackActive {
+                                    self.settingsPath.append($0)
+                                }
+                            },
+                            onOpenConnection: self.onOpenConnection)
+                            .toolbar(.hidden, for: .navigationBar)
+                    case .approvals:
+                        ApprovalsScreen(onBack: { self.settingsPath.removeLast() })
+                    case .permissions:
+                        PermissionsScreen(onBack: { self.settingsPath.removeLast() })
+                    case .notifications:
+                        NotificationsScreen(onBack: { self.settingsPath.removeLast() })
+                    case .channels:
+                        ChannelsScreenHost(onBack: { self.settingsPath.removeLast() })
+                    case .voice:
+                        VoiceSettingsScreenHost(
+                            onBack: { self.settingsPath.removeLast() },
+                            onOpenWakeWords: {
+                                if !self.swipeBackActive {
+                                    self.settingsPath.append(.wakeWords)
+                                }
+                            })
+                    case .wakeWords:
+                        WakeWordsScreenHost(onBack: { self.settingsPath.removeLast() })
+                    case .licenses:
+                        LicensesScreen(onBack: { self.settingsPath.removeLast() })
+                    default:
+                        SettingsProTab(directRoute: route)
+                    }
                 }
+                .modifier(SwipeToGoBack(isActive: self.$swipeBackActive) {
+                    if !self.settingsPath.isEmpty {
+                        self.settingsPath.removeLast()
+                    }
+                })
             }
         }
         .onChange(of: self.settingsPath.isEmpty) { _, isEmpty in
@@ -1549,6 +1569,47 @@ private struct PhoneTabSettingsHost<Content: View>: View {
             self.settingsPath.append(route)
             self.pendingRoute = nil
         }
+    }
+}
+
+/// Left→right swipe-to-go-back, mirroring the chat drawer's open gesture: a full-width
+/// `.simultaneousGesture` that shares touches with the screen's vertical scroll. It latches on the first
+/// significant movement and only fires `action` when the swipe is clearly rightward and horizontally
+/// dominant (and travels/flicks far enough), so vertical scrolling and taps pass through untouched.
+private struct SwipeToGoBack: ViewModifier {
+    @Binding var isActive: Bool
+    let action: () -> Void
+    @State private var engaged: Bool?
+
+    init(isActive: Binding<Bool>, _ action: @escaping () -> Void) {
+        self._isActive = isActive
+        self.action = action
+    }
+
+    func body(content: Content) -> some View {
+        content.simultaneousGesture(
+            DragGesture(minimumDistance: 12)
+                .onChanged { value in
+                    if self.engaged == nil {
+                        self.engaged = value.translation.width > 0
+                            && abs(value.translation.width) > abs(value.translation.height)
+                    }
+                    // Flag the instant the swipe is a rightward drag, so a row it passes over is suppressed
+                    // for this gesture (row taps fire on touch-up, alongside `onEnded`).
+                    if self.engaged == true, !self.isActive {
+                        self.isActive = true
+                    }
+                }
+                .onEnded { value in
+                    let committed = self.engaged == true
+                        && (value.translation.width > 80 || value.predictedEndTranslation.width > 200)
+                    self.engaged = nil
+                    if committed {
+                        self.action()
+                    }
+                    // Clear on the next runloop so a same-touch row tap still sees the flag set.
+                    DispatchQueue.main.async { self.isActive = false }
+                })
     }
 }
 
