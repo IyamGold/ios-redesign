@@ -91,7 +91,6 @@ struct PermissionsScreen: View {
     let onBack: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.displayScale) private var displayScale
     @State private var statuses = PermissionStatuses()
 
     var body: some View {
@@ -99,25 +98,21 @@ struct PermissionsScreen: View {
             ScrollView {
                 VStack(spacing: 17) {
                     self.row("PermissionsPinGlyph", "Location", self.statuses.location)
-                    self.divider
+                    OpenClawRowDivider()
                     self.row("PermissionsCalendarGlyph", "Calendar", self.statuses.calendar)
-                    self.divider
+                    OpenClawRowDivider()
                     self.row("PermissionsClipboardGlyph", "Reminders", self.statuses.reminders)
-                    self.divider
+                    OpenClawRowDivider()
                     self.row("PermissionsContactGlyph", "Contacts", self.statuses.contacts)
-                    self.divider
+                    OpenClawRowDivider()
                     self.row("PermissionsMicGlyph", "Microphone", self.statuses.microphone)
-                    self.divider
+                    OpenClawRowDivider()
                     self.row("PermissionsImageGlyph", "Photos", self.statuses.photos)
-                    self.divider
+                    OpenClawRowDivider()
                     self.row("PermissionsCameraGlyph", "Camera", self.statuses.camera)
                 }
                 .padding(.vertical, 14)
-                .padding(.horizontal, 12)
-                .background {
-                    RoundedRectangle(cornerRadius: 25, style: .continuous)
-                        .fill(self.cardFill)
-                }
+                .openClawSectionBackground(self.cardFill)
                 .padding(.horizontal, 24)
                 .padding(.top, 4)
             }
@@ -128,15 +123,6 @@ struct PermissionsScreen: View {
         { _ in
             self.statuses.refresh() // reflect changes made in Settings.app
         }
-    }
-
-    /// 0.3 crisp single-pixel hairline, centered between 17pt-spaced rows (shared Settings token).
-    private var divider: some View {
-        Rectangle()
-            .fill(Color.primary.opacity(0.3))
-            .frame(maxWidth: .infinity)
-            .frame(height: 1 / self.displayScale)
-            .padding(.leading, 34)
     }
 
     private var cardFill: Color {
@@ -172,6 +158,8 @@ struct PermissionsScreen: View {
                     .frame(width: 20, height: 20)
                     .foregroundStyle(Color.primary)
             }
+            // Row-level horizontal inset (card no longer pads) so `OpenClawRowDivider` is full-bleed.
+            .padding(.horizontal, 12)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -276,7 +264,7 @@ struct NotificationsScreen: View {
                     }
                     .padding(.horizontal, 16)
                     .frame(height: 50)
-                    .background { Capsule(style: .continuous).fill(self.cardFill) }
+                    .openClawSectionBackground(self.cardFill)
                 }
                 .padding(.horizontal, 24)
                 .padding(.top, 4)
@@ -584,7 +572,6 @@ struct VoiceSettingsScreen: View {
     let onOpenWakeWords: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.displayScale) private var displayScale
 
     var body: some View {
         SettingsDestinationChrome(title: "Voice Settings", onBack: self.onBack) {
@@ -598,22 +585,22 @@ struct VoiceSettingsScreen: View {
                     }
                     .padding(.horizontal, 17)
                     .frame(height: 50)
-                    .background { Capsule(style: .continuous).fill(self.cardFill) }
+                    .openClawSectionBackground(self.cardFill)
 
                     Group {
                         self.voiceSection("Permissions") {
                             self.toggleRow("Voice Wake", isOn: self.$voiceWake)
-                            self.sectionDivider
+                            OpenClawRowDivider()
                             self.toggleRow("Background Listening", isOn: self.$backgroundListening)
-                            self.sectionDivider
+                            OpenClawRowDivider()
                             self.toggleRow("Speakerphone", isOn: self.$speakerphone)
                         }
 
                         self.voiceSection("Language & Gateway") {
                             self.pickerRow("Language", value: self.$language, options: self.languageOptions)
-                            self.sectionDivider
+                            OpenClawRowDivider()
                             self.pickerRow("Provider", value: self.$provider, options: self.providerOptions)
-                            self.sectionDivider
+                            OpenClawRowDivider()
                             self.wakeWordsRow
                         }
                     }
@@ -638,36 +625,30 @@ struct VoiceSettingsScreen: View {
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(Color.primary.opacity(0.5))
                 .padding(.leading, 15)
+            // Horizontal inset lives on the ROWS (see `rowInset`) so `OpenClawRowDivider` is full-bleed.
             VStack(spacing: 17) {
                 content()
             }
             .padding(.vertical, 14)
-            .padding(.horizontal, 15)
-            .background {
-                RoundedRectangle(cornerRadius: 25, style: .continuous)
-                    .fill(self.cardFill)
-            }
+            .openClawSectionBackground(self.cardFill)
         }
     }
 
-    /// 0.3 crisp single-pixel hairline (shared Settings token); full width — these rows have no icon.
-    private var sectionDivider: some View {
-        Rectangle()
-            .fill(Color.primary.opacity(0.3))
-            .frame(maxWidth: .infinity)
-            .frame(height: 1 / self.displayScale)
+    /// Row-level horizontal inset (card no longer pads) so `OpenClawRowDivider` reaches the card edges.
+    private func rowInset(_ view: some View) -> some View {
+        view.padding(.horizontal, 15)
     }
 
     private func toggleRow(_ title: String, isOn: Binding<Bool>) -> some View {
-        Toggle(isOn: isOn) {
+        self.rowInset(Toggle(isOn: isOn) {
             Text(title)
                 .font(OpenClawType.body)
                 .foregroundStyle(Color.primary)
-        }
+        })
     }
 
     private func pickerRow(_ title: String, value: Binding<String>, options: [String]) -> some View {
-        HStack {
+        self.rowInset(HStack {
             Text(title)
                 .font(OpenClawType.body)
                 .foregroundStyle(Color.primary)
@@ -685,7 +666,7 @@ struct VoiceSettingsScreen: View {
             } else {
                 self.pickerValue(value.wrappedValue, withChevrons: false)
             }
-        }
+        })
     }
 
     private func pickerValue(_ value: String, withChevrons: Bool) -> some View {
@@ -707,7 +688,7 @@ struct VoiceSettingsScreen: View {
 
     private var wakeWordsRow: some View {
         Button(action: self.onOpenWakeWords) {
-            HStack {
+            self.rowInset(HStack {
                 Text("Wake Words")
                     .font(OpenClawType.body)
                     .foregroundStyle(Color.primary)
@@ -718,7 +699,7 @@ struct VoiceSettingsScreen: View {
                     .scaledToFit()
                     .frame(width: 20, height: 20)
                     .foregroundStyle(Color.primary)
-            }
+            })
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -793,7 +774,6 @@ struct WakeWordsScreen: View {
     let onBack: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.displayScale) private var displayScale
     @State private var showsAddAlert = false
     @State private var newWord = ""
 
@@ -806,19 +786,12 @@ struct WakeWordsScreen: View {
                 VStack(spacing: 0) {
                     ForEach(self.words, id: \.self) { word in
                         self.wordRow(word)
-                        Rectangle()
-                            .fill(Color.primary.opacity(0.3))
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 1 / self.displayScale)
+                        OpenClawRowDivider()
                     }
                     self.resetButton
                 }
-                .padding(.horizontal, 15)
                 .padding(.vertical, 8)
-                .background {
-                    RoundedRectangle(cornerRadius: 25, style: .continuous)
-                        .fill(self.cardFill)
-                }
+                .openClawSectionBackground(self.cardFill)
                 .padding(.horizontal, 24)
                 .padding(.top, 4)
             }
@@ -889,6 +862,8 @@ struct WakeWordsScreen: View {
             Spacer(minLength: 0)
         }
         .frame(height: 40)
+        // Row-level inset (card no longer pads) so `OpenClawRowDivider` reaches the card edges.
+        .padding(.horizontal, 15)
         .contentShape(Rectangle())
         .contextMenu {
             Button(role: .destructive) {
@@ -916,6 +891,7 @@ struct WakeWordsScreen: View {
                 Spacer(minLength: 0)
             }
             .frame(height: 44)
+            .padding(.horizontal, 15)
         }
     }
 

@@ -23,9 +23,15 @@ struct ChatDrawerHost<ChatContent: View>: View {
     var allowsOpen: Bool = true
     let onSelectDestination: (ChatDrawerDestination) -> Void
     let onSelectSession: (String) -> Void
+    /// Mint + switch to a fresh chat session (the compose affordance in the drawer header).
+    let onNewSession: () -> Void
+    /// The currently open session key, so its row reads as active (medium weight).
+    let activeSessionID: String?
     @ViewBuilder let chatContent: ChatContent
 
     @Environment(\.colorScheme) private var colorScheme
+    /// Client-side pins + ordering for the session list (server truth untouched).
+    @State private var prefs = ChatSessionPrefs.shared
     /// Live drag translation. @State (not @GestureState) so the snap-back on release can be animated —
     /// a @GestureState reset is instantaneous and made the drawer jump.
     @State private var dragOffset: CGFloat = 0
@@ -152,9 +158,36 @@ struct ChatDrawerHost<ChatContent: View>: View {
 
     private var drawerContent: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("OpenClaw")
-                .font(.system(size: 25.6, weight: .semibold))
-                .foregroundStyle(Color.primary)
+            HStack {
+                Text("OpenClaw")
+                    .font(.system(size: 25.6, weight: .semibold))
+                    .foregroundStyle(Color.primary)
+                Spacer(minLength: 0)
+                Button {
+                    self.suppressCloseHaptic = true
+                    self.onNewSession()
+                    self.close()
+                } label: {
+                    Image("ChatPlusGlyph")
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 20, height: 20)
+                        .foregroundStyle(Color.primary)
+                        .frame(width: 34, height: 34)
+                        // App-standard glass chrome (matches the nav/close buttons), not a flat fill.
+                        .background {
+                            ChatGlassBackground(
+                                shape: Circle(),
+                                fill: self.colorScheme == .dark
+                                    ? Color(red: 30 / 255, green: 30 / 255, blue: 30 / 255).opacity(0.2)
+                                    : Color(red: 245 / 255, green: 244 / 255, blue: 250 / 255).opacity(0.2))
+                        }
+                        .shadow(color: .black.opacity(0.15), radius: 25, x: 0, y: 0)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.trailing, 8)
 
             VStack(alignment: .leading, spacing: 23) {
                 self.drawerRow("DrawerMoonStarGlyph", "Dreaming") {
@@ -185,18 +218,38 @@ struct ChatDrawerHost<ChatContent: View>: View {
                 Text("Sessions")
                     .font(.system(size: 15))
                     .foregroundStyle(Color.primary.opacity(0.6))
-                ForEach(self.sessions.prefix(4)) { session in
+                // Pins float to the top; pull from a slightly wider window (8) so a pinned-but-older
+                // session still surfaces within the four visible rows.
+                ForEach(Array(self.prefs.ordered(Array(self.sessions.prefix(8))).prefix(4))) { session in
                     Button {
                         self.suppressCloseHaptic = true
                         self.onSelectSession(session.id)
                         self.close()
                     } label: {
-                        Text(session.title)
-                            .font(.system(size: 17.13))
-                            .foregroundStyle(Color.primary)
-                            .lineLimit(1)
+                        HStack(spacing: 6) {
+                            Text(session.title)
+                                .font(.system(
+                                    size: 17.13,
+                                    weight: session.id == self.activeSessionID ? .medium : .regular))
+                                .foregroundStyle(Color.primary)
+                                .lineLimit(1)
+                            if self.prefs.isPinned(session.id) {
+                                Image(systemName: "pin.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Color.primary.opacity(0.4))
+                            }
+                        }
                     }
                     .buttonStyle(.plain)
+                    .contextMenu {
+                        Button {
+                            self.prefs.togglePin(session.id)
+                        } label: {
+                            Label(
+                                self.prefs.isPinned(session.id) ? "Unpin" : "Pin",
+                                systemImage: self.prefs.isPinned(session.id) ? "pin.slash" : "pin")
+                        }
+                    }
                 }
             }
             .padding(.top, 32)

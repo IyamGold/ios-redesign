@@ -44,10 +44,57 @@ struct ChatRootSurface: View {
     @State private var diskCachedChipKeys: Set<String> = []
     /// Armed on send; fires the reply-intro haptic once when the assistant's reply first appears.
     @State private var replyIntroArmed = false
-    /// Armed on send; fires the crisp closing click once when the assistant's run completes.
-    @State private var replyEndArmed = false
+    /// The active run's tool-use preambles, shown live in the working indicator (not yet an in-transcript
+    /// trail). Flushed into the collapsed "steps" trail by `rebuildRows` once the run completes.
+    @State private var liveActivitySteps: [String] = []
     /// The `[embed]` canvas open in the viewer panel (tapped from an inline card).
     @State private var openEmbed: CanvasEmbed?
+    /// Steps shown in the "Worked through N steps" detail sheet (nil = closed). A sheet keeps long runs
+    /// from widening the transcript, which inline expansion did past ~3 steps.
+    @State private var stepsSheet: ChatStepsPayload?
+    /// Id of the just-finalized assistant reply that should play the top-to-bottom reveal (nil = none).
+    /// Only set for a live answer (see `awaitingReplyReveal`), never on history load / session switch.
+    @State private var revealReplyID: String?
+    /// Armed while a run is in flight so the *next* new assistant row is treated as its live answer and
+    /// revealed. Distinguishes a real reply from a bulk history/session repopulation.
+    @State private var awaitingReplyReveal = false
+    /// The single source of truth for a live turn's UI stage. Forward-only within a turn and LATCHED over
+    /// the view model's `pendingRuns` flicker (which clears/re-adopts mid-turn) so the node/bubble/footprint
+    /// rendering never oscillates. Replaces deriving everything from the raw `isAssistantWorking`.
+    ///   idle      → nothing in flight
+    ///   thinking  → run started, no tool step yet (streamed text shows as the reply bubble — a plain reply,
+    ///               or a first preamble that briefly flashes here before its toolUse lands)
+    ///   tooling   → ≥1 tool preamble surfaced; streamed inter-tool preambles stay in the footprint node
+    ///   answering → the final answer is streaming after the tools (footprints collapse to the "Worked
+    ///               through N steps" row, the answer streams as the bubble)
+    @State private var turnPhase: TurnPhase = .idle
+    /// Set when a turn's answer row lands; blocks a trailing `pendingRuns` re-adopt from restarting a
+    /// phantom `thinking` phase after the reply is already shown. Reset on the next send.
+    @State private var turnJustCompleted = false
+
+    enum TurnPhase: Int { case idle, thinking, tooling, answering }
+
+    /// Gates the "Thinking" node's *appearance* until the just-sent user bubble has finished its spring/
+    /// layout settle. Without it the node mounts in the same transaction as the bubble and rides its
+    /// spring, popping in before the bubble sits in place. Default true so external/resumed runs (no local
+    /// send) show the node immediately; a send flips it false, then a short delay (the spring duration)
+    /// flips it back.
+    @State private var nodeReady = true
+    /// Height of the scroll viewport, tracked so the trailing spacer can reserve enough room for the
+    /// newest question to spring up and rest near the top even in a near-empty chat.
+    @State private var viewportHeight: CGFloat = 0
+    /// The just-sent user turn's row id: it springs up to rest near the top and stays pinned (the trailing
+    /// spacer holds the room) until the next send or a session switch. nil restores normal bottom-anchoring.
+    @State private var pinTurnID: String?
+    /// One-shot trigger: set on send, consumed once the pinned turn's row exists so the spring-to-top scroll
+    /// runs exactly once (not on every subsequent `rows` change while the reply streams in below).
+    @State private var pinScrollPending = false
+    /// Live-measured layout of the pinned turn (in content coordinates), driving the dynamic bottom spacer:
+    /// `pinnedQuestionTop` is the pinned question row's top; `contentTailBottom` is the bottom of the last
+    /// real row. Their difference is the newest turn's rendered height, so the reserved room can shrink as
+    /// the reply grows (question stays the scroll ceiling, no over-scroll, no reply-end snap).
+    @State private var pinnedQuestionTop: CGFloat?
+    @State private var contentTailBottom: CGFloat = 0
     /// App model — used to resolve `[embed]` canvas docs against the gateway's capability-scoped host URL.
     @Environment(NodeAppModel.self) private var appModel
 
@@ -74,9 +121,109 @@ struct ChatRootSurface: View {
         self.viewModel.pendingRunCount > 0 || self.viewModel.isSending
     }
 
-    private var streamingText: String? {
-        guard let text = self.viewModel.streamingAssistantText else { return nil }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
+    /// The live "footprint" shown while thinking. During the tool/footprint phase we surface the raw
+    /// streamed preamble text as it arrives (so preambles visibly stream as footprints), falling back to
+    /// the most recent finalized step, or "Thinking" before the first one lands. In a tool-free run this
+    /// stream is instead shown as the typewriter reply bubble (see `streamingReplyText`), so it never
+    /// leaks here.
+    private var activityLatestLine: String {
+        if self.turnPhase == .tooling,
+           let live = self.viewModel.streamingAssistantText?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !live.isEmpty
+        {
+            return live
+        }
+        return self.liveActivitySteps.last ?? "Thinking"
+    }
+
+    /// The in-flight answer text to stream as a live "typewriter" bubble, or nil to keep the thinking node.
+    /// Gated on the phase, not the raw run state: only `.thinking` (a plain reply / first-preamble flash) or
+    /// `.answering` (the final answer past the last tool) stream here. In `.tooling` the streamed text is an
+    /// inter-tool preamble and stays in the footprint node.
+    private var streamingReplyText: String? {
+        guard self.turnPhase == .thinking || self.turnPhase == .answering,
+              self.viewModel.pendingToolCalls.isEmpty,
+              let text = self.viewModel.streamingAssistantText,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return text
+    }
+
+    /// Minimum streamed length before an in-tool run promotes `.tooling → .answering`. Larger than a
+    /// typical one-line preamble so short inter-tool preambles don't false-promote before their toolUse
+    /// lands; the real answer crosses it within its first sentence or two.
+    private static let answeringPromoteThreshold = 160
+
+    /// Forward-only phase transition (except an explicit reset to `.idle`), latched over the pendingRuns
+    /// flicker so the UI stage never regresses mid-turn. Logged for the timeline capture.
+    private func setTurnPhase(_ next: TurnPhase) {
+        guard next == .idle || next.rawValue > self.turnPhase.rawValue else { return }
+        guard next != self.turnPhase else { return }
+        ChatTimeline.mark("view.phase \(self.turnPhase)->\(next)")
+        self.turnPhase = next
+    }
+
+    /// Where a pinned question comes to rest: ~120pt below the top so it clears the top bar / scrim.
+    private var pinAnchor: UnitPoint {
+        guard self.viewportHeight > 200 else { return .top }
+        return UnitPoint(x: 0.5, y: min(0.4, 120 / self.viewportHeight))
+    }
+
+    /// Fixed padding kept between the last line and the bottom of the scroll content (the "note page"
+    /// resting gap). A long reply bottoms out at exactly this.
+    private static let bottomContentPadding: CGFloat = 10
+    /// Named coordinate space on the scroll content, so the pin/tail probes measure content-relative
+    /// offsets that don't move with the scroll position.
+    private static let chatContentSpace = "chatContentSpace"
+
+    /// Rendered height of the newest turn (pinned question → last line), from the live probes.
+    private var pinnedTurnHeight: CGFloat {
+        guard let top = self.pinnedQuestionTop else { return 0 }
+        return max(0, self.contentTailBottom - top)
+    }
+
+    /// Dynamic room below the newest turn. Sized so the pinned question resting at `pinAnchor` is the
+    /// furthest the content can scroll: reserve exactly enough that (question → last line) fills the
+    /// viewport below the pin. As the reply grows, `pinnedTurnHeight` grows and this shrinks 1:1 — no net
+    /// reflow and no teardown, so there's no reply-end snap and no over-scroll into dead space. A reply
+    /// long enough to fill the viewport bottoms out at the fixed padding. Not pinned → just the padding.
+    private var bottomSpacerHeight: CGFloat {
+        guard self.pinTurnID != nil, self.viewportHeight > 0 else { return Self.bottomContentPadding }
+        let pinOffset = self.pinAnchor.y * self.viewportHeight
+        return max(Self.bottomContentPadding, self.viewportHeight - pinOffset - self.pinnedTurnHeight)
+    }
+
+    /// Reports the pinned question row's top (content coords) via preference; a no-op background for every
+    /// other row. Only the pinned row emits, so the preference reduce yields exactly its offset (or nil).
+    @ViewBuilder
+    private func pinnedQuestionProbe(for row: ChatDisplayRow) -> some View {
+        if row.id == self.pinTurnID {
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: PinnedQuestionTopKey.self,
+                    value: geo.frame(in: .named(Self.chatContentSpace)).minY)
+            }
+        } else {
+            Color.clear
+        }
+    }
+
+    private struct PinnedQuestionTopKey: PreferenceKey {
+        static let defaultValue: CGFloat? = nil
+        static func reduce(value: inout CGFloat?, nextValue: () -> CGFloat?) {
+            value = value ?? nextValue()
+        }
+    }
+
+    private struct ContentTailBottomKey: PreferenceKey {
+        static let defaultValue: CGFloat = 0
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+            value = max(value, nextValue())
+        }
+    }
+
+    private static func stepsLabel(_ count: Int) -> String {
+        "Worked through \(count) step\(count == 1 ? "" : "s")"
     }
 
     var body: some View {
@@ -116,10 +263,27 @@ struct ChatRootSurface: View {
                 onClose: { self.openEmbed = nil })
                 .presentationCornerRadius(47)
         }
+        // "Worked through N steps" → a custom bottom-sheet overlay, NOT a system `.sheet`. iOS 26 renders
+        // every sheet sizing (.form/.page/.fitted) as a horizontally-inset floating card with no public
+        // API to pin it flush to the screen edges. Owning the card gives a true edge-to-edge, bottom-flush
+        // panel with the app canvas + glass X, matching the drawer destinations.
+        // Always-mounted so the card's `.move` slide + the scrim's `.opacity` fade run as independent
+        // child transitions. If the overlay itself were conditionally inserted, SwiftUI would apply its
+        // default (`.opacity`) transition to the whole subtree — making the card *fade* in instead of
+        // *slide* up. `payload == nil` renders nothing and disables hit testing.
+        .overlay {
+            ChatStepsOverlay(payload: self.stepsSheet, onClose: { self.closeStepsSheet() })
+        }
         // Kick the view model's bootstrap (history + health poll) on appear and whenever the model
         // instance changes. The shared kit view did this in its own `.onAppear`; without it the health
         // probe never runs, so sends queue offline forever and no reply ever comes back.
         .task(id: ObjectIdentifier(self.viewModel)) {
+            // A different session's rows are about to load — drop any pin so its spacer doesn't linger.
+            self.pinTurnID = nil
+            self.pinScrollPending = false
+            self.pinnedQuestionTop = nil
+            self.turnPhase = .idle
+            self.turnJustCompleted = false
             self.viewModel.load()
         }
         // Images: system photo picker (images only). Loaded items feed the shared attachment pipeline.
@@ -163,29 +327,123 @@ struct ChatRootSurface: View {
                 LazyVStack(spacing: 0) {
                     ForEach(self.rows) { row in
                         self.messageView(for: row)
-                            .padding(.bottom, row.isUser ? 21 : 25)
+                            // The "Worked through N steps" row belongs to the answer below it, so drop it
+                            // down (extra top space away from the user bubble) and tighten its gap to the
+                            // reply (~40% less than the standard 25) so the two read as one group.
+                                .padding(.top, row.progressLines.isEmpty ? 0 : 10)
+                                .padding(.bottom, self.rowBottomSpacing(row))
+                                // Measure the pinned question row's top (content coords) so the spacer can
+                                // reserve exactly the room that keeps it at the scroll ceiling.
+                                .background(self.pinnedQuestionProbe(for: row))
+                                // User turns rise into place from below with a soft spring settle; assistant
+                                // rows just fade so the reply doesn't shove the pinned question around.
+                                .transition(row.isUser
+                                    ? .move(edge: .bottom).combined(with: .opacity)
+                                    : .opacity)
                     }
                     self.trailingIndicator
+                        // Fade the footprint/thinking node out as the "Worked through N steps" row + answer
+                        // fade in, and the streaming bubble out as its finalized row lands — no hard swap.
+                            .animation(.easeInOut(duration: 0.25), value: self.turnPhase)
+                            .animation(.easeInOut(duration: 0.25), value: self.streamingReplyText != nil)
+                            // Fade the node in once the user bubble has settled (see `nodeReady`).
+                            .animation(.easeInOut(duration: 0.25), value: self.nodeReady)
+                    // Marks the bottom of the last real row (content coords). Placed before the spacer so
+                    // `contentTailBottom - pinnedQuestionTop` is the newest turn's rendered height.
+                    Color.clear
+                        .frame(height: 0)
+                        .background(
+                            GeometryReader { geo in
+                                Color.clear.preference(
+                                    key: ContentTailBottomKey.self,
+                                    value: geo.frame(in: .named(Self.chatContentSpace)).minY)
+                            })
+                    // Dynamic room below the newest turn (see `bottomSpacerHeight`): shrinks as the reply
+                    // grows so the pinned question stays the scroll ceiling; a bare `bottomContentPadding`
+                    // when nothing is pinned.
+                    Color.clear
+                        .frame(height: self.bottomSpacerHeight)
                     Color.clear
                         .frame(height: 1)
                         .id(Self.bottomAnchorID)
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 108)
+                .coordinateSpace(.named(Self.chatContentSpace))
             }
             .defaultScrollAnchor(.bottom)
-            .scrollDismissesKeyboard(.interactively)
-            // A newly committed message animates to the bottom once; the very first population snaps
-            // without animation so the transcript paints at the bottom instead of scrolling up on open.
-            .onChange(of: self.rows.count) { old, _ in
-                self.scrollToBottom(proxy, animated: old != 0)
+            // Retain the last non-nil top: once a long reply scrolls the pinned question off the top,
+            // LazyVStack stops rendering it (probe → nil), but its content-space offset is stable through
+            // the turn — dropping it would balloon the spacer and jump. Reset happens on send/session switch.
+            .onPreferenceChange(PinnedQuestionTopKey.self) { newValue in
+                if let newValue {
+                    self.pinnedQuestionTop = newValue
+                }
             }
-            // Streaming tokens pin the bottom WITHOUT a per-token animation, so the transcript tracks
-            // the reply smoothly instead of re-animating (and visibly repositioning) on every token.
-            .onChange(of: self.viewModel.streamingAssistantText) { _, text in
-                self.scrollToBottom(proxy, animated: false)
-                if let text, !text.isEmpty {
-                    self.fireReplyIntroIfArmed()
+            .onPreferenceChange(ContentTailBottomKey.self) { self.contentTailBottom = $0 }
+            // Track the viewport height so the trailing spacer can size the "pin to top" room.
+            .onScrollGeometryChange(for: CGFloat.self) { $0.containerSize.height } action: { _, new in
+                self.viewportHeight = new
+            }
+            // Anchor the TOP on size changes so the finalized answer inserting at full height doesn't
+            // instant-yank the transcript upward (the "snap"). New messages/answers still reach the
+            // bottom via the explicit, animated scrollToBottom calls below — so the only motion is that
+            // one smooth scroll, running while the answer reveals.
+            .defaultScrollAnchor(.top, for: .sizeChanges)
+            // The bottom anchor used to keep the last message above the keyboard for free; with sizeChanges
+            // now top-anchored we re-pin explicitly whenever the composer/keyboard grows the bottom inset.
+            .onScrollGeometryChange(for: CGFloat.self) { $0.contentInsets.bottom } action: { old, new in
+                if new > old {
+                    self.scrollToBottom(proxy, animated: false, reason: "bottomInset")
+                }
+            }
+            .scrollDismissesKeyboard(.interactively)
+            // On send, the new user turn springs up to rest near the top (once, when its row first lands);
+            // while a turn is pinned, later rows (the reply) fill in BELOW without yanking to the bottom —
+            // the `.top` size-change anchor keeps the question put. With no pin, keep the old behavior:
+            // newly committed rows animate to the bottom; the very first population snaps.
+            .onChange(of: self.rows.count) { old, new in
+                ChatTimeline
+                    .mark(
+                        "view.rows.count \(old)->\(new) pinPending=\(self.pinScrollPending) pin=\(self.pinTurnID != nil)")
+                // First row change after a send is the optimistic user turn — pin it to the top once.
+                if self.pinScrollPending, let userRow = self.rows.last(where: { $0.isUser }) {
+                    self.pinScrollPending = false
+                    self.pinTurnID = userRow.id
+                    ChatTimeline.mark("view.pin set + springScrollTo(top)")
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+                        proxy.scrollTo(userRow.id, anchor: self.pinAnchor)
+                    }
+                } else if self.pinTurnID == nil {
+                    self.scrollToBottom(proxy, animated: old != 0, reason: "rows.count")
+                }
+            }
+            // Streamed tokens: only track the bottom for a tool-free reply that has no pinned question above
+            // it. When a question is pinned the reply grows downward into the reserved spacer and the top
+            // anchor holds it steady — so we must NOT scroll on every token.
+            .onChange(of: self.viewModel.streamingAssistantText) { _, _ in
+                ChatTimeline.markThrottled(
+                    "view.streamText",
+                    "view.streamText len=\(self.viewModel.streamingAssistantText?.count ?? 0) "
+                        + "phase=\(self.turnPhase) replyBubble=\(self.streamingReplyText != nil) "
+                        + "pin=\(self.pinTurnID != nil)")
+                // Past the last tool: once the answer is streaming in earnest, promote tooling→answering so
+                // the footprints collapse to the "Worked through N steps" row and the answer takes the bubble.
+                if self.turnPhase == .tooling,
+                   self.viewModel.pendingToolCalls.isEmpty,
+                   (self.viewModel.streamingAssistantText?.count ?? 0) >= Self.answeringPromoteThreshold
+                {
+                    self.setTurnPhase(.answering)
+                    self.rebuildRows() // flush footprints into the in-transcript row now
+                }
+                if self.pinTurnID == nil {
+                    self.scrollToBottom(proxy, animated: false, reason: "streamToken")
+                }
+                // Once shown as a live streaming bubble, the finalized row must NOT also play the wipe — the
+                // text is already fully revealed. Tool replies (footprint-only) keep `awaitingReplyReveal`
+                // armed, so their answer still reveals on completion.
+                if self.streamingReplyText != nil {
+                    self.awaitingReplyReveal = false
                 }
             }
             .onChange(of: self.assistantRowCount) { old, new in
@@ -194,15 +452,22 @@ struct ChatRootSurface: View {
                 }
             }
             .onChange(of: self.isAssistantWorking) { old, new in
+                ChatTimeline.mark("view.isAssistantWorking \(old)->\(new)")
                 // Reveal the typing indicator when a run starts (no message/token change fires here yet).
                 if new {
-                    self.scrollToBottom(proxy, animated: false)
+                    self.scrollToBottom(proxy, animated: false, reason: "workStart")
+                    // Arm the reveal: the next new assistant row is this run's answer, not history.
+                    self.awaitingReplyReveal = true
+                    // Enter the phase machine for a run this view didn't send (external/resumed), but never
+                    // restart a phantom `thinking` from a trailing pendingRuns re-adopt after the reply landed.
+                    if self.turnPhase == .idle, !self.turnJustCompleted {
+                        self.setTurnPhase(.thinking)
+                    }
                 }
-                // Run finished (pending cleared): close the reply with one crisp click.
-                if old, !new, self.replyEndArmed {
-                    self.replyEndArmed = false
+                // Run finished (pending cleared): only disarm the intro so a stale one can't fire later.
+                // No closing haptic — a one-word reply lands start+end together and double-buzzed.
+                if old, !new {
                     self.replyIntroArmed = false
-                    OpenClawHaptics.click()
                 }
             }
         }
@@ -212,43 +477,99 @@ struct ChatRootSurface: View {
         self.rows.reduce(0) { $0 + ($1.isUser ? 0 : 1) }
     }
 
-    /// Two-phase reply haptics, both armed on send: a warning pattern introduces the reply (fired once by
-    /// whichever lands first — streamed token or finalized row, so it can't buzz while a transcript loads),
-    /// and a crisp click closes it out when the run completes (see the isAssistantWorking transition above).
+    /// A single reply haptic, armed on send: a warning pattern introduces the reply, fired once by whichever
+    /// lands first (streamed token or finalized row) so it can't buzz while a transcript loads. There is no
+    /// closing haptic — a one-word reply lands start+end in the same instant, which double-buzzed.
     private func fireReplyIntroIfArmed() {
         guard self.replyIntroArmed else { return }
         self.replyIntroArmed = false
-        OpenClawHaptics.play(.secured4)
+        OpenClawHaptics.tap()
+    }
+
+    /// Matches the feel of a UIKit page-sheet present/dismiss: a smooth, near-critically-damped spring
+    /// (~0.5s, no bounce). The real sheet timing is a private UIKit spring — this is a by-feel match, since
+    /// a system `.sheet` exposes no animation parameters to copy.
+    private static let stepsSheetSlide: Animation = .spring(response: 0.5, dampingFraction: 0.95)
+
+    /// Open/close the custom steps overlay. Driving the state inside `withAnimation` is what actually
+    /// animates the overlay's move/opacity transitions (an `.animation(value:)` on the chain does not
+    /// reliably drive a conditionally-inserted overlay).
+    private func openStepsSheet(_ steps: [String]) {
+        withAnimation(Self.stepsSheetSlide) {
+            self.stepsSheet = ChatStepsPayload(steps: steps)
+        }
+    }
+
+    private func closeStepsSheet() {
+        withAnimation(Self.stepsSheetSlide) {
+            self.stepsSheet = nil
+        }
+    }
+
+    /// Bottom gap under a row: user bubbles 21, the "Worked through N steps" trail 15 (tightened toward
+    /// its answer), all other assistant rows 25.
+    private func rowBottomSpacing(_ row: ChatDisplayRow) -> CGFloat {
+        if row.isUser {
+            return 21
+        }
+        return row.progressLines.isEmpty ? 25 : 15
     }
 
     /// User turns stay in a chat bubble; assistant turns render free (no bubble, full width) so code
     /// blocks and wide content aren't boxed in.
     @ViewBuilder
     private func messageView(for row: ChatDisplayRow) -> some View {
-        if let embed = row.canvasEmbed {
+        if let day = row.daySeparator {
+            Text(day)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle((self.colorScheme == .dark ? Color.white : .black).opacity(0.45))
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 4)
+        } else if !row.progressLines.isEmpty {
+            ChatThinkingNode(
+                label: Self.stepsLabel(row.progressLines.count),
+                steps: row.progressLines,
+                shimmer: false,
+                colorScheme: self.colorScheme,
+                onOpenSteps: { self.openStepsSheet(row.progressLines) })
+        } else if let embed = row.canvasEmbed {
             CanvasEmbedCard(embed: embed, onOpen: { self.openEmbed = embed })
         } else if row.isUser {
             ChatUserBubble(row: row, colorScheme: self.colorScheme)
         } else {
-            ChatAssistantMessage(row: row, colorScheme: self.colorScheme)
+            ChatAssistantMessage(
+                row: row,
+                colorScheme: self.colorScheme,
+                reveal: row.id == self.revealReplyID)
         }
     }
 
     @ViewBuilder private var trailingIndicator: some View {
-        if let streaming = self.streamingText {
-            // The reply as it streams in — same free layout as the finalized turn so nothing jumps.
-            ChatAssistantMessage(
-                row: ChatDisplayRow(streamingText: streaming),
-                colorScheme: self.colorScheme)
-                .padding(.bottom, 25)
-        } else if self.isAssistantWorking {
-            ChatTypingIndicator()
+        // Tool-free replies stream live as a paced typewriter bubble. Tool runs show the footprint (thinking
+        // node) with the live preamble text (see `activityLatestLine`); on completion the footprints settle
+        // into the in-transcript "Worked through N steps" row and the answer reveals — a plain opacity
+        // crossfade (below) makes that hand-off a fade, not a disappear/appear.
+        if let streamText = self.streamingReplyText {
+            StreamingReplyBubble(
+                fullText: streamText,
+                textColor: self.colorScheme == .dark ? .white : .black)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.bottom, 25)
+                .transition(.opacity)
+        } else if self.turnPhase != .idle, self.nodeReady {
+            ChatThinkingNode(
+                label: self.activityLatestLine,
+                steps: self.liveActivitySteps,
+                shimmer: true,
+                colorScheme: self.colorScheme)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 25)
+                .transition(.opacity)
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true, reason: String = "?") {
+        ChatTimeline.mark("view.scrollToBottom [\(reason)] animated=\(animated)")
         guard animated else {
             proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
             return
@@ -263,6 +584,19 @@ struct ChatRootSurface: View {
     private func rebuildRows() {
         var result: [ChatDisplayRow] = []
         var allEmbeds: [CanvasEmbed] = []
+        // Tool-use turns (stopReason "toolUse" / toolCall parts) each emit a one-line preamble before
+        // calling tools; only the final turn is the answer. Buffer those preambles and flush them as a
+        // single collapsible "steps" row just above the answer, instead of N standalone replies.
+        var pendingProgress: [String] = []
+        var pendingProgressTimestamp: Double?
+        func flushProgress() {
+            guard !pendingProgress.isEmpty else { return }
+            result.append(ChatDisplayRow(
+                progressLines: pendingProgress,
+                timestamp: pendingProgressTimestamp))
+            pendingProgress.removeAll()
+            pendingProgressTimestamp = nil
+        }
         for message in self.viewModel.messages {
             let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard role == "user" || role == "assistant" else { continue }
@@ -333,6 +667,16 @@ struct ChatRootSurface: View {
             let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             guard hasText || !images.isEmpty || !chips.isEmpty || !embeds.isEmpty else { continue }
             let isUser = role == "user"
+            // A pure-text tool-use preamble collapses into the progress trail rather than its own row.
+            if !isUser, hasText, images.isEmpty, chips.isEmpty, embeds.isEmpty,
+               Self.isToolUseTurn(message)
+            {
+                pendingProgress.append(text)
+                pendingProgressTimestamp = message.timestamp
+                continue
+            }
+            // Any real row flushes the accumulated progress trail so it sits just above the answer.
+            flushProgress()
             // Canvas cards render ABOVE the reply text so they read as part of the reply, not as a
             // detached row beneath the text + timestamp.
             for embed in embeds {
@@ -350,9 +694,135 @@ struct ChatRootSurface: View {
             }
             allEmbeds.append(contentsOf: embeds)
         }
-        self.rows = result
+        // First tool preamble this turn moves the phase thinking→tooling (drives node vs bubble).
+        if !pendingProgress.isEmpty, self.turnPhase == .thinking {
+            self.setTurnPhase(.tooling)
+        }
+        // Footprints live in the node during thinking/tooling; they collapse to the in-transcript "Worked
+        // through N steps" row once the answer is streaming (.answering) or the turn is done (.idle). Gating
+        // on the PHASE (not the raw `isAssistantWorking`) is what stops the node↔row oscillation the
+        // pendingRuns flicker used to cause.
+        if self.turnPhase == .thinking || self.turnPhase == .tooling, !pendingProgress.isEmpty {
+            self.liveActivitySteps = pendingProgress
+        } else {
+            flushProgress()
+            self.liveActivitySteps = []
+        }
+        let nextRows = Self.withDaySeparators(result)
+        // Arm the top-to-bottom reveal for a freshly finalized answer: only when a run was in flight
+        // (`awaitingReplyReveal`) and the newest assistant text row is one we haven't shown before. This
+        // never fires on history load / session switch (nothing armed it).
+        // Animate row insertions (spring settle + the per-row `.transition`) only during a live turn, so a
+        // bulk history load / session switch repopulates instantly instead of cascading every row in.
+        let liveTurn = self.pinScrollPending || self.pinTurnID != nil || self.awaitingReplyReveal
+        let oldIDs = Set(self.rows.map(\.id))
+        if let reply = nextRows.last(where: Self.isAnswerRow), !oldIDs.contains(reply.id) {
+            if self.awaitingReplyReveal {
+                self.revealReplyID = reply.id
+                self.awaitingReplyReveal = false
+                ChatTimeline.mark("view.reveal ARMED for new answer row")
+            }
+            // The turn's answer row has landed — end the live turn (hides node/bubble; the row is the reply).
+            // `turnJustCompleted` blocks a trailing pendingRuns re-adopt from restarting a phantom turn.
+            if self.turnPhase != .idle {
+                self.turnJustCompleted = true
+                self.setTurnPhase(.idle)
+                // Do NOT release the pin or scroll at reply end. Tearing down the reserved bottom spacer
+                // (≈a full viewport) and forcing a scroll-to-bottom is what snapped the transcript upward.
+                // Instead the finished turn stays where it landed — question near the top, reply below,
+                // with flexible off-screen space beneath it. Short replies get zero layout shift; a long
+                // reply just scrolls normally. The pin moves to the next question on the next send.
+            }
+        }
+        // Fix A: identical projection → skip reassigning `self.rows` entirely. A safety-net history refetch
+        // that changed nothing visible (see the pending-run probes) would otherwise reassign the whole
+        // array and make LazyVStack re-diff — the idle-time blank-until-touch. Canvas index still updates.
+        guard nextRows != self.rows else {
+            ChatTimeline.mark("view.rebuildRows SKIPPED (identical) rows=\(nextRows.count)")
+            CanvasEmbedIndex.shared.update(fromTranscriptOrder: allEmbeds)
+            return
+        }
+        let progressCount = nextRows.filter { !$0.progressLines.isEmpty }.count
+        let answerCount = nextRows.filter(Self.isAnswerRow).count
+        // ID churn: new/removed row identities. A high churn on a rebuild that didn't add real content is
+        // the LazyVStack blank-until-touch smell (ForEach identity thrash from optimistic→canonical swaps).
+        let newIDs = Set(nextRows.map(\.id))
+        let addedIDs = newIDs.subtracting(oldIDs).count
+        let removedIDs = oldIDs.subtracting(newIDs).count
+        ChatTimeline.mark(
+            "view.rebuildRows rows=\(nextRows.count) (prev=\(self.rows.count)) progress=\(progressCount) "
+                + "answers=\(answerCount) liveSteps=\(self.liveActivitySteps.count) idChurn=+\(addedIDs)/-\(removedIDs) "
+                + "working=\(self.isAssistantWorking) animated=\(liveTurn && nextRows.count != self.rows.count)")
+        if liveTurn, nextRows.count != self.rows.count {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+                self.rows = nextRows
+            }
+        } else {
+            self.rows = nextRows
+        }
         // Feed the drawer's Canvas archive from the same source as the inline cards.
         CanvasEmbedIndex.shared.update(fromTranscriptOrder: allEmbeds)
+    }
+
+    /// A rendered assistant answer row (not a user turn, day divider, steps trail, or canvas card).
+    private static func isAnswerRow(_ row: ChatDisplayRow) -> Bool {
+        !row.isUser
+            && !row.text.isEmpty
+            && row.canvasEmbed == nil
+            && row.daySeparator == nil
+            && row.progressLines.isEmpty
+    }
+
+    /// Insert a centered day-divider row wherever the calendar day changes between consecutive
+    /// timestamped rows, so a transcript spanning days is legible ("Today" / "Monday" / "Sep 3").
+    private static func withDaySeparators(_ rows: [ChatDisplayRow]) -> [ChatDisplayRow] {
+        let calendar = Calendar.current
+        var out: [ChatDisplayRow] = []
+        var lastDay: DateComponents?
+        for row in rows {
+            if let timestamp = row.timestamp {
+                let date = Date(timeIntervalSince1970: timestamp > 4_000_000_000 ? timestamp / 1000 : timestamp)
+                let day = calendar.dateComponents([.year, .month, .day], from: date)
+                if day != lastDay {
+                    let key = "\(day.year ?? 0)-\(day.month ?? 0)-\(day.day ?? 0)"
+                    out.append(ChatDisplayRow(daySeparator: Self.daySeparatorLabel(for: date), dayKey: key))
+                    lastDay = day
+                }
+            }
+            out.append(row)
+        }
+        return out
+    }
+
+    /// "Today" / "Yesterday" / weekday within the last week / "MMM d" / "MMM d, yyyy" once the year differs.
+    private static func daySeparatorLabel(for date: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) {
+            return "Today"
+        }
+        if calendar.isDateInYesterday(date) {
+            return "Yesterday"
+        }
+        let formatter = DateFormatter()
+        let startOfDate = calendar.startOfDay(for: date)
+        let startOfNow = calendar.startOfDay(for: Date())
+        let daysAgo = calendar.dateComponents([.day], from: startOfDate, to: startOfNow).day ?? 99
+        if daysAgo > 0, daysAgo < 7 {
+            formatter.dateFormat = "EEEE" // weekday name for the last week
+            return formatter.string(from: date)
+        }
+        let sameYear = calendar.component(.year, from: date) == calendar.component(.year, from: Date())
+        formatter.dateFormat = sameYear ? "MMM d" : "MMM d, yyyy"
+        return formatter.string(from: date)
+    }
+
+    /// A tool-use turn: the model narrates a one-line preamble then calls tools. Keyed on stopReason
+    /// ("toolUse") or the presence of a toolCall content part — model-agnostic across providers.
+    private static func isToolUseTurn(_ message: OpenClawChatMessage) -> Bool {
+        if let stop = message.stopReason?.lowercased(), stop.contains("tool") {
+            return true
+        }
+        return message.content.contains { ($0.type ?? "").lowercased().contains("toolcall") }
     }
 
     /// Project a message's attachment content blocks into renderable pieces, once, off the render path.
@@ -545,6 +1015,7 @@ struct ChatRootSurface: View {
                     self.attachmentTray
                         .padding(.leading, 14)
                         .padding(.bottom, 10)
+                        .offset(y: self.attachmentGroupLift)
                         .transition(.scale(scale: 0.1, anchor: .bottomLeading).combined(with: .opacity))
                 }
             }
@@ -581,8 +1052,20 @@ struct ChatRootSurface: View {
             .animation(
                 self.showsAttachmentTray
                     ? .easeOut(duration: 0.1)
-                    : .easeOut(duration: 0.15).delay(0.1),
+                    // Fade in promptly on close (no delay) so the button is visible through its dip.
+                    : .easeOut(duration: 0.15),
                 value: self.showsAttachmentTray)
+            // Persistent group lift: rises on open, glides back on close (smooth, so it doesn't fight
+            // the dip below).
+            .offset(y: self.attachmentGroupLift)
+            // Close bounce: the button draws down past its resting spot, then recoils up to rest.
+            .keyframeAnimator(initialValue: CGFloat.zero, trigger: self.showsAttachmentTray) { view, dip in
+                view.offset(y: dip)
+            } keyframes: { _ in
+                // Opening uses 0 (only the lift moves); closing dips down to 12 then springs back to 0.
+                SpringKeyframe(self.showsAttachmentTray ? 0 : 12, duration: 0.16, spring: .snappy)
+                SpringKeyframe(CGFloat.zero, duration: 0.34, spring: .bouncy)
+            }
 
             self.composerFieldContent
                 .background {
@@ -792,8 +1275,23 @@ struct ChatRootSurface: View {
     }
 
     private func armAndSend() {
+        ChatTimeline.begin("SEND (tap)")
         self.replyIntroArmed = true
-        self.replyEndArmed = true
+        // Pin the turn we're about to send: the next `rows` change (its optimistic bubble) springs to top.
+        self.pinScrollPending = true
+        // Drop the retained top so the new question re-measures instead of sizing off the previous turn.
+        self.pinnedQuestionTop = nil
+        // Fresh turn: enter the phase machine at `.thinking` and clear the completion guard.
+        self.turnJustCompleted = false
+        self.turnPhase = .thinking
+        ChatTimeline.mark("view.phase ->thinking (send)")
+        // Hold the "Thinking" node back until the user bubble's spring settles (matches the row-insert /
+        // pin spring duration), so it doesn't ride that spring and pop in early.
+        self.nodeReady = false
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(0.42))
+            self.nodeReady = true
+        }
         self.viewModel.send()
     }
 
@@ -848,6 +1346,12 @@ struct ChatRootSurface: View {
         return self.composerGlassFill
     }
 
+    /// The +/tray group lifts as one when the tray opens (~5% nudge), then springs back on close. The
+    /// same value drives the plus button and the tray overlay so they move together.
+    private var attachmentGroupLift: CGFloat {
+        self.showsAttachmentTray ? -12 : 0
+    }
+
     private var attachmentTray: some View {
         VStack(alignment: .leading, spacing: 23) {
             self.trayRow("ChatStickerGlyph", "GIFs", iconSize: 22) { self.showsGifLibrary = true }
@@ -898,6 +1402,7 @@ struct ChatRootSurface: View {
     }
 
     private func closeAttachmentTray() {
+        // Smooth glide for the lift return; the plus button's keyframe dip provides the visible bounce.
         withAnimation(.spring(duration: 0.3)) {
             self.showsAttachmentTray = false
         }
@@ -1191,6 +1696,10 @@ private struct ChatDisplayRow: Identifiable, Equatable {
     let chips: [ChatAttachmentChip]
     /// Set for a `[embed]` canvas card projected from an assistant message; nil otherwise.
     let canvasEmbed: CanvasEmbed?
+    /// Non-empty for a collapsed tool-use "steps" trail; each entry is one turn's preamble line.
+    let progressLines: [String]
+    /// Set for a centered day-divider row (e.g. "Today", "Monday", "Sep 3"); nil for message rows.
+    let daySeparator: String?
 
     init(
         id: UUID,
@@ -1210,6 +1719,8 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.images = images
         self.chips = chips
         self.canvasEmbed = nil
+        self.progressLines = []
+        self.daySeparator = nil
     }
 
     init(streamingText: String) {
@@ -1222,6 +1733,8 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.images = []
         self.chips = []
         self.canvasEmbed = nil
+        self.progressLines = []
+        self.daySeparator = nil
     }
 
     init(canvasEmbed: CanvasEmbed, timestamp: Double?) {
@@ -1234,6 +1747,37 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.images = []
         self.chips = []
         self.canvasEmbed = canvasEmbed
+        self.progressLines = []
+        self.daySeparator = nil
+    }
+
+    init(progressLines: [String], timestamp: Double?) {
+        // Deterministic id from content so identical trails diff stably across rebuilds.
+        self.id = "progress-\(progressLines.joined(separator: "|").hashValue)"
+        self.isUser = false
+        self.text = ""
+        self.timestamp = timestamp
+        self.isError = false
+        self.isStreaming = false
+        self.images = []
+        self.chips = []
+        self.canvasEmbed = nil
+        self.progressLines = progressLines
+        self.daySeparator = nil
+    }
+
+    init(daySeparator label: String, dayKey: String) {
+        self.id = "day-\(dayKey)"
+        self.isUser = false
+        self.text = ""
+        self.timestamp = nil
+        self.isError = false
+        self.isStreaming = false
+        self.images = []
+        self.chips = []
+        self.canvasEmbed = nil
+        self.progressLines = []
+        self.daySeparator = label
     }
 
     /// UIImage/chip aren't Equatable, so compare their derived counts; the row id + text already capture
@@ -1244,6 +1788,8 @@ private struct ChatDisplayRow: Identifiable, Equatable {
             && lhs.isStreaming == rhs.isStreaming && lhs.images.count == rhs.images.count
             && lhs.chips.count == rhs.chips.count
             && lhs.canvasEmbed?.id == rhs.canvasEmbed?.id
+            && lhs.progressLines == rhs.progressLines
+            && lhs.daySeparator == rhs.daySeparator
     }
 }
 
@@ -1267,7 +1813,10 @@ private struct ChatUserBubble: View {
 
     private static let maxBubbleWidth: CGFloat = 296
 
-    private static let bubbleFill = Color(red: 195 / 255, green: 63 / 255, blue: 51 / 255)
+    /// Neutral user bubble: white in light mode, black in dark. Text/controls invert via `textColor`.
+    private static let bubbleFill = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark ? .black : .white
+    })
 
     /// Cap the bubble width, then push the capped bubble to the trailing side. Proven wrap-and-hug
     /// recipe: short text hugs, long text wraps at the cap — no truncation.
@@ -1322,6 +1871,7 @@ private struct ChatUserBubble: View {
             data: data,
             durationSeconds: durationSeconds,
             fill: Self.bubbleFill,
+            foreground: self.textColor,
             shape: self.bubbleShape,
             metaRow: AnyView(self.metaRow))
     }
@@ -1339,7 +1889,7 @@ private struct ChatUserBubble: View {
                     .padding(.vertical, 6)
                 Text(chip.title)
                     .font(.system(size: 16))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(self.textColor)
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
@@ -1450,7 +2000,7 @@ private struct ChatUserBubble: View {
     }
 
     private var textColor: Color {
-        .white
+        self.colorScheme == .dark ? .white : .black
     }
 }
 
@@ -1462,6 +2012,7 @@ private struct AudioBubbleContent: View {
     let data: Data?
     let durationSeconds: Double
     let fill: Color
+    let foreground: Color
     let shape: UnevenRoundedRectangle
     let metaRow: AnyView
     @State private var playback = ChatAudioPlayback()
@@ -1476,18 +2027,18 @@ private struct AudioBubbleContent: View {
                     }
                 } label: {
                     if self.playback.isPlaying {
-                        ChatPauseGlyph(color: .white)
+                        ChatPauseGlyph(color: self.foreground)
                     } else {
                         Image(systemName: "play.fill")
                             .font(.system(size: 18))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(self.foreground)
                     }
                 }
                 .disabled(self.data == nil)
                 ChatAmplitudeWaveform(
                     levels: self.levels,
-                    color: .white.opacity(0.4),
-                    activeColor: .white,
+                    color: self.foreground.opacity(0.4),
+                    activeColor: self.foreground,
                     progress: self.playback.progress)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .clipped()
@@ -1496,7 +2047,7 @@ private struct AudioBubbleContent: View {
                         ? self.playback.currentTime
                         : self.durationSeconds))
                     .font(.system(size: 12))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(self.foreground)
                     .monospacedDigit()
                     .lineLimit(1)
                     .fixedSize()
@@ -1516,11 +2067,225 @@ private struct AudioBubbleContent: View {
 
 // MARK: - Assistant message (bubble-less)
 
+/// Collapsed trail of a run's tool-use preambles ("I'll grab…", "Pulling the timeline…"). Renders as a
+/// single muted, tappable "Worked through N steps" line so a multi-tool run reads as one turn, not many.
+/// Expands to show each step. De-spams the transcript while keeping the agent's narration available.
+/// The single "thinking" node — one persistent element whose label mutates through a run: "Thinking",
+/// then the live tool/preamble line (shimmering), and finally settling (static) into the in-transcript
+/// "Worked through N steps" trail. Same footprint throughout, so the states crossfade in place instead
+/// of rows popping in and out. `shimmer` marks the active phase; `steps.count > 1` makes it expandable.
+private struct ChatThinkingNode: View {
+    let label: String
+    let steps: [String]
+    let shimmer: Bool
+    let colorScheme: ColorScheme
+    /// Resting-only: tapping opens the steps sheet. Nil for the live (shimmering) node, which is never tappable.
+    var onOpenSteps: (() -> Void)?
+
+    private var tint: Color {
+        (self.colorScheme == .dark ? Color.white : .black).opacity(0.55)
+    }
+
+    /// Openable only in the resting state — the chevron + steps sheet belong to "Worked through N steps",
+    /// never the live footprints. Covers a single step too (we no longer skip 1-step runs).
+    private var canOpen: Bool {
+        !self.shimmer && !self.steps.isEmpty && self.onOpenSteps != nil
+    }
+
+    var body: some View {
+        Button {
+            self.onOpenSteps?()
+        } label: {
+            HStack(spacing: 6) {
+                // Stable view (no `.id`) so a label change swaps text in place via the shimmer's
+                // content transition rather than destroying/recreating the node (which visibly shifted).
+                self.collapsedLabel
+                if self.canOpen {
+                    // Right chevron: the steps now open a sheet, not an inline drop-down.
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(self.tint)
+                }
+            }
+            // Crossfade the label as it mutates ("Thinking" → tool line → "Worked through N steps").
+            .animation(.easeInOut(duration: 0.25), value: self.label)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!self.canOpen)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private var collapsedLabel: some View {
+        if self.shimmer {
+            ChatShimmerLabel(text: self.label)
+        } else {
+            Text(self.label)
+                .font(.system(size: 16).italic())
+                .foregroundStyle(self.tint)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+    }
+}
+
+/// Identifies the steps payload driving the "Worked through N steps" detail sheet. A fresh id per open
+/// keeps `.sheet(item:)` presenting even when the same run's steps are reopened.
+private struct ChatStepsPayload: Identifiable {
+    let id = UUID()
+    let steps: [String]
+}
+
+/// The "Worked through N steps" detail as a self-owned bottom-sheet overlay (system sheets can't go
+/// edge-to-edge on iOS 26 — every sizing renders as a horizontally-inset floating card). A dimmed scrim
+/// plus an opaque canvas card: full width, bottom-flush, grabber + drag-down / tap-scrim to dismiss.
+/// Layout follows the Paper spec — 19pt centered title over the glass X, 5pt bullets at a 40pt margin.
+private struct ChatStepsOverlay: View {
+    /// Optional so this view stays mounted while closed — see the stable-parent note below. Nil = closed.
+    let payload: ChatStepsPayload?
+    let onClose: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var dragOffset: CGFloat = 0
+
+    /// Card fill is the app canvas (#F5F4FA light / #171717 dark), matching every other surface.
+    private var canvas: Color {
+        self.colorScheme == .dark
+            ? Color(red: 23 / 255, green: 23 / 255, blue: 23 / 255)
+            : Color(red: 245 / 255, green: 244 / 255, blue: 250 / 255)
+    }
+
+    private var bullet: Color {
+        (self.colorScheme == .dark ? Color.white : .black).opacity(0.5)
+    }
+
+    private func title(_ steps: [String]) -> String {
+        "Worked through \(steps.count) step\(steps.count == 1 ? "" : "s")"
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            // This GeometryReader/ZStack is the STABLE parent (always mounted). The scrim + card are
+            // conditionally inserted INSIDE it, so each runs its own transition — the card slides
+            // (`.move`) and the scrim fades (`.opacity`), instead of the whole overlay fading in as one.
+            ZStack(alignment: .bottom) {
+                if let payload = self.payload {
+                    // Dimmed backdrop; tap outside the card to dismiss. Fades while the card slides.
+                    Color.black.opacity(0.35)
+                        .contentShape(Rectangle())
+                        .onTapGesture(perform: self.onClose)
+                        .transition(.opacity)
+
+                    self.card(
+                        steps: payload.steps,
+                        maxHeight: geo.size.height * 0.62,
+                        bottomInset: geo.safeAreaInsets.bottom)
+                        .offset(y: max(0, self.dragOffset))
+                        .gesture(self.dragToDismiss)
+                        .transition(.move(edge: .bottom))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .ignoresSafeArea()
+        // When closed the overlay is empty and must not eat taps meant for the chat beneath it.
+        .allowsHitTesting(self.payload != nil)
+    }
+
+    private func card(steps: [String], maxHeight: CGFloat, bottomInset: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            Capsule()
+                .fill(Color.primary.opacity(0.25))
+                .frame(width: 40, height: 5)
+                .padding(.top, 8)
+
+            self.header(steps)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    ForEach(steps.indices, id: \.self) { index in
+                        HStack(alignment: .top, spacing: 12) {
+                            Circle()
+                                .fill(self.bullet)
+                                .frame(width: 5, height: 5)
+                                .padding(.top, 8)
+                            Text(steps[index])
+                                .font(.system(size: 16))
+                                .foregroundStyle(Color.primary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                // Bullets sit at a 40pt left margin (spec), further in than the X's 24pt.
+                .padding(.leading, 40)
+                .padding(.trailing, 24)
+                .padding(.top, 4)
+                // Clear the home indicator so the last step never sits under it.
+                .padding(.bottom, bottomInset + 24)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(maxHeight: maxHeight + bottomInset, alignment: .top)
+        .background(self.canvas)
+        .clipShape(.rect(topLeadingRadius: 47, topTrailingRadius: 47))
+    }
+
+    private func header(_ steps: [String]) -> some View {
+        // Centered 19pt title over the leading glass X — the app's unified nav treatment.
+        ZStack {
+            Text(self.title(steps))
+                .font(.system(size: 19, weight: .medium))
+                .foregroundStyle(Color.primary)
+            HStack {
+                Button(action: self.onClose) {
+                    Image("ChatCloseGlyph")
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 22, height: 22)
+                        .foregroundStyle(Color.primary)
+                        .frame(width: 40, height: 40)
+                        .background {
+                            ChatGlassBackground(
+                                shape: Circle(),
+                                fill: self.colorScheme == .dark
+                                    ? Color(red: 30 / 255, green: 30 / 255, blue: 30 / 255).opacity(0.2)
+                                    : Color(red: 245 / 255, green: 244 / 255, blue: 250 / 255).opacity(0.2))
+                        }
+                        .shadow(color: .black.opacity(0.15), radius: 25, x: 0, y: 0)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 24)
+        }
+        .padding(.top, 14)
+        .padding(.bottom, 16)
+    }
+
+    /// Drag the card down past a threshold to dismiss; a short drag springs back.
+    private var dragToDismiss: some Gesture {
+        DragGesture()
+            .onChanged { value in
+                self.dragOffset = value.translation.height
+            }
+            .onEnded { value in
+                if value.translation.height > 120 {
+                    self.onClose()
+                } else {
+                    withAnimation(.easeOut(duration: 0.2)) { self.dragOffset = 0 }
+                }
+            }
+    }
+}
+
 /// Assistant turns render free of any bubble: full transcript width, no timestamp, with fenced code
 /// rendered as standalone code cards. Removing the bubble is what lets code/wide content breathe.
 private struct ChatAssistantMessage: View {
     let row: ChatDisplayRow
     let colorScheme: ColorScheme
+    /// True only for the just-finalized live answer — plays the top-to-bottom reveal once.
+    var reveal: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1532,7 +2297,8 @@ private struct ChatAssistantMessage: View {
                 ChatFormattedText(
                     text: self.row.text,
                     isUser: false,
-                    textColor: self.colorScheme == .dark ? .white : .black)
+                    textColor: self.colorScheme == .dark ? .white : .black,
+                    reveal: self.reveal)
             }
             if !self.row.isStreaming, self.row.timestamp != nil {
                 Text(chatTimeString(for: self.row.timestamp))
@@ -1546,28 +2312,94 @@ private struct ChatAssistantMessage: View {
 
 // MARK: - Block-level markdown
 
-/// Splits assistant/user text into blocks and gives headings real weight/size and lists real
-/// bullet/number glyphs with hanging indent. Paragraphs, fenced code, and tables are delegated to the
-/// kit's inline renderer (`OpenClawChatMarkdownText`) so code highlighting / tables stay intact.
+/// Splits assistant/user text into blocks so headings get real weight/size and lists get real
+/// bullet/number glyphs with hanging indent. Each paragraph, fenced code, and table is delegated to the
+/// kit's inline renderer (`OpenClawChatMarkdownText`) — but PER PARAGRAPH, not per whole message: a
+/// single `Text(AttributedString(markdown: .full))` collapses list/paragraph structure into a run-on
+/// wall (SwiftUI drops block presentation intents), so block splitting has to happen here.
 private struct ChatFormattedText: View {
     let isUser: Bool
     let textColor: Color
     /// Parsed once at init — NOT a computed property. Re-parsing every body pass would mint fresh block
     /// identities each render and thrash ForEach (which pegged the main actor and stuck "Connecting…").
     private let blocks: [ChatTextBlock]
+    /// When true, the reply unravels top-to-bottom once on appear via a descending soft-edge mask.
+    private let reveal: Bool
+    /// Approximate rendered-line count, used to pace the sweep so long replies aren't glacial.
+    private let lineCount: Int
+    /// 0 = fully masked (hidden), 1 = fully shown. Drives an animatable wipe Shape (not a gradient — a
+    /// plain Double feeding gradient stops does NOT tween, so the reveal popped instead of sweeping).
+    @State private var revealFraction: Double
 
-    init(text: String, isUser: Bool, textColor: Color) {
+    /// Seconds each rendered line takes to unravel, and the clamped total sweep bounds.
+    private static let perLine: Double = 0.085
+    private static let minDuration: Double = 0.55
+    private static let maxDuration: Double = 2.2
+    /// Blur on the wipe's edge (points) — feathers each line's fade-in as the reveal front passes it.
+    private static let feather: CGFloat = 16
+    /// Line-height between wrapped lines within a paragraph (overrides the kit's default 4pt) — this is
+    /// the dominant "spacing" lever for dense replies where block/paragraph gaps rarely appear.
+    private static let proseLineSpacing: CGFloat = 8
+
+    init(text: String, isUser: Bool, textColor: Color, reveal: Bool = false) {
         self.isUser = isUser
         self.textColor = textColor
-        self.blocks = ChatTextBlock.parse(text)
+        let parsed = ChatTextBlock.parse(text)
+        self.blocks = parsed
+        self.reveal = reveal
+        self.lineCount = Self.revealLineCount(parsed)
+        self._revealFraction = State(initialValue: reveal ? 0 : 1)
+    }
+
+    private var revealDuration: Double {
+        min(Self.maxDuration, max(Self.minDuration, Double(self.lineCount) * Self.perLine))
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        // Height is committed on frame 1 (blocks parsed once); the mask only changes what's *visible*, so
+        // the reply never reflows. A blurred wipe grows top→bottom, so each line materializes after the one
+        // above it — an in-place unravel rather than one whole-element fade.
+        let content = VStack(alignment: .leading, spacing: 20) {
             ForEach(self.blocks.indices, id: \.self) { index in
                 self.view(for: self.blocks[index])
             }
         }
+        if self.reveal {
+            content
+                .mask(alignment: .top) {
+                    ChatRevealWipe(fraction: self.revealFraction, overshoot: Self.feather * 2)
+                        .fill(Color.black)
+                        .blur(radius: Self.feather)
+                }
+                .onAppear {
+                    guard self.revealFraction < 1 else { return }
+                    withAnimation(.linear(duration: self.revealDuration)) {
+                        self.revealFraction = 1
+                    }
+                }
+        } else {
+            content
+        }
+    }
+
+    /// Count rendered lines/items so the sweep paces with content length (prose lines + list items + one
+    /// per code/heading block).
+    private static func revealLineCount(_ blocks: [ChatTextBlock]) -> Int {
+        var count = 0
+        for block in blocks {
+            switch block.kind {
+            case let .prose(markdown):
+                count += markdown
+                    .components(separatedBy: "\n")
+                    .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                    .count
+            case let .list(items):
+                count += items.count
+            case .code, .heading:
+                count += 1
+            }
+        }
+        return max(count, 1)
     }
 
     @ViewBuilder
@@ -1580,14 +2412,14 @@ private struct ChatFormattedText: View {
         case let .heading(level, markdown):
             self.inline(markdown, font: Self.headingFont(level))
         case let .list(items):
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 15) {
                 ForEach(items.indices, id: \.self) { index in
                     let item = items[index]
-                    HStack(alignment: .top, spacing: 6) {
+                    HStack(alignment: .top, spacing: 8) {
                         Text(item.marker)
                             .font(.system(size: 16))
                             .foregroundStyle(self.textColor.opacity(item.ordered ? 1 : 0.7))
-                            .frame(minWidth: item.ordered ? 18 : 10, alignment: .leading)
+                            .frame(minWidth: item.ordered ? 20 : 14, alignment: .leading)
                         self.inline(item.markdown, font: .system(size: 16))
                     }
                     .padding(.leading, CGFloat(item.depth) * 16)
@@ -1596,20 +2428,37 @@ private struct ChatFormattedText: View {
         }
     }
 
-    /// Render each source line as its own row. `Text(AttributedString(markdown:))` swallows both hard
-    /// breaks and paragraph intents, so we honor the model's newlines by stacking lines ourselves — and
-    /// a blank line becomes an empty-line gap so double line breaks read as a clear paragraph break.
+    /// Render each paragraph (blank-line-separated) as ONE kit block. Per paragraph the kit preserves
+    /// soft breaks as hard breaks AND applies its 4pt line-spacing; a `Text` per source line instead would
+    /// throw away line-height, and one `Text` for the whole run collapses the paragraph breaks.
     private func proseView(_ markdown: String) -> some View {
-        let lines = markdown.components(separatedBy: "\n")
-        return VStack(alignment: .leading, spacing: 2) {
-            ForEach(lines.indices, id: \.self) { index in
-                if lines[index].trimmingCharacters(in: .whitespaces).isEmpty {
-                    Color.clear.frame(height: 10)
-                } else {
-                    self.inline(lines[index], font: .system(size: 16))
-                }
+        let paragraphs = Self.paragraphs(in: markdown)
+        return VStack(alignment: .leading, spacing: 20) {
+            ForEach(paragraphs.indices, id: \.self) { index in
+                self.inline(paragraphs[index], font: .system(size: 16))
             }
         }
+    }
+
+    /// Split a prose run into paragraphs on blank lines; each paragraph keeps its internal single
+    /// newlines so the kit renders them as soft breaks.
+    private static func paragraphs(in markdown: String) -> [String] {
+        var paragraphs: [String] = []
+        var current: [String] = []
+        for line in markdown.components(separatedBy: "\n") {
+            if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                if !current.isEmpty {
+                    paragraphs.append(current.joined(separator: "\n"))
+                    current = []
+                }
+            } else {
+                current.append(line)
+            }
+        }
+        if !current.isEmpty {
+            paragraphs.append(current.joined(separator: "\n"))
+        }
+        return paragraphs
     }
 
     private func inline(_ markdown: String, font: Font) -> some View {
@@ -1617,7 +2466,8 @@ private struct ChatFormattedText: View {
             text: markdown,
             isUser: self.isUser,
             font: font,
-            textColor: self.textColor)
+            textColor: self.textColor,
+            lineSpacing: Self.proseLineSpacing)
     }
 
     private static func headingFont(_ level: Int) -> Font {
@@ -1792,8 +2642,10 @@ private struct ChatTextBlock {
 /// "Typing…" in regular-italic SF Pro with a highlight that sweeps across the glyphs. The sweep is
 /// driven off `TimelineView(.animation)` (position computed from the frame clock) so parent re-renders
 /// can't interrupt it and freeze the shimmer mid-cycle.
-private struct ChatTypingIndicator: View {
-    private static let label = "Typing…"
+/// A shimmering italic label — the "…in progress" affordance. Shared by the typing indicator and the
+/// agent-working activity element so their collapsed footprint is byte-identical.
+private struct ChatShimmerLabel: View {
+    let text: String
     private static let font = Font.system(size: 16).italic()
     /// Seconds for one left-to-right sweep.
     private static let period: Double = 1.6
@@ -1802,9 +2654,10 @@ private struct ChatTypingIndicator: View {
         TimelineView(.animation) { context in
             let time = context.date.timeIntervalSinceReferenceDate
             let phase = (time.truncatingRemainder(dividingBy: Self.period)) / Self.period
-            Text(Self.label)
+            Text(self.text)
                 .font(Self.font)
                 .foregroundStyle(Color.primary.opacity(0.35))
+                .contentTransition(.opacity)
                 .overlay {
                     GeometryReader { geo in
                         let width = geo.size.width
@@ -1818,10 +2671,13 @@ private struct ChatTypingIndicator: View {
                             .offset(x: -band + phase * (width + band))
                     }
                     .mask {
-                        Text(Self.label).font(Self.font)
+                        Text(self.text).font(Self.font).contentTransition(.opacity)
                     }
                 }
-                .fixedSize()
+                .lineLimit(1)
+                .truncationMode(.tail)
+                // Swap footprints in place (crossfade the glyphs) rather than a hard cut / view replace.
+                .animation(.easeInOut(duration: 0.3), value: self.text)
         }
     }
 }
@@ -2013,5 +2869,29 @@ struct ChatGlassPanel: View {
                         .fill(self.fill)
                 }
         }
+    }
+}
+
+/// Reveal mask for the answer unravel: a rect covering the top `fraction` of the height. `animatableData`
+/// makes the growth tween frame-by-frame (a Shape animates; a Double feeding gradient stops does not), so
+/// the reveal front sweeps smoothly. Overshoots the width so a blurred edge doesn't clip the sides.
+private struct ChatRevealWipe: Shape {
+    var fraction: Double
+    /// The mask overshoots the content by this much top and bottom so the blurred (feathered) edges fall
+    /// OUTSIDE the text. Without it, a short reply sits entirely inside the feather and stays dimmed even
+    /// when fully revealed.
+    let overshoot: CGFloat
+
+    var animatableData: Double {
+        get { self.fraction }
+        set { self.fraction = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let clamped = CGFloat(max(0, min(1, self.fraction)))
+        let top = -self.overshoot
+        // At fraction 1 the front reaches height + overshoot, so the bottom feather clears the last line.
+        let bottom = top + clamped * (rect.height + 2 * self.overshoot)
+        return Path(CGRect(x: -20, y: top, width: rect.width + 40, height: max(0, bottom - top)))
     }
 }

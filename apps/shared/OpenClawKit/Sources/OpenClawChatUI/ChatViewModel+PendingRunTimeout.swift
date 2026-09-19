@@ -40,6 +40,7 @@ extension OpenClawChatViewModel {
         self.pendingRunTimeoutTasks[runId] = nil
         self.pendingRunTimeoutArmIDs[runId] = nil
         if wasPending {
+            ChatTimeline.mark("pendingRuns.clear run=\(runId.suffix(6)) -> count=\(self.pendingRunCount)")
             self.logDiagnostic(
                 "chat.ui pending cleared sessionKey=\(self.sessionKey) "
                     + "runId=\(runId)")

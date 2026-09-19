@@ -117,9 +117,7 @@ struct LicensesScreen: View {
         }
         .padding(.vertical, 14)
         .padding(.horizontal, 15)
-        .background {
-            RoundedRectangle(cornerRadius: 25, style: .continuous).fill(self.cardFill)
-        }
+        .openClawSectionBackground(self.cardFill)
         .padding(.horizontal, 24)
         .padding(.top, 4)
         .accessibilityIdentifier("settings-licenses-list")

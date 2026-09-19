@@ -23,6 +23,42 @@ enum OpenClawRadius {
     static let md: CGFloat = 12
 }
 
+/// Single source of truth for the corner radius of every settings / grouped-list section container
+/// (single- or multi-row). Kept at 12 to match the drawer destination lists.
+enum OpenClawSectionStyle {
+    static let cornerRadius: CGFloat = 12
+    /// Height of the row separator inside grouped-list cards.
+    static let dividerHeight: CGFloat = 2
+}
+
+/// The one canonical separator for every Settings grouped-list card (root + destinations). Full-bleed
+/// (edge-to-edge of the card, so it must be a full-width child — cards move their horizontal padding onto
+/// the rows), drawn in the app CANVAS color at full opacity so consecutive rows read as demarcated by a
+/// gap of page background rather than a hairline. Single source of truth — do not re-declare per screen.
+struct OpenClawRowDivider: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Rectangle()
+            .fill(self.colorScheme == .dark
+                ? Color(red: 23 / 255, green: 23 / 255, blue: 23 / 255)
+                : Color(red: 245 / 255, green: 244 / 255, blue: 250 / 255))
+            .frame(maxWidth: .infinity)
+            .frame(height: OpenClawSectionStyle.dividerHeight)
+    }
+}
+
+extension View {
+    /// Standard rounded background for a section / grouped-list card. Route every section through this
+    /// so the radius stays consistent — new sections inherit the treatment automatically.
+    func openClawSectionBackground(_ fill: Color) -> some View {
+        self.background {
+            RoundedRectangle(cornerRadius: OpenClawSectionStyle.cornerRadius, style: .continuous)
+                .fill(fill)
+        }
+    }
+}
+
 struct OpenClawProBackground: View {
     var body: some View {
         Color(uiColor: .systemGroupedBackground)

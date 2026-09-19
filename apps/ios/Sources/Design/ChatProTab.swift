@@ -263,6 +263,17 @@ struct ChatProTab: View {
             activeAgentId: self.appModel.chatDeliveryAgentId,
             sessionRoutingContract: self.appModel.chatSessionRoutingContract,
             attachmentOwnerIsActive: { voiceNoteRecorder.ownsPendingChatAttachment },
+            // The redesigned phone chat owns reply feedback in `ChatRootSurface` (one intro tap when the
+            // answer appears). Drop the view model's run-end haptics (`.runCompleted`/`.runFailed`) so a
+            // reply doesn't buzz twice — they landed on top of that tap. Send/confirm feedback stays.
+            haptics: OpenClawChatHaptics(performer: { event in
+                switch event {
+                case .runCompleted, .runFailed:
+                    break
+                case .messageSent, .actionConfirmed:
+                    OpenClawChatHaptics().perform(event)
+                }
+            }),
             transcriptCache: offlineStore,
             outbox: offlineStore,
             onSessionChanged: { sessionKey in

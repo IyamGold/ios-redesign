@@ -19,6 +19,13 @@ extension OpenClawChatViewModel {
         // their true position instead of appending at the tail. Idempotent for already-ordered input.
         let ordered = Self.orderedBySequence(messages)
         guard self.messages != ordered else { return }
+        if let last = ordered.last {
+            let lastTool = (last.stopReason?.lowercased().contains("tool") ?? false)
+                || last.content.contains { ($0.type ?? "").lowercased().contains("toolcall") }
+            ChatTimeline.mark(
+                "messages -> count=\(ordered.count) last=\(last.role)/\(last.stopReason ?? "-")"
+                    + " tool=\(lastTool) len=\(ChatMessageVisibleText.visibleText(in: last).count)")
+        }
         self.messages = ordered
         markTimelineChanged()
     }

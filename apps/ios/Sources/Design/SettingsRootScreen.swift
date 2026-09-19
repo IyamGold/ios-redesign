@@ -31,7 +31,6 @@ struct SettingsRootScreen: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.openURL) private var openURL
-    @Environment(\.displayScale) private var displayScale
 
     private static let docsURL = URL(string: "https://docs.openclaw.ai")!
 
@@ -44,9 +43,9 @@ struct SettingsRootScreen: View {
                     self.connectionPill
                     self.section("Control") {
                         self.cardRow(icon: "SettingsShieldGlyph", title: "Approvals", action: self.onOpenApprovals)
-                        self.cardDivider
+                        OpenClawRowDivider()
                         self.cardRow(icon: "SettingsToggleGlyph", title: "Permissions", action: self.onOpenPermissions)
-                        self.cardDivider
+                        OpenClawRowDivider()
                         self.defaultAgentRow
                     }
                     self.section("App settings") {
@@ -54,12 +53,12 @@ struct SettingsRootScreen: View {
                             icon: "SettingsBellGlyph",
                             title: "Notifications",
                             action: self.onOpenNotifications)
-                        self.cardDivider
+                        OpenClawRowDivider()
                         self.cardRow(
                             icon: "SettingsUnplugGlyph",
                             title: "Channels & Integrations",
                             action: self.onOpenChannels)
-                        self.cardDivider
+                        OpenClawRowDivider()
                         self.cardRow(
                             icon: "SettingsWaveformGlyph",
                             title: "Voice settings",
@@ -141,6 +140,14 @@ struct SettingsRootScreen: View {
 
     // MARK: - Sections and rows
 
+    /// Horizontal inset applied to each ROW (not the card) so full-bleed dividers can reach the card edges.
+    /// Leading 17 clears the icon column; trailing 12 balances the chevron.
+    private func rowInset(_ view: some View) -> some View {
+        view
+            .padding(.leading, 17)
+            .padding(.trailing, 12)
+    }
+
     private func section(_ title: String, @ViewBuilder content: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             // Design calls for SF Pro medium here, not the branded Display face.
@@ -148,17 +155,13 @@ struct SettingsRootScreen: View {
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(Color.primary.opacity(0.5))
                 .padding(.leading, 17)
-            // 17pt above/below the divider → ~34pt between rows, divider centered.
+            // 17pt above/below the divider → ~34pt between rows, divider centered. Horizontal insets live
+            // on the ROWS (`rowInset`) so `OpenClawRowDivider` can span the card edge-to-edge.
             VStack(spacing: 17) {
                 content()
             }
             .padding(.vertical, 12)
-            .padding(.leading, 17)
-            .padding(.trailing, 12)
-            .background {
-                RoundedRectangle(cornerRadius: 25, style: .continuous)
-                    .fill(self.cardFill)
-            }
+            .openClawSectionBackground(self.cardFill)
         }
     }
 
@@ -180,9 +183,7 @@ struct SettingsRootScreen: View {
             .padding(.leading, 16)
             .frame(height: 50)
             .frame(maxWidth: .infinity)
-            .background {
-                Capsule(style: .continuous).fill(self.cardFill)
-            }
+            .openClawSectionBackground(self.cardFill)
         }
     }
 
@@ -193,7 +194,7 @@ struct SettingsRootScreen: View {
         action: @escaping () -> Void) -> some View
     {
         Button(action: action) {
-            HStack(spacing: 12) {
+            self.rowInset(HStack(spacing: 12) {
                 if let iconView {
                     iconView
                 } else if let icon {
@@ -214,24 +215,14 @@ struct SettingsRootScreen: View {
                     .scaledToFit()
                     .frame(width: 20, height: 20)
                     .foregroundStyle(Color.primary)
-            }
+            })
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 
-    private var cardDivider: some View {
-        Rectangle()
-            .fill(Color.primary.opacity(0.3))
-            // Force full-width fill (bare shapes in a flexible row can size unevenly) and snap to a
-            // single device pixel so every divider is the exact same length and crispness.
-            .frame(maxWidth: .infinity)
-            .frame(height: 1 / self.displayScale)
-            .padding(.leading, 34)
-    }
-
     private var defaultAgentRow: some View {
-        HStack(spacing: 12) {
+        self.rowInset(HStack(spacing: 12) {
             Image("SettingsUsersGlyph")
                 .renderingMode(.template)
                 .resizable()
@@ -258,11 +249,11 @@ struct SettingsRootScreen: View {
                     .font(OpenClawType.callout)
                     .foregroundStyle(Color.primary.opacity(0.6))
             }
-        }
+        })
     }
 
     private var themeRow: some View {
-        HStack(spacing: 12) {
+        self.rowInset(HStack(spacing: 12) {
             Image("SettingsSunGlyph")
                 .renderingMode(.template)
                 .resizable()
@@ -284,14 +275,14 @@ struct SettingsRootScreen: View {
                 self.pickerTrailing(self.theme.rawValue)
             }
         }
-        .frame(height: 26)
+        .frame(height: 26))
     }
 
     private func linkPillRow(icon: String, title: String, url: URL) -> some View {
         Button {
             self.openURL(url)
         } label: {
-            HStack(spacing: 12) {
+            self.rowInset(HStack(spacing: 12) {
                 Image(icon)
                     .renderingMode(.template)
                     .resizable()
@@ -309,7 +300,7 @@ struct SettingsRootScreen: View {
                     .frame(width: 20, height: 20)
                     // The glyph bakes its own 0.3 opacity; tint at full strength so it isn't double-dimmed.
                     .foregroundStyle(Color.primary)
-            }
+            })
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

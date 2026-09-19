@@ -59,6 +59,9 @@ struct RootTabs: View {
     @State private var lastReportedGatewayProblem: GatewayConnectionProblem?
     @State private var showOnboarding: Bool = false
     @State private var onboardingAllowSkip: Bool = true
+    /// Set when onboarding is opened specifically to scan a full-access QR (from the Connection sheet), so
+    /// the wizard jumps straight to the scanner. Reset whenever onboarding closes.
+    @State private var onboardingAutoScan: Bool = false
     @State private var didEvaluateOnboarding: Bool = false
     @State private var didAutoOpenSettings: Bool = false
     @State private var didApplyInitialChatSession: Bool = false
@@ -176,7 +179,14 @@ struct RootTabs: View {
             // The drawer is a chat-surface control; disable drag-to-open while Settings covers the chat.
             allowsOpen: !self.isPhoneSettingsPresented,
             onSelectDestination: { self.activeDrawerDestination = $0 },
-            onSelectSession: { self.appModel.openChat(sessionKey: $0) })
+            onSelectSession: { self.appModel.openChat(sessionKey: $0) },
+            // New chat: mint a fresh key and switch to it. The gateway materializes the room lazily on the
+            // first message, so an abandoned empty chat costs nothing (no eager sessions.create needed).
+            onNewSession: {
+                let key = "mobile-\(UUID().uuidString.prefix(8).lowercased())"
+                self.appModel.openChat(sessionKey: key)
+            },
+            activeSessionID: self.appModel.chatSessionKey)
         {
             PhoneTabSettingsHost(
                 resetRequestID: self.phoneChatSettingsResetRequestID,
@@ -232,25 +242,28 @@ struct RootTabs: View {
                     onClose: { self.activeDrawerDestination = nil },
                     onOpenEmbed: { self.selectedCanvasEmbed = $0 })
             case .dreaming:
-                AgentProTab(directRoute: .dreaming, headerLeadingAction: nil, headerTitle: "Dreaming")
+                DreamingScreenHost(onClose: { self.activeDrawerDestination = nil })
             case .usage:
-                AgentProTab(directRoute: .usage, headerLeadingAction: nil, headerTitle: "Usage")
+                UsageScreenHost(onClose: { self.activeDrawerDestination = nil })
             case .instances:
-                AgentProTab(directRoute: .instances, headerLeadingAction: nil, headerTitle: "Instances")
+                InstancesScreenHost(onClose: { self.activeDrawerDestination = nil })
             case .cron:
-                AgentProTab(directRoute: .cron, headerLeadingAction: nil, headerTitle: "Cron Jobs")
+                CronJobsScreenHost(onClose: { self.activeDrawerDestination = nil })
             case .files:
-                AgentProTab(directRoute: .files, headerLeadingAction: nil, headerTitle: "Files")
+                FilesWorkspaceScreenHost(onClose: { self.activeDrawerDestination = nil })
             case .skills:
-                AgentProTab(directRoute: .skills, headerLeadingAction: nil, headerTitle: "Skills")
+                SkillsScreenHost(onClose: { self.activeDrawerDestination = nil })
             }
         }
         // Consistent redesigned "cancel" X across all drawer destinations (matches the Connection sheet),
         // in place of each screen's own back chevron. A top safe-area inset (not an overlay) reserves
-        // its space so the button never sits on top of the screen's content. Canvas draws its own header
-        // + close, so it opts out of the shared button.
+        // its space so the button never sits on top of the screen's content. Canvas, Usage, Instances,
+        // Cron, Skills, and Files draw their own header + close, so they opt out of the shared button.
         .safeAreaInset(edge: .top, alignment: .leading, spacing: 0) {
-            if destination != .canvas {
+            if destination != .canvas, destination != .usage,
+               destination != .instances, destination != .cron, destination != .skills,
+               destination != .files, destination != .dreaming
+            {
                 DrawerCloseButton(onClose: { self.activeDrawerDestination = nil })
             }
         }
@@ -950,8 +963,17 @@ struct RootTabs: View {
             }
     }
 
-    private func rootPresentation(_ content: some View) -> some View {
+    /// The connection sheet presents with no custom presenter recede. Ground-truth experiments proved a
+    /// clean whole-app recede isn't achievable in SwiftUI here: a `WindowGroup` root doesn't get the native
+    /// page-sheet presenter scale-back; live-scaling the app collapses its `ignoresSafeArea` edge-bleed and
+    /// snaps it back at scale==1 (the "paper cut"); and `.drawingGroup()`/snapshot flattening fails on the
+    /// app's WebView/glass/Metal content. Pass-through until we choose a deliberate approach.
+    private func recedingRoot(_ content: some View) -> some View {
         content
+    }
+
+    private func rootPresentation(_ content: some View) -> some View {
+        self.recedingRoot(content)
             .sheet(isPresented: self.$showGatewayProblemDetails) {
                 if let gatewayProblem = self.appModel.lastGatewayProblem {
                     GatewayProblemDetailsSheet(
@@ -974,8 +996,15 @@ struct RootTabs: View {
             .sheet(isPresented: self.$showConnectionSheet) {
                 ConnectionSheetHostView(
                     onScanFullAccess: {
+                        // Upgrading to full access means scanning a new (full-access) QR — launch the
+                        // onboarding pairing flow straight into the scanner, not the read-only gateway
+                        // details page. Defer so the sheet finishes dismissing before the cover presents.
                         self.showConnectionSheet = false
-                        self.pendingSettingsRoute = .gateway
+                        self.onboardingAutoScan = true
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(400))
+                            self.evaluateOnboardingPresentation(force: true)
+                        }
                     },
                     onClose: { self.showConnectionSheet = false })
                     .environment(self.appModel)
@@ -986,14 +1015,17 @@ struct RootTabs: View {
             .fullScreenCover(isPresented: self.$showOnboarding) {
                 OnboardingWizardView(
                     allowSkip: self.onboardingAllowSkip,
+                    autoOpenScanner: self.onboardingAutoScan,
                     onRequestLocalNetworkAccess: { reason in
                         self.requestLocalNetworkAccess(reason: reason)
                     },
                     onClose: {
                         self.showOnboarding = false
+                        self.onboardingAutoScan = false
                     },
                     onComplete: {
                         self.showOnboarding = false
+                        self.onboardingAutoScan = false
                         self.selectSidebarDestination(.chat)
                     })
                     .environment(self.appModel)
@@ -1326,7 +1358,11 @@ extension RootTabs {
 
     private func evaluateOnboardingPresentation(force: Bool) {
         if force {
-            self.onboardingAllowSkip = true
+            // Skippable only when a usable gateway still exists (e.g. re-opening to add or upgrade a
+            // gateway). After a disconnect/reset there are no credentials, so onboarding is mandatory —
+            // no close affordance — otherwise the user could dismiss it straight back into a
+            // credential-less app and think nothing reset.
+            self.onboardingAllowSkip = self.appModel.gatewayServerName != nil || self.hasExistingGatewayConfig()
             self.showOnboarding = true
             return
         }

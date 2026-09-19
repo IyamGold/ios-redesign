@@ -27,6 +27,8 @@ struct ChatMarkdownRenderer: View {
     let variant: ChatMarkdownVariant
     let font: Font
     let textColor: Color
+    /// Overrides the variant's default prose line-height when set; nil keeps the standard/compact default.
+    var lineSpacing: CGFloat?
     var reveal: ChatMarkdownProseReveal?
 
     @ScaledMetric private var inlineMathFontSize: CGFloat
@@ -38,6 +40,7 @@ struct ChatMarkdownRenderer: View {
         variant: ChatMarkdownVariant,
         font: Font,
         textColor: Color,
+        lineSpacing: CGFloat? = nil,
         inlineMathTypography: InlineMathTypography = .body,
         isComplete: Bool = true)
     {
@@ -47,6 +50,7 @@ struct ChatMarkdownRenderer: View {
             variant: variant,
             font: font,
             textColor: textColor,
+            lineSpacing: lineSpacing,
             inlineMathTypography: inlineMathTypography)
     }
 
@@ -56,6 +60,7 @@ struct ChatMarkdownRenderer: View {
         variant: ChatMarkdownVariant,
         font: Font,
         textColor: Color,
+        lineSpacing: CGFloat? = nil,
         inlineMathTypography: InlineMathTypography = .body,
         reveal: ChatMarkdownProseReveal? = nil)
     {
@@ -64,6 +69,7 @@ struct ChatMarkdownRenderer: View {
         self.variant = variant
         self.font = font
         self.textColor = textColor
+        self.lineSpacing = lineSpacing
         self.reveal = reveal
         self._inlineMathFontSize = ScaledMetric(
             wrappedValue: inlineMathTypography.size,
@@ -91,7 +97,7 @@ struct ChatMarkdownRenderer: View {
                 .foregroundStyle(self.textColor)
                 .tint(self.linkColor)
                 .textSelection(.enabled)
-                .lineSpacing(self.variant == .compact ? 2 : 4)
+                .lineSpacing(self.lineSpacing ?? (self.variant == .compact ? 2 : 4))
                 .modifier(ChatInlineMathAccessibilityModifier(label: prose.inlineAccessibilityText))
         case let .code(code):
             ChatCodeBlockView(block: code)

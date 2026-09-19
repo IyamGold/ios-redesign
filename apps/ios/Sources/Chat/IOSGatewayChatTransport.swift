@@ -95,7 +95,9 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         var agentId: String?
         var expectedSessionRoutingContract: String?
         var message: String
-        var thinking: String
+        // Optional on the wire: omitted entirely when the client has no explicit user-chosen level, so
+        // the gateway applies each model's own default (reasoning-mandatory models reject "off").
+        var thinking: String?
         var attachments: [OpenClawChatAttachmentPayload]?
         var timeoutMs: Int
         var idempotencyKey: String
@@ -272,7 +274,8 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
             agentId: agentId,
             expectedSessionRoutingContract: expectedSessionRoutingContract,
             message: message,
-            thinking: thinking,
+            // Empty is the client's "no explicit level" sentinel → omit the field.
+            thinking: thinking.isEmpty ? nil : thinking,
             attachments: attachments.isEmpty ? nil : attachments,
             timeoutMs: self.defaultChatSendTimeoutMs,
             idempotencyKey: idempotencyKey)

@@ -2,6 +2,20 @@
 
 Root rules still apply. This file adds the iOS release guardrails.
 
+## Architecture Surface Map (read before changing any iOS UI)
+
+The app was restructured; several legacy/shared types still compile and *look* authoritative but do not render the live iOS phone UI. Before editing a visual, trace from the entry point to the surface that actually renders it — do not assume a plausibly-named type is live.
+
+- **Entry:** `Sources/OpenClawApp.swift` (`@main`) → `Sources/RootTabs.swift` (root; owns phone vs iPad layout).
+- **Phone chat:** `RootTabs.phoneTabContent` → `ChatProTab` → **`Sources/Design/ChatRootSurface.swift`** renders the redesigned chat (bubbles, composer, message rows). Edit chat *visuals* HERE.
+  - Split of ownership: chat **visuals** live in `ChatRootSurface` (app target); chat **data/state/transport** live in shared `OpenClawKit` — `ChatViewModel` (+extensions), `Sources/Chat/IOSGatewayChatTransport.swift`, and generated `OpenClawProtocol`. Edit those for behavior.
+  - **`OpenClawChatUI` package `ChatView` / `ChatMessageViews` / `ChatComposer` / `ChatTheme` are the legacy/macOS chat UI.** iOS phone bubbles/composer do NOT render through them. Do not edit them for iOS visual changes (they're shared with macOS).
+- **Phone drawer destinations** (`RootTabs.drawerDestinationScreen`): redesigned hosts, each drawing its own header/close — `CanvasArchiveScreen`, `DreamingScreenHost`, `UsageScreenHost`, `InstancesScreenHost`, `CronJobsScreenHost`, `FilesWorkspaceScreenHost`, `SkillsScreenHost` (files under `Sources/Design/*Screen.swift`).
+- **iPad sidebar** (`RootTabs.sidebarDetail`): STILL uses the older `AgentProTab(directRoute: .agents/.instances/.files/.dreaming/.usage/.cron)` plus `AgentProDreamingDestination` / `AgentProNodesDestination`. These are LIVE for iPad — a phone-drawer change does NOT update the iPad twin, and vice-versa. Change both when parity matters.
+- **Settings (phone):** `PhoneTabSettingsHost` → `SettingsRootContainer` / `SettingsDestinationScreens` / host screens.
+- **Protocol models:** `apps/shared/OpenClawKit/Sources/OpenClawProtocol/GatewayModels.swift` is GENERATED via `pnpm protocol:gen:swift` (drift-guarded by `pnpm protocol:check`). Regenerate; never hand-edit.
+- **Chat `thinking` (reasoning level):** the client omits `thinking` unless the user picked a level the model advertises (`ChatViewModel+Thinking.effectiveThinkingLevelForSend` returns "" → transport drops the field) so the gateway applies each model's default. Never fabricate `"off"` — reasoning-mandatory models (e.g. `xai/grok-4.6`) reject it.
+
 ## UI / Typography
 
 - iOS SwiftUI text should use branded typography helpers, not bare system fonts. Use `OpenClawType` in `apps/ios/Sources/**`, `OpenClawChatTypography` in shared chat UI, `WatchClawType` in watch UI, and `OpenClawActivityType` in Live Activity UI.

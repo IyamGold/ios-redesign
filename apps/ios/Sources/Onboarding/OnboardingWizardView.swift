@@ -85,6 +85,7 @@ struct OnboardingWizardView: View {
     @State private var pairingRequestId: String?
     @State private var discoveryRestartTask: Task<Void, Never>?
     @State private var showQRScanner: Bool = false
+    @State private var didAutoOpenScanner = false
     @State private var scannerError: String?
     @State private var scannerResultHandoff = QRScannerResultHandoff()
     @State private var scannerScanID: UInt64 = 0
@@ -112,17 +113,22 @@ struct OnboardingWizardView: View {
     private static let pairingAutoResumeTicker = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
 
     let allowSkip: Bool
+    /// When true (e.g. "Switch to full access"), jump straight into the QR scanner on appear instead of
+    /// making the user tap "Scan QR Code" on the welcome step.
+    let autoOpenScanner: Bool
     let onRequestLocalNetworkAccess: (String) -> Void
     let onClose: () -> Void
     let onComplete: () -> Void
 
     init(
         allowSkip: Bool,
+        autoOpenScanner: Bool = false,
         onRequestLocalNetworkAccess: @escaping (String) -> Void,
         onClose: @escaping () -> Void,
         onComplete: @escaping () -> Void)
     {
         self.allowSkip = allowSkip
+        self.autoOpenScanner = autoOpenScanner
         self.onRequestLocalNetworkAccess = onRequestLocalNetworkAccess
         self.onClose = onClose
         self.onComplete = onComplete
@@ -142,6 +148,15 @@ struct OnboardingWizardView: View {
 
     var body: some View {
         self.lifecycleContent
+            .onAppear {
+                // Full-access upgrade: open the scanner immediately (once), after the cover settles.
+                guard self.autoOpenScanner, !self.didAutoOpenScanner else { return }
+                self.didAutoOpenScanner = true
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(300))
+                    self.openQRScannerFromOnboarding()
+                }
+            }
             .onChange(of: self.scenePhase) { _, newValue in
                 guard newValue == ScenePhase.active else { return }
                 self.applyPendingGatewaySetupLinkIfNeeded()

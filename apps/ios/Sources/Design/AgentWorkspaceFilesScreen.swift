@@ -187,21 +187,93 @@ struct AgentWorkspaceDirectoryList: View {
 
     @MainActor
     private func fetchPage(offset: Int) async -> AgentsWorkspaceListResult? {
+        let method = "agents.workspace.list"
+        let params = AgentsWorkspaceListParams(
+            agentid: self.agentId,
+            path: self.path.isEmpty ? nil : self.path,
+            offset: offset == 0 ? nil : offset,
+            limit: nil)
+        let paramsJSON = (try? Self.encodeParams(params)) ?? "<encode failed>"
         do {
-            let params = AgentsWorkspaceListParams(
-                agentid: self.agentId,
-                path: self.path.isEmpty ? nil : self.path,
-                offset: offset == 0 ? nil : offset,
-                limit: nil)
-            let paramsJSON = try Self.encodeParams(params)
             let data = try await self.appModel.operatorSession.request(
-                method: "agents.workspace.list",
+                method: method,
                 paramsJSON: paramsJSON,
                 timeoutSeconds: 12)
-            return try JSONDecoder().decode(AgentsWorkspaceListResult.self, from: data)
+            do {
+                return try JSONDecoder().decode(AgentsWorkspaceListResult.self, from: data)
+            } catch {
+                let raw = String(data: data, encoding: .utf8) ?? "<\(data.count) non-utf8 bytes>"
+                self.reportFailure(
+                    error, stage: "decode", method: method, paramsJSON: paramsJSON, rawResponse: raw)
+                return nil
+            }
         } catch {
-            self.errorText = "Could not load this folder."
+            self.reportFailure(
+                error, stage: "request", method: method, paramsJSON: paramsJSON, rawResponse: nil)
             return nil
+        }
+    }
+
+    /// Diagnostics: surface the real cause (gateway rejection / transport / decode) instead of a
+    /// generic string, both on-screen and in the console, with the exact request context.
+    @MainActor
+    private func reportFailure(
+        _ error: Error,
+        stage: String,
+        method: String,
+        paramsJSON: String,
+        rawResponse: String?)
+    {
+        var lines: [String] = []
+        lines.append("method: \(method)")
+        lines.append("agentId: \"\(self.agentId)\"")
+        lines.append("path: \"\(self.path)\"\(self.path.isEmpty ? " (root)" : "")")
+        lines.append("params: \(paramsJSON)")
+        lines.append("")
+        lines.append(Self.describeError(error))
+        if let rawResponse {
+            lines.append("")
+            lines.append("raw response (first 500): \(String(rawResponse.prefix(500)))")
+        }
+        let diagnostic = lines.joined(separator: "\n")
+        print("🗂️ [Files] \(stage) failed\n\(diagnostic)")
+        self.errorText = "Could not load this folder.\n\n\(diagnostic)"
+    }
+
+    static func describeError(_ error: Error) -> String {
+        if let gatewayError = error as? GatewayResponseError {
+            var text = "Gateway rejected [\(gatewayError.code)]: \(gatewayError.message)"
+            if let reason = gatewayError.detailsReason {
+                text += "\nreason: \(reason)"
+            }
+            if !gatewayError.details.isEmpty {
+                text += "\ndetail keys: \(gatewayError.details.keys.sorted().joined(separator: ", "))"
+            }
+            return text
+        }
+        if let decodingError = error as? DecodingError {
+            return "Decode failed: \(Self.describeDecoding(decodingError))"
+        }
+        let nsError = error as NSError
+        return "Transport error (\(nsError.domain) #\(nsError.code)): \(nsError.localizedDescription)"
+    }
+
+    static func describeDecoding(_ error: DecodingError) -> String {
+        func path(_ context: DecodingError.Context) -> String {
+            let keys = context.codingPath.map(\.stringValue)
+            return keys.isEmpty ? "<root>" : keys.joined(separator: ".")
+        }
+        switch error {
+        case let .keyNotFound(key, context):
+            return "missing key \"\(key.stringValue)\" at \(path(context))"
+        case let .typeMismatch(type, context):
+            return "type mismatch (\(type)) at \(path(context)) — \(context.debugDescription)"
+        case let .valueNotFound(type, context):
+            return "null value (\(type)) at \(path(context))"
+        case let .dataCorrupted(context):
+            return "data corrupted at \(path(context)) — \(context.debugDescription)"
+        @unknown default:
+            return error.localizedDescription
         }
     }
 
@@ -329,16 +401,26 @@ struct AgentWorkspaceFilePreview: View {
         self.file = nil
         self.errorText = nil
         defer { self.loading = false }
+        let method = "agents.workspace.get"
+        let params = AgentsWorkspaceGetParams(agentid: self.agentId, path: self.path)
+        let paramsJSON = (try? AgentWorkspaceDirectoryList.encodeParams(params)) ?? "<encode failed>"
         do {
-            let params = AgentsWorkspaceGetParams(agentid: self.agentId, path: self.path)
-            let paramsJSON = try AgentWorkspaceDirectoryList.encodeParams(params)
             let data = try await self.appModel.operatorSession.request(
-                method: "agents.workspace.get",
+                method: method,
                 paramsJSON: paramsJSON,
                 timeoutSeconds: 20)
             self.file = try JSONDecoder().decode(AgentsWorkspaceGetResult.self, from: data).file
         } catch {
-            self.errorText = "This file cannot be previewed. It may be binary or too large."
+            let diagnostic = """
+            method: \(method)
+            agentId: "\(self.agentId)"
+            path: "\(self.path)"
+            params: \(paramsJSON)
+
+            \(AgentWorkspaceDirectoryList.describeError(error))
+            """
+            print("🗂️ [Files] preview failed\n\(diagnostic)")
+            self.errorText = "This file cannot be previewed. It may be binary or too large.\n\n\(diagnostic)"
         }
     }
 

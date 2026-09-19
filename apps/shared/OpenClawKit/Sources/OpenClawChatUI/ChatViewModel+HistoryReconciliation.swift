@@ -55,7 +55,7 @@ extension OpenClawChatViewModel {
         attachingServerMessageId serverMessageId: String?,
         serverSeq: Int? = nil) -> OpenClawChatMessage
     {
-        let resolvedServerMessageId = message.serverMessageId ?? normalizedIdempotencyKey(serverMessageId)
+        let resolvedServerMessageId = message.serverMessageId ?? self.normalizedIdempotencyKey(serverMessageId)
         let resolvedServerSeq = message.serverSeq ?? serverSeq
         guard resolvedServerMessageId != message.serverMessageId ||
             resolvedServerSeq != message.serverSeq
@@ -86,8 +86,13 @@ extension OpenClawChatViewModel {
     nonisolated static func orderedBySequence(_ messages: [OpenClawChatMessage]) -> [OpenClawChatMessage] {
         guard messages.contains(where: { $0.serverSeq != nil }) else { return messages }
         var carriedSeq = Int.min
-        let keyed = messages.enumerated().map { index, message -> (seq: Int, index: Int, message: OpenClawChatMessage) in
-            if let seq = message.serverSeq { carriedSeq = seq }
+        let keyed = messages.enumerated().map { index, message -> (
+            seq: Int,
+            index: Int,
+            message: OpenClawChatMessage) in
+            if let seq = message.serverSeq {
+                carriedSeq = seq
+            }
             return (carriedSeq, index, message)
         }
         return keyed
@@ -475,6 +480,11 @@ extension OpenClawChatViewModel {
         self.runMessageScopesByRunID = self.runMessageScopesByRunID.filter { entry in
             referencedRunIDs.contains(entry.key)
         }
+        // Bounded cleanup of the live-answered marker set. The completion handlers read it synchronously
+        // (before this prune can run), so dropping already-retired runs once the set grows large is safe.
+        if self.runsAnsweredViaLiveStream.count > 64 {
+            self.runsAnsweredViaLiveStream = self.runsAnsweredViaLiveStream.intersection(self.pendingRuns)
+        }
     }
 
     func adoptCorrelatedUserMessage(incoming: OpenClawChatMessage) -> Bool {
@@ -745,7 +755,9 @@ extension OpenClawChatViewModel {
                 result.append(message)
                 continue
             }
-            if seen.contains(key) { continue }
+            if seen.contains(key) {
+                continue
+            }
             seen.insert(key)
             result.append(message)
         }

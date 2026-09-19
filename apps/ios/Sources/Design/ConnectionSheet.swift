@@ -19,6 +19,7 @@ struct ConnectionSheet: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var confirmingDisconnect = false
+    @State private var confirmingFullAccess = false
     @State private var pendingSwitch: ConnectionGatewayRow?
 
     private static let destructiveRed = Color(red: 197 / 255, green: 62 / 255, blue: 56 / 255)
@@ -174,10 +175,7 @@ struct ConnectionSheet: View {
             }
         }
         .padding(.horizontal, 15)
-        .background {
-            RoundedRectangle(cornerRadius: 25, style: .continuous)
-                .fill(self.cardFill)
-        }
+        .openClawSectionBackground(self.cardFill)
         .confirmationDialog(
             self.switchConfirmationTitle,
             isPresented: self.switchConfirmationBinding,
@@ -222,7 +220,7 @@ struct ConnectionSheet: View {
                     .foregroundStyle(Color.primary.opacity(0.6))
             } else {
                 Menu {
-                    Button { self.onScanFullAccess() } label: {
+                    Button { self.confirmingFullAccess = true } label: {
                         Text("Full access").font(OpenClawType.body)
                     }
                 } label: {
@@ -242,7 +240,22 @@ struct ConnectionSheet: View {
         }
         .padding(.horizontal, 17)
         .frame(height: 50)
-        .background { Capsule(style: .continuous).fill(self.cardFill) }
+        .openClawSectionBackground(self.cardFill)
+        .confirmationDialog(
+            "Switch to full access?",
+            isPresented: self.$confirmingFullAccess,
+            titleVisibility: .visible)
+        {
+            Button { self.onScanFullAccess() } label: {
+                Text("Scan QR Code").font(OpenClawType.body)
+            }
+            Button(role: .cancel) {} label: {
+                Text("Cancel").font(OpenClawType.body)
+            }
+        } message: {
+            Text("Switching to full access mode requires you to scan a new QR code to take effect.")
+                .font(OpenClawType.subhead)
+        }
     }
 
     private var accessNote: some View {

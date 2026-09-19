@@ -8,12 +8,14 @@ public struct OpenClawChatMarkdownText: View {
     private let isUser: Bool
     private let font: Font
     private let textColor: Color
+    private let lineSpacing: CGFloat?
 
-    public init(text: String, isUser: Bool, font: Font, textColor: Color) {
+    public init(text: String, isUser: Bool, font: Font, textColor: Color, lineSpacing: CGFloat? = nil) {
         self.text = text
         self.isUser = isUser
         self.font = font
         self.textColor = textColor
+        self.lineSpacing = lineSpacing
     }
 
     public var body: some View {
@@ -22,6 +24,7 @@ public struct OpenClawChatMarkdownText: View {
             context: self.isUser ? .user : .assistant,
             variant: .standard,
             font: self.font,
-            textColor: self.textColor)
+            textColor: self.textColor,
+            lineSpacing: self.lineSpacing)
     }
 }
