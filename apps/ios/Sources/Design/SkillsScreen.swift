@@ -68,7 +68,7 @@ struct SkillsScreen: View {
                     .foregroundStyle(Color.primary)
                 HStack {
                     Button(action: self.onClose) {
-                        Image("ChatCloseGlyph")
+                        Image("ChatBackGlyph")
                             .renderingMode(.template)
                             .resizable()
                             .scaledToFit()

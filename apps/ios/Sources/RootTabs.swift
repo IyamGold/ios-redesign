@@ -179,37 +179,56 @@ struct RootTabs: View {
             // The drawer is a chat-surface control; disable drag-to-open while Settings covers the chat.
             allowsOpen: !self.isPhoneSettingsPresented,
             onSelectDestination: { self.activeDrawerDestination = $0 },
-            onSelectSession: { self.appModel.openChat(sessionKey: $0) },
+            // Selecting a session/new chat also clears any active drawer destination so the chat (not a
+            // lingering destination) is what the closing drawer reveals.
+            onSelectSession: {
+                self.activeDrawerDestination = nil
+                self.appModel.openChat(sessionKey: $0)
+            },
             // New chat: mint a fresh key and switch to it. The gateway materializes the room lazily on the
             // first message, so an abandoned empty chat costs nothing (no eager sessions.create needed).
             onNewSession: {
+                self.activeDrawerDestination = nil
                 let key = "mobile-\(UUID().uuidString.prefix(8).lowercased())"
                 self.appModel.openChat(sessionKey: key)
             },
             activeSessionID: self.appModel.chatSessionKey)
         {
-            PhoneTabSettingsHost(
-                resetRequestID: self.phoneChatSettingsResetRequestID,
-                onOpenConnection: { self.showConnectionSheet = true },
-                pendingRoute: self.$pendingSettingsRoute,
-                isPresentingSettings: self.$isPhoneSettingsPresented)
-            { openSettingsRoute in
-                ChatProTab(
-                    headerLeadingAction: self.phoneChatReturnAction,
-                    ownsNavigationStack: false,
-                    openSettings: { openSettingsRoute(.home) },
-                    onOpenDrawer: {
-                        withAnimation(.spring(duration: 0.35)) { self.isChatDrawerOpen = true }
-                    })
+            // The chat and each drawer destination are peer "tabs" sharing one panel — exactly one shows at
+            // a time (like switching chat sessions), never layered. They are ZStack SIBLINGS, not an overlay
+            // of a destination on top of the chat: layering was what let the chat bleed through a
+            // destination. The chat stays MOUNTED but hidden while a destination is active, so its view
+            // model / gateway connection isn't torn down and rebuilt on every tab switch. Both live inside
+            // the drawer host's panel, so they inherit the same left-to-right slide-to-open, drop shadow,
+            // and open haptic; each destination's leading chevron opens the drawer too. You switch tabs
+            // (chat included) through the drawer — no modal, no dedicated back-to-chat.
+            ZStack {
+                PhoneTabSettingsHost(
+                    resetRequestID: self.phoneChatSettingsResetRequestID,
+                    onOpenConnection: { self.showConnectionSheet = true },
+                    pendingRoute: self.$pendingSettingsRoute,
+                    isPresentingSettings: self.$isPhoneSettingsPresented)
+                { openSettingsRoute in
+                    ChatProTab(
+                        headerLeadingAction: self.phoneChatReturnAction,
+                        ownsNavigationStack: false,
+                        openSettings: { openSettingsRoute(.home) },
+                        onOpenDrawer: {
+                            withAnimation(.spring(duration: 0.35)) { self.isChatDrawerOpen = true }
+                        })
+                }
+                .opacity(self.activeDrawerDestination == nil ? 1 : 0)
+                .allowsHitTesting(self.activeDrawerDestination == nil)
+
+                if let destination = self.activeDrawerDestination {
+                    self.drawerDestinationScreen(destination)
+                }
             }
         }
         .task(id: self.isChatDrawerOpen) {
             if self.isChatDrawerOpen {
                 await self.loadDrawerSessions()
             }
-        }
-        .fullScreenCover(item: self.$activeDrawerDestination) { destination in
-            self.drawerDestinationScreen(destination)
         }
     }
 
@@ -235,24 +254,28 @@ struct RootTabs: View {
     /// Drawer items point to their existing destinations. Agent surfaces reuse `AgentProTab`
     /// (which owns its own overview-loading duty); Canvas hosts the shared screen controller.
     private func drawerDestinationScreen(_ destination: ChatDrawerDestination) -> some View {
-        Group {
+        // Every destination is a peer "tab": its leading chevron opens the drawer (the tab switcher),
+        // matching the chat's leading button + the left-to-right slide. There is no dedicated
+        // back-to-chat — you switch tabs (chat included) through the drawer.
+        let openDrawer = { withAnimation(.spring(duration: 0.35)) { self.isChatDrawerOpen = true } }
+        return Group {
             switch destination {
             case .canvas:
                 CanvasArchiveScreen(
-                    onClose: { self.activeDrawerDestination = nil },
+                    onClose: openDrawer,
                     onOpenEmbed: { self.selectedCanvasEmbed = $0 })
             case .dreaming:
-                DreamingScreenHost(onClose: { self.activeDrawerDestination = nil })
+                DreamingScreenHost(onClose: openDrawer)
             case .usage:
-                UsageScreenHost(onClose: { self.activeDrawerDestination = nil })
+                UsageScreenHost(onClose: openDrawer)
             case .instances:
-                InstancesScreenHost(onClose: { self.activeDrawerDestination = nil })
+                InstancesScreenHost(onClose: openDrawer)
             case .cron:
-                CronJobsScreenHost(onClose: { self.activeDrawerDestination = nil })
+                CronJobsScreenHost(onClose: openDrawer)
             case .files:
-                FilesWorkspaceScreenHost(onClose: { self.activeDrawerDestination = nil })
+                FilesWorkspaceScreenHost(onClose: openDrawer)
             case .skills:
-                SkillsScreenHost(onClose: { self.activeDrawerDestination = nil })
+                SkillsScreenHost(onClose: openDrawer)
             }
         }
         // Consistent redesigned "cancel" X across all drawer destinations (matches the Connection sheet),

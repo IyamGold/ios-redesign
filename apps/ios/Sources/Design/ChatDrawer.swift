@@ -35,9 +35,6 @@ struct ChatDrawerHost<ChatContent: View>: View {
     /// Live drag translation. @State (not @GestureState) so the snap-back on release can be animated —
     /// a @GestureState reset is instantaneous and made the drawer jump.
     @State private var dragOffset: CGFloat = 0
-    /// Suppresses the open/close click when the drawer closes as a side effect of picking an item —
-    /// the click is for opening/dismissing the drawer, not for selection.
-    @State private var suppressCloseHaptic = false
     /// Per-gesture latch for the closed-state open swipe: nil until the first significant movement, then
     /// true (a rightward, horizontally-dominant swipe → open) or false (vertical/leftward → yield to the
     /// transcript scroll). Latching once prevents a mid-drag direction change from flipping the decision.
@@ -93,13 +90,10 @@ struct ChatDrawerHost<ChatContent: View>: View {
                     .simultaneousGesture(self.panelDrag(open: openOffset))
             }
         }
-        // Crisp minimal click when the drawer opens or is dismissed — but not when it closes because
-        // an item/session was picked (that's a navigation, not a drawer toggle).
+        // Crisp minimal click on every drawer open/close. Selecting a destination/session closes the
+        // drawer to reveal that tab, so this is also the tab-switch feedback — the drawer and its items
+        // are one "OneTab" surface, so switching tabs should feel like the drawer moving.
         .onChange(of: self.isOpen) { _, _ in
-            if self.suppressCloseHaptic {
-                self.suppressCloseHaptic = false
-                return
-            }
             OpenClawHaptics.click()
         }
     }
@@ -168,7 +162,6 @@ struct ChatDrawerHost<ChatContent: View>: View {
                     .foregroundStyle(Color.primary)
                 Spacer(minLength: 0)
                 Button {
-                    self.suppressCloseHaptic = true
                     self.onNewSession()
                     self.close()
                 } label: {
@@ -226,7 +219,6 @@ struct ChatDrawerHost<ChatContent: View>: View {
                 // session still surfaces within the four visible rows.
                 ForEach(Array(self.prefs.ordered(Array(self.sessions.prefix(8))).prefix(4))) { session in
                     Button {
-                        self.suppressCloseHaptic = true
                         self.onSelectSession(session.id)
                         self.close()
                     } label: {
@@ -279,7 +271,6 @@ struct ChatDrawerHost<ChatContent: View>: View {
     }
 
     private func select(_ destination: ChatDrawerDestination) {
-        self.suppressCloseHaptic = true
         self.onSelectDestination(destination)
         self.close()
     }

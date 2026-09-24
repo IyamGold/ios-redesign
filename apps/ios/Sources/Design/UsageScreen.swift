@@ -69,7 +69,7 @@ struct UsageScreen: View {
                     .font(.system(size: 20, weight: .medium))
                     .foregroundStyle(Color.primary)
                 HStack {
-                    self.chromePill(asset: "ChatCloseGlyph", action: self.onClose)
+                    self.chromePill(asset: "ChatBackGlyph", action: self.onClose)
                     Spacer()
                     Menu {
                         Button("All") { self.selectedMonth = nil }

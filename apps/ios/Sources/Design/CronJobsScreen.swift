@@ -87,7 +87,7 @@ struct CronJobsScreen: View {
                     .foregroundStyle(Color.primary)
                 HStack {
                     Button(action: self.onClose) {
-                        self.glassChrome("ChatCloseGlyph")
+                        self.glassChrome("ChatBackGlyph")
                     }
                     Spacer()
                     Menu {

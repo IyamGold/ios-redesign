@@ -167,6 +167,9 @@ private struct CanvasThumbnailTile: View {
 private struct CanvasPanelHeader: View {
     let title: String
     let onClose: () -> Void
+    // Archive screen (a drawer tab) passes the back chevron so its leading button opens the drawer;
+    // the embed viewer panels are sheets and keep the default close X.
+    var leadingGlyph = "ChatCloseGlyph"
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
@@ -178,7 +181,7 @@ private struct CanvasPanelHeader: View {
                 .frame(maxWidth: 240)
             HStack {
                 Button(action: self.onClose) {
-                    Image("ChatCloseGlyph")
+                    Image(self.leadingGlyph)
                         .renderingMode(.template)
                         .resizable()
                         .scaledToFit()
@@ -345,7 +348,7 @@ struct CanvasArchiveScreen: View {
             }
         }
         .safeAreaInset(edge: .top, spacing: 0) {
-            CanvasPanelHeader(title: "Canvas", onClose: self.onClose)
+            CanvasPanelHeader(title: "Canvas", onClose: self.onClose, leadingGlyph: "ChatBackGlyph")
                 .padding(.top, 8)
                 .padding(.bottom, 14)
         }

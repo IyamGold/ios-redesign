@@ -71,7 +71,7 @@ struct FilesGridScreen: View {
                                     .font(.system(size: 17, weight: .semibold))
                                     .foregroundStyle(Color.primary)
                             } else {
-                                Image("ChatCloseGlyph")
+                                Image("ChatBackGlyph")
                                     .renderingMode(.template)
                                     .resizable()
                                     .scaledToFit()
