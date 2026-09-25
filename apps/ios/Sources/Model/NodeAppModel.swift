@@ -451,6 +451,27 @@ final class NodeAppModel {
         return await cache.loadSessions()
     }
 
+    /// Live session list straight from the gateway (`sessions.list`) for the drawer, so titles and renames
+    /// reflect server truth across the ecosystem instead of a local cache. Falls back to the cache when the
+    /// gateway call fails (offline), so the drawer still shows something.
+    func fetchDrawerSessions() async -> [OpenClawChatSessionEntry] {
+        do {
+            let response = try await self.makeChatTransport().listSessions(
+                limit: 100, search: nil, archived: false)
+            return response.sessions
+        } catch {
+            return await self.loadCachedChatSessions()
+        }
+    }
+
+    /// Rename a session via `sessions.patch { label }` — gateway truth, so the new title syncs everywhere.
+    func renameChatSession(key: String, label: String) async {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        try? await self.makeChatTransport().patchSession(
+            key: key, label: trimmed, category: nil, pinned: nil, archived: nil, unread: nil)
+    }
+
     func storeCachedChatSessions(_ sessions: [OpenClawChatSessionEntry]) async {
         guard let cache = self.makeChatOfflineStore() else { return }
         await cache.storeSessions(sessions)

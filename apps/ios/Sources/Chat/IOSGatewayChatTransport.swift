@@ -36,6 +36,10 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
         var limit: Int?
         var search: String?
         var archived: Bool?
+        /// Ask the gateway to derive each row's title from its first user message (ChatGPT/Claude style).
+        /// The gateway only reads the transcript for this when the flag is set (it's file I/O), so without
+        /// it `derivedTitle` comes back nil and untitled chats fall back to the generic dated placeholder.
+        var includeDerivedTitles: Bool?
     }
 
     private struct DeleteSessionParams: Codable {
@@ -219,7 +223,8 @@ struct IOSGatewayChatTransport: OpenClawChatTransport {
             includeUnknown: false,
             limit: limit,
             search: normalizedSearch?.isEmpty == false ? normalizedSearch : nil,
-            archived: archived ? true : nil))
+            archived: archived ? true : nil,
+            includeDerivedTitles: true))
     }
 
     static func makePatchSessionParamsJSON(

@@ -88,6 +88,9 @@ public struct OpenClawChatSessionEntry: Codable, Identifiable, Sendable, Hashabl
     public var kind: String?
     public var displayName: String?
     public var label: String?
+    /// Gateway-derived title (`sessions.list`): the user label / displayName / subject, else the first user
+    /// message truncated (ChatGPT/Claude style). Present on list rows so clients never show a raw key.
+    public var derivedTitle: String?
     public var category: String?
     public var pinned: Bool?
     public var pinnedAt: Double?

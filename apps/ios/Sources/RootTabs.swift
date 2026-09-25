@@ -175,7 +175,6 @@ struct RootTabs: View {
         ChatDrawerHost(
             isOpen: self.$isChatDrawerOpen,
             sessions: self.drawerSessions,
-            versionText: Self.appVersionText,
             // The drawer is a chat-surface control; disable drag-to-open while Settings covers the chat.
             allowsOpen: !self.isPhoneSettingsPresented,
             onSelectDestination: { self.activeDrawerDestination = $0 },
@@ -192,7 +191,16 @@ struct RootTabs: View {
                 let key = "mobile-\(UUID().uuidString.prefix(8).lowercased())"
                 self.appModel.openChat(sessionKey: key)
             },
-            activeSessionID: self.appModel.chatSessionKey)
+            // Rename via the gateway (sessions.patch { label }), then refetch so the new title shows.
+            onRenameSession: { key, label in
+                Task {
+                    await self.appModel.renameChatSession(key: key, label: label)
+                    await self.loadDrawerSessions()
+                }
+            },
+            activeSessionID: self.resolvedActiveSessionID,
+            activeDestination: self.activeDrawerDestination,
+            mainSessionID: self.resolvedMainSessionID)
         {
             // The chat and each drawer destination are peer "tabs" sharing one panel — exactly one shows at
             // a time (like switching chat sessions), never layered. They are ZStack SIBLINGS, not an overlay
@@ -232,24 +240,117 @@ struct RootTabs: View {
         }
     }
 
-    private static let appVersionText =
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+    /// The home session's key AS IT APPEARS in the cached list. `appModel.mainSessionKey` is the normalized
+    /// base (`main`), but the gateway usually keys the same session by its agent alias
+    /// (`agent:<defaultAgent>:main`). Preferring the cached key lets the drawer's "Main" section dedupe
+    /// cleanly against the recents and open the real history. Falls back to the base when nothing is cached.
+    private var resolvedMainSessionID: String {
+        self.drawerSessions.first(where: { self.isMainSessionAlias($0.id) })?.id
+            ?? self.appModel.mainSessionKey
+    }
 
-    /// Loads the app-cached recent chat sessions for the drawer, mapping to display rows.
+    /// True when `key` is the home session under either spelling (base `main` or `agent:<defaultAgent>:main`),
+    /// mirroring the chat view model's main-session alias contract.
+    private func isMainSessionAlias(_ key: String) -> Bool {
+        let candidate = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let base = self.appModel.mainSessionKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if candidate == base {
+            return true
+        }
+        let agent = (self.appModel.gatewayDefaultAgentId ?? self.appModel.selectedAgentId ?? "main")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let room = base.isEmpty ? "main" : base
+        return candidate == "agent:\(agent.isEmpty ? "main" : agent):\(room)"
+    }
+
+    /// The active session resolved to the key AS IT APPEARS in the drawer list, so the active row highlights
+    /// automatically — not only after a manual tap. The live active key (`chatSessionKey`) is often an alias
+    /// of the listed key: cold start uses the base `main` while the list has `agent:main:main`, and a chat
+    /// created via "+" is focused as `mobile-…` while the gateway lists it as `agent:<agent>:mobile-…`.
+    /// Falls back to the raw active key when nothing in the list matches.
+    private var resolvedActiveSessionID: String {
+        self.drawerSessions.first(where: { self.isActiveSessionAlias($0.id) })?.id
+            ?? self.appModel.chatSessionKey
+    }
+
+    /// True when `key` is the currently-open session under either spelling — exact, or the gateway's
+    /// agent-scoped form (`agent:<defaultAgent>:<room>`) of the bare/base active key.
+    private func isActiveSessionAlias(_ key: String) -> Bool {
+        let entry = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let active = self.appModel.chatSessionKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if entry == active {
+            return true
+        }
+        let agent = (self.appModel.gatewayDefaultAgentId ?? self.appModel.selectedAgentId ?? "main")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let prefix = "agent:\(agent.isEmpty ? "main" : agent):"
+        if entry.hasPrefix(prefix), String(entry.dropFirst(prefix.count)) == active {
+            return true
+        }
+        if active.hasPrefix(prefix), String(active.dropFirst(prefix.count)) == entry {
+            return true
+        }
+        return false
+    }
+
+    /// Loads the app-cached recent chat sessions for the drawer, mapping to display rows. Cron/automation
+    /// sessions (isolated scheduled agent turns, not conversations) are dropped — see `isAutomationSession`.
     private func loadDrawerSessions() async {
-        let entries = await self.appModel.loadCachedChatSessions()
+        let entries = await self.appModel.fetchDrawerSessions()
         self.drawerSessions = entries
+            .filter { !Self.isAutomationSession($0) }
             .sorted { ($0.updatedAt ?? $0.lastActivityAt ?? 0) > ($1.updatedAt ?? $1.lastActivityAt ?? 0) }
             .map { entry in
-                ChatDrawerSession(id: entry.key, title: Self.drawerSessionTitle(entry))
+                ChatDrawerSession(id: entry.key, title: self.drawerSessionTitle(entry))
             }
     }
 
-    private static func drawerSessionTitle(_ entry: OpenClawChatSessionEntry) -> String {
-        let raw = entry.displayName ?? entry.label ?? entry.key
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? entry.key : trimmed
+    /// Cron/automation sessions (e.g. the managed "Memory Dreaming Promotion" job) run as isolated agent
+    /// turns keyed `agent:<id>:cron:<job>` — they have no conversation and don't belong in the recents.
+    /// The `:cron:` key segment is the gateway's canonical structure for these (`cron/isolated-agent`); a
+    /// real chat key can't contain it. The kind/category/surface markers are a defensive backstop.
+    private static func isAutomationSession(_ entry: OpenClawChatSessionEntry) -> Bool {
+        let key = entry.key.lowercased()
+        if key.hasPrefix("cron:") || key.contains(":cron:") {
+            return true
+        }
+        let markers: Set = ["cron", "automation", "schedule", "scheduled"]
+        return [entry.kind, entry.category, entry.surface]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .contains { markers.contains($0) }
     }
+
+    /// A human display title — never the raw key. Prefers the gateway's own title (displayName / label /
+    /// subject); the home session reads as "Main"; anything still untitled falls back to a dated "Chat ·
+    /// <date>" (or "New chat" when there's no timestamp) so a key like `agent:main:mobile-…` never shows.
+    private func drawerSessionTitle(_ entry: OpenClawChatSessionEntry) -> String {
+        // An explicit user rename (label) always wins — even for the home session.
+        if let label = entry.label?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty {
+            return label
+        }
+        // The home session reads as "Main" unless it was renamed above.
+        if self.isMainSessionAlias(entry.key) {
+            return "Main"
+        }
+        // Otherwise use the gateway's ChatGPT/Claude-style title (`derivedTitle`: displayName / subject, else
+        // the first user message truncated). Fall back to a dated placeholder, then a generic — never a key.
+        for candidate in [entry.derivedTitle, entry.displayName, entry.subject] {
+            if let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        if let millis = entry.updatedAt ?? entry.lastActivityAt {
+            let date = Date(timeIntervalSince1970: millis / 1000)
+            return "Chat · " + Self.drawerSessionDateFormatter.string(from: date)
+        }
+        return "New chat"
+    }
+
+    private static let drawerSessionDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d"
+        return formatter
+    }()
 
     /// Drawer items point to their existing destinations. Agent surfaces reuse `AgentProTab`
     /// (which owns its own overview-loading duty); Canvas hosts the shared screen controller.
