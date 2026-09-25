@@ -14,6 +14,7 @@ struct ChatRootSurface: View {
     var onOpenDrawer: (() -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.scenePhase) private var scenePhase
     @State private var inputHeight: CGFloat = 0
     @State private var showsAttachmentTray = false
     /// Photo-library picker (images only — the shared attachment pipeline is image-only today).
@@ -371,6 +372,11 @@ struct ChatRootSurface: View {
                 .padding(.top, 108)
                 .coordinateSpace(.named(Self.chatContentSpace))
             }
+            // Recreate the ScrollView once when rows first arrive (empty→loaded). Otherwise history loads as
+            // a bulk size-change that `.defaultScrollAnchor(.top, for: .sizeChanges)` throws into a limbo
+            // where the LazyVStack won't paint until a physical scroll. Rebuilt with rows already present,
+            // `.defaultScrollAnchor(.bottom)` positions AND paints the latest turns immediately.
+            .id(self.rows.isEmpty)
             .defaultScrollAnchor(.bottom)
             // Retain the last non-nil top: once a long reply scrolls the pinned question off the top,
             // LazyVStack stops rendering it (probe → nil), but its content-space offset is stable through
@@ -417,6 +423,25 @@ struct ChatRootSurface: View {
                 } else if self.pinTurnID == nil {
                     self.scrollToBottom(proxy, animated: old != 0, reason: "rows.count")
                 }
+            }
+            // Cold start / session switch can MOUNT with rows already populated (history loads from cache
+            // before this view appears), so `rows.count` never changes and the initial scroll-to-bottom is
+            // skipped — the LazyVStack then reads blank until a manual scroll materializes it. Fire once on
+            // first appearance (`initial: true`), deferred a runloop so the cells are laid out before we scroll.
+            .onChange(of: self.rows.isEmpty, initial: true) { _, isEmpty in
+                guard !isEmpty, self.pinTurnID == nil else { return }
+                Task { @MainActor in
+                    self.scrollToBottom(proxy, animated: false, reason: "initialRows")
+                }
+            }
+            // A long background suspends the transcript's LazyVStack; on foreground it renders blank until a
+            // manual scroll re-materializes the cells. Refresh history (catch anything missed while
+            // suspended) and re-assert the scroll so the rows render immediately. The iOS surface owns this —
+            // the legacy macOS ChatView wired it in its own scenePhase handler; this one never did.
+            .onChange(of: self.scenePhase) { _, phase in
+                guard phase == .active else { return }
+                self.viewModel.resumeFromForeground()
+                self.scrollToBottom(proxy, animated: false, reason: "foreground")
             }
             // Streamed tokens: only track the bottom for a tool-free reply that has no pinned question above
             // it. When a question is pinned the reply grows downward into the reserved spacer and the top

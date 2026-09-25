@@ -145,9 +145,9 @@ struct CronJobsScreen: View {
                     Text(job.descriptionText)
                         .font(.system(size: 13))
                         .foregroundStyle(Color.primary.opacity(0.6))
-                        // One-time jobs show their full prompt (wraps + grows the card); recurring jobs
-                        // keep a single-line subtitle so their chips stay the focus.
-                        .lineLimit(job.isRecurring ? 1 : nil)
+                        // Cap every job's subtitle at 3 lines (one-time prompts can be long) so no card
+                        // balloons; overflow truncates with an ellipsis.
+                        .lineLimit(3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
