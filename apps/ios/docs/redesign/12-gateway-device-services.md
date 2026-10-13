@@ -238,14 +238,14 @@ Loads the registry entry, sets it active in the registry, then dispatches to `co
 Synchronous portion:
 - Removes from `GatewaySettingsStore` registry.
 - Cancels any in-flight connect attempt for this gateway.
-- Calls `appModel.disconnectForgottenGateway`.
+- **Conditionally** calls `appModel.disconnectForgottenGateway(preservingPendingConnectAttempt:)` — only when the gateway was actively connected (`shouldDisconnect`, computed from `activeGatewayConnectConfig?.effectiveStableID == stableID || connectedGatewayID == stableID`, `Sources/Gateway/GatewayConnectionController.swift:546–553`). Forgetting a gateway that was never activated skips this call. `preservingPendingConnectAttempt` is true when a *different* target has a pending attempt (so it survives).
 - Clears legacy UserDefaults keys, gateway credentials, custom headers, TLS pin, clientId override, selected agent ID, share relay config.
 - Clears device auth tokens for both primary and share-extension identities, for both `node` and `operator` roles.
 
-Async cleanup task:
-- Waits for gateway session reset.
-- Runs a second `clearDeviceAuthTokens` pass (a handshake racing teardown can persist a token after the first cleanup — see inline comment at `Sources/Gateway/GatewayConnectionController.swift:575`).
-- Purges the chat transcript cache for this gateway.
+Async cleanup task (`Sources/Gateway/GatewayConnectionController.swift:570–581`) branches on the same `shouldDisconnect`:
+- **When `shouldDisconnect` is true** (and `appModel` is still alive): waits for gateway session reset (`waitForGatewaySessionResetIfNeeded()`), then runs a second `clearDeviceAuthTokens` pass (a handshake racing teardown can persist a token after the first cleanup — see inline comment at `Sources/Gateway/GatewayConnectionController.swift:575`), then purges the chat transcript cache.
+- **When `shouldDisconnect` is false** (gateway never connected): skips the session-reset wait and second token clear; still purges the chat transcript cache.
+- **Fallback when `appModel` is nil** (deallocated): directly removes the transcript-cache database files via `OpenClawChatSQLiteTranscriptCache.removeDatabaseFiles(at:)`.
 
 Forget cleanups are tracked in `pendingForgetCleanups: [String: (id: UUID, task: Task<Void, Never>)]`. If `connectDiscoveredGateway` or `connectManual` is called for an ID with a pending forget cleanup, it awaits the cleanup task before proceeding.
 
@@ -270,7 +270,7 @@ Forget cleanups are tracked in `pendingForgetCleanups: [String: (id: UUID, task:
 5. Check `gateway.preferredStableID` and `gateway.lastDiscoveredStableID` against current discovered gateways.
 6. If exactly one discovered gateway has a stored TLS pin → auto-connect to it.
 
-**Security invariant:** Auto-connect only proceeds to gateways that have a stored TLS fingerprint pin. First-time connects always require explicit user trust.
+**Security invariant (TLS connects only):** For TLS gateways, auto-connect proceeds only when a stored fingerprint pin exists — the guard `!resolvedUseTLS || tlsParams?.expectedFingerprint != nil` (`Sources/Gateway/GatewayConnectionController.swift:990`) blocks a pinless TLS auto-connect, so first-time TLS connects require explicit user trust. Note this is **not** universal: when `resolvedUseTLS` is false (a plaintext local-network manual gateway) the guard passes with no pin required, so plaintext gateways auto-connect without a TLS pin.
 
 `attemptAutoReconnectIfNeeded()` is called on scene becoming active and on local network access grant. It resets `didAutoConnect` and calls `maybeAutoConnect()`.
 
