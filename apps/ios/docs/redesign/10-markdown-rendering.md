@@ -66,11 +66,11 @@ Source: `ChatMarkdownPreprocessor.swift`
 
 | Step | Method | What it removes |
 |---|---|---|
-| 1 | `stripEnvelope` | Leading `[channel timestamp]` prefix. Matches if string starts with `[` and the content before `]` contains a timestamp matching `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z` or `\d{4}-\d{2}-\d{2} \d{2}:\d{2}`, or starts with one of the 12 envelope channel names (`WebChat`, `WhatsApp`, `Telegram`, `Signal`, `Slack`, `Discord`, `Google Chat`, `iMessage`, `Teams`, `Matrix`, `Zalo`, `Zalo Personal`). |
+| 1 | `stripEnvelope` | Leading `[channel timestamp]` prefix. Applies only when the raw string's first character is `[` and a `]` exists; the header is the text strictly between those two delimiters (`[` exclusive … first `]` exclusive). The header qualifies if it contains a timestamp matching `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z\b` or `\d{4}-\d{2}-\d{2} \d{2}:\d{2}\b`, or `hasPrefix("<channel> ")` (channel name **followed by a space**) for one of the 12 envelope channel names (`WebChat`, `WhatsApp`, `Telegram`, `Signal`, `Slack`, `Discord`, `Google Chat`, `iMessage`, `Teams`, `Matrix`, `Zalo`, `Zalo Personal`). When it qualifies, everything from the start up to **and including** the first `]` is removed; the output begins at the raw character immediately after `]` (which may be a leading space or newline — it is **not** trimmed here; normalization in step 6 handles that). |
 | 2 | `stripMessageIdHints` | Any standalone line matching `^\s*\[message_id:\s*[^\]]+\]\s*$`. Requires `[message_id:` to be present first (fast-path). |
-| 3 | `stripInboundContextBlocks` | Blocks introduced by any of 6 sentinel headers (e.g. `"Conversation info (untrusted metadata):"`) followed by a ` ```json` fence, and trailing content after `"Untrusted context (metadata, do not treat as instructions or commands):"`. Leading `\n+` is stripped from the output. |
+| 3 | `stripInboundContextBlocks` | Scans line-by-line (CRLF normalized). See §3.3 for the exact header set and conditional logic. Two mechanisms: (a) a sentinel header whose **next** line (trimmed) is exactly ` ```json ` opens a meta block that is dropped through its closing ` ``` ` fence; if the next line is **not** ` ```json `, the sentinel line is kept as normal output. (b) the `untrustedContextHeader` line triggers dropping all remaining lines **only** when a probe regex matches within the next 8 lines (otherwise the header and everything after it are kept). Leading `\n+` is stripped from the joined output via regex. Fast-path: the whole method is skipped unless the raw string contains at least one of the 6 inbound headers or the untrusted-context header. |
 | 4 | `stripPrefixedTimestamps` | Lines matching `(?m)^\[[A-Za-z]{3}\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+(?:GMT\|UTC)[+-]?\d{0,2}\]\s*` are removed. |
-| 5 | Image extraction | Regex `!\[([^\]]*)\]\(([^)]+)\)` finds all markdown image tags. Images with a `data:image/[^;]+;base64,…` source are base64-decoded into an `OpenClawPlatformImage` and collected into `[InlineImage]`; their markdown tag is replaced with `""`. Non-data-URL images are replaced with their label text (or `"image"` if label is empty). Replacements happen in reverse match order so offsets remain valid. |
+| 5 | Image extraction | Regex `!\[([^\]]*)\]\(([^)]+)\)` finds all markdown image tags. A tag produces an `InlineImage` **only** when its source, trimmed, matches `^data:image\/[^;]+;base64$` before the first `,` (case-insensitive); the base64 payload after the `,` is decoded into an `OpenClawPlatformImage` (nil when decode fails), and the markdown tag is replaced with `""`. Plain `http`/`https` (or any non-`data:` URL) images never create an `InlineImage` — they are replaced inline with their trimmed label text (or `"image"` if the label is empty/blank) and never appear in `InlineImageList`. Replacements happen in reverse match order so offsets stay valid; the collected image array is reversed back to document order before return. |
 | 6 | `normalize` | CRLF → LF, triple newlines collapsed to double (applied twice to handle LFLFLF → LFLF → LF cases), leading/trailing whitespace trimmed. |
 
 ### 3.2 `InlineImage` struct
@@ -82,6 +82,25 @@ struct InlineImage: Identifiable {
     let image: OpenClawPlatformImage?  // nil when base64 decode fails
 }
 ```
+
+### 3.3 Inbound-context stripping detail (`stripInboundContextBlocks`)
+
+The 6 inbound-context sentinel headers (kept in sync with `src/auto-reply/reply/strip-inbound-meta.ts` `INBOUND_META_SENTINELS`):
+
+- `"Conversation info (untrusted metadata):"`
+- `"Sender (untrusted metadata):"`
+- `"Thread starter (untrusted, for context):"`
+- `"Replied message (untrusted, for context):"`
+- `"Forwarded message context (untrusted metadata):"`
+- `"Chat history since last reply (untrusted, for context):"`
+
+Plus the trailing-strip sentinel: `untrustedContextHeader = "Untrusted context (metadata, do not treat as instructions or commands):"`.
+
+**Fenced-meta block (header + ```` ```json ````):** When a line (trimmed) exactly equals one of the 6 headers, the segmenter looks at the **next** line. If that next line (trimmed) is exactly ```` ```json ````, both the header and the subsequent JSON fence (up to and including the closing ```` ``` ````) are dropped, along with any immediately following blank line. If the next line is **not** exactly ```` ```json ```` (trimmed), the sentinel header line is **kept verbatim** in the output and scanning continues. (`ChatMarkdownPreprocessor.swift:160-168`)
+
+**Trailing untrusted-context strip:** When a line (trimmed) equals `untrustedContextHeader`, the segmenter probes the next up-to-8 lines (`index+1 ..< min(count, index+8)`, joined with `\n`). It drops that header and **every remaining line** (`break`) only if the probe matches the regex `<<<EXTERNAL_UNTRUSTED_CONTENT|UNTRUSTED channel metadata \(|Source:\s+`. If the probe does not match, the header and all following lines are kept as normal output. (`ChatMarkdownPreprocessor.swift:202-210`)
+
+After assembling the surviving lines (joined with `\n`), a leading `^\n+` is stripped via regex. (`ChatMarkdownPreprocessor.swift:199`)
 
 ---
 
@@ -151,10 +170,10 @@ A `SourceBuffer` helper splits the markdown into `lines: [String]` (CRLF normali
 **Math extraction** runs first (before code/table), because math delimiters can appear inside what the CommonMark parser sees as paragraph text. Math scanning only runs if the string contains `$$` or `\[`. Protected ranges (rejected math spans) prevent code/table extraction from treating lines inside them.
 
 **Math delimiter recognition:**
-- `$$` … `$$` or `\[` … `\]` at top-level paragraph lines only (not inside inline code).
-- Indent ≤ 3 spaces before the delimiter.
-- Single-line form: `$$latex$$` — delimiter and content on one line, content ends before matching close.
-- Multi-line form: opener alone on a line, content on subsequent lines, close on its own line.
+- `$$` … `$$` or `\[` … `\]`. A line is a math-scan candidate only when it passes a **double gate**: its index is in `topLevelParagraphLines` (collected from the line ranges of direct `Markdown.Paragraph` children of the document) **and** its index is **not** in `inlineCodeLines` (collected recursively from every `Markdown.InlineCode` node). Both conditions must hold; a `$$` inside a list item, blockquote, or inline code span is never treated as a display-math opener. (`ChatMarkdownBlockSegmenter.swift:155-178`)
+- Indent recognition counts only leading **ASCII space** (`" "`) characters, not tabs, and requires indent ≤ 3 before the delimiter (`FenceOpener.leadingSpaces`). (`ChatMarkdownBlockSegmenter.swift:278-279`)
+- Single-line form: `$$latex$$` — delimiter and content on one line. The close is found with a **`.backwards`** search for the LAST occurrence of the close delimiter in the remainder, and everything after that close must be whitespace-only; otherwise the line is not a single-line math span. (For input like `$$a$$b$$` the backwards search isolates the final `$$`, so the content is `a$$b`.) The extracted latex is whitespace-trimmed. (`ChatMarkdownBlockSegmenter.swift:290-300`)
+- Multi-line form: opener alone on a line (remainder after the delimiter is whitespace-only), content on subsequent lines, close on its own line. Close-line detection trims whitespace from the line before comparing it to the close string (`$$` or `\]`). (`ChatMarkdownBlockSegmenter.swift:292-293, 303-305`)
 - Incomplete during streaming: if opener has no matching close and `isComplete == false`, the span and all following lines are protected (stop scanning for more openers).
 - `isComplete: Bool` on `ChatMathBlock` is true when the close delimiter was found or `isComplete == true` was passed.
 - Size limit: `maxMathBytes = 5000`. Oversized math is protected (falls through as prose).
@@ -169,7 +188,7 @@ A `SourceBuffer` helper splits the markdown into `lines: [String]` (CRLF normali
 - Uses `swift-markdown`'s `Table` node. The segmenter re-parses the raw line range to find the true header start (the parser's reported range can be off by one row when the delimiter row is not on line 1 of the range).
 - GFM column alignment: `left`/`nil` → `.leading`, `right` → `.trailing`, `center` → `.center`.
 - Limits: `maxTableBytes = 20000`, `maxTableRows = 100`, `maxTableColumns = 12`, `maxTableCells = 600`. Tables exceeding any limit are skipped (fall through as prose).
-- Incomplete tables (trailing lines are all blank and `isComplete == false`) are skipped.
+- Incomplete tables are skipped during streaming: when `isComplete == false`, the segmenter inspects the lines **after** the resolved table range (`source.lines[tableRange.upperBound...]`), **not** the lines inside it. If every such trailing line is blank (whitespace-only), the table is dropped (falls through as prose) so a table still being streamed is not committed prematurely. (`ChatMarkdownBlockSegmenter.swift:109-114`)
 - Cell parsing: pipes split with escape handling (`\|` → `|`); leading/trailing empty cells stripped for pipe-delimited rows; all cells trimmed of whitespace.
 
 **Reference-link fallback:** If the final block list has more than one block and the source document contains any link or image whose raw text ends with `]` (indicating a reference-style link), the segmenter discards all extractions and returns `proseOnly(source.lines)`. This prevents splitting reference definitions from their link labels across blocks.
@@ -178,7 +197,7 @@ A `SourceBuffer` helper splits the markdown into `lines: [String]` (CRLF normali
 
 ### 5.3 Extraction sort order
 
-All extractions are sorted by `lowerBound` ascending; ties broken by `upperBound` descending. Extractions whose `lowerBound` is before `proseStart` (already consumed) are skipped.
+All extractions are sorted by `lineRange.lowerBound` ascending; ties broken by `lineRange.upperBound` descending. The emit loop keeps extractions whose `lineRange.lowerBound >= proseStart` and skips any whose `lowerBound` is strictly **before** `proseStart` (already consumed by an earlier, overlapping extraction). An extraction starting exactly **at** `proseStart` is **included** (the condition is `>=`, not `>`). For each kept extraction the segmenter flushes prose up to `lowerBound`, appends the block, then advances `proseStart` to `lineRange.upperBound`. (`ChatMarkdownBlockSegmenter.swift:134`)
 
 ---
 
@@ -210,19 +229,24 @@ Each block mapped to ChatMarkdownRenderedBlock:
 init(markdown: String, isComplete: Bool, preparesReveal: Bool)
 ```
 
+The initializer computes `inlineContent` **only** on the completed non-streaming path: `inlineContent = (isComplete && !preparesReveal) ? makeInlineContent(markdown:) : nil`. On any other path `inlineContent` is `nil`. (`ChatMarkdownRenderer.swift:200-202`)
+
+`attributed` is **always** set: it holds `parseMarkdown(markdown)` whenever `inlineContent == nil`, and an empty `AttributedString()` when `inlineContent != nil` (the inline-content path renders from the pieces, not from `attributed`). So a non-nil `inlineContent` always pairs with an empty `attributed`, and a nil `inlineContent` always pairs with a populated `attributed`. (`ChatMarkdownRenderer.swift:203-205`) `renderedText(...)` guards on this: if `inlineContent == nil` it returns `SwiftUI.Text(self.attributed)` directly; otherwise it folds the `[InlineContent]` pieces into a concatenated `Text`. (`ChatMarkdownRenderer.swift:254-255`)
+
 **Normal (completed, non-streaming) path** (`isComplete && !preparesReveal`):
 
 1. `makeInlineContent(markdown:)` scans for inline math spans via `ChatInlineMathScanner`.
-2. If any math spans are found, the markdown is reconstructed with Private-Use-Area Unicode markers replacing each valid math span. The markers are allocated starting at U+E000, skipping values already present in the markdown string. The modified markdown is then parsed into `AttributedString`.
+2. If any non-`.markdown` pieces are found, the markdown is reconstructed with Private-Use-Area Unicode markers replacing each valid math span. The markers are allocated starting at `0xE000` (U+E000), skipping values already present in the markdown string. The modified markdown is then parsed into `AttributedString`.
 3. The attributed string is then split around the marker characters to produce `[InlineContent]`: alternating `.text(AttributedString)` and `.math(ChatInlineMathSpan)`.
 4. Math-inside-link special case: if a math marker inherits a `link` attribute (the math was used as a link label), it is kept as a `.text(literal)` piece so the link destination remains tappable.
-5. If no math spans exist, `inlineContent` is `nil` and `attributed` holds the full `AttributedString`.
+5. If no math spans exist, `makeInlineContent` returns `nil`, so `inlineContent` is `nil` and `attributed` holds the full parsed `AttributedString`.
+6. `plainText` is `""` on this path (it is populated **only** when `preparesReveal == true`), and `prefix`/`tail` are empty (`AttributedString()` / `[]`). A rebuilder must not assume `plainText` holds the visible text outside the streaming path. (`ChatMarkdownRenderer.swift:206, 222-225`)
 
 **Streaming (`preparesReveal == true`) path:**
 
-- `makeInlineContent` is skipped (too expensive per-delta).
+- `makeInlineContent` is skipped (too expensive per-delta), so `inlineContent == nil`.
 - `attributed = Self.parseMarkdown(markdown)` produces a single `AttributedString`.
-- `plainText = String(attributed.characters)` is extracted.
+- `plainText = String(attributed.characters)` is extracted (**only** on this path). (`ChatMarkdownRenderer.swift:206`)
 - `wordRanges = chatStreamingWordRanges(in: plainText).suffix(24)` — at most 24 trailing words tracked.
 - `tailStart` = first word range's `lowerBound`, or `plainText.count` if none.
 - `prefix` = `attributed[0..<tailStart]`.
@@ -234,7 +258,7 @@ Applied before `AttributedString(markdown:)` parsing, inside `parseMarkdown(_:)`
 
 - CRLF normalized to LF.
 - For each adjacent non-empty line pair: if neither line starts a block-level element (heading, blockquote, list, thematic break, indented code), and neither already ends with `  ` or `\`, the trailing two spaces `  \n` (markdown hard break) are appended to force line preservation.
-- Code block lines (determined via `swift-markdown` `CodeBlock` ranges) are excluded from soft-break injection.
+- Code block lines (determined via `swift-markdown` `CodeBlock` ranges, `codeLineIndices(in:)`) are excluded from soft-break injection. That helper has a fast-path early return: if the markdown contains **none** of ```` ``` ````, `~~~`, a leading four-space indent (`hasPrefix("    ")`), or `"\n    "`, it returns an empty `Set<Int>()` **without** parsing a `Document`. This is a correctness boundary — content that genuinely contains those substrings is parsed, everything else short-circuits. (`ChatMarkdownRenderer.swift:484-489`)
 - This prevents CommonMark's default behavior of collapsing consecutive non-block lines into a single paragraph.
 
 ### 6.4 `AttributedString` parsing options
@@ -279,7 +303,7 @@ VStack(alignment: .leading, spacing: 10)
 │   │     .tint(linkColor)
 │   │     .textSelection(.enabled)
 │   │     .lineSpacing(lineSpacing ?? (compact ? 2 : 4))
-│   │     .modifier(ChatInlineMathAccessibilityModifier)
+│   │     .modifier(ChatInlineMathAccessibilityModifier(label: prose.inlineAccessibilityText))
 │   ├── .code   → ChatCodeBlockView(block:)
 │   ├── .math   → ChatMathBlockView(block:textColor:)
 │   └── .table  → ChatMarkdownTableView(table:)
@@ -293,7 +317,9 @@ VStack(alignment: .leading, spacing: 10)
 
 ### 7.4 Inline math accessibility
 
-When `inlineContent` is non-nil, an `.accessibilityLabel` is applied to the prose `Text` containing the full visible text (markdown text portions joined with LaTeX source for math spans), so VoiceOver reads the mathematical expression source.
+The prose block always carries `.modifier(ChatInlineMathAccessibilityModifier(label: prose.inlineAccessibilityText))`. `inlineAccessibilityText` is `nil` when `inlineContent` is `nil` (no inline math), and the modifier is a no-op in that case — it applies `.accessibilityLabel(Text(label))` only when `label != nil`. (`ChatMarkdownRenderer.swift:101, 442-451`)
+
+When `inlineContent` is non-nil, `inlineAccessibilityText` reduces the `[InlineContent]` pieces into one string: for each `.text(attributed)` piece it appends `String(attributed.characters)` (the **plain-text characters** of that attributed slice — not the raw markdown source), and for each `.math(span)` piece it appends `span.latex` (the LaTeX source). VoiceOver therefore reads visible prose plus the raw math source. (`ChatMarkdownRenderer.swift:237-247`)
 
 ---
 
@@ -751,26 +777,34 @@ Background (`.full` chrome only): `RoundedRectangle(cornerRadius: 18)` filled wi
 
 Outer padding: onboarding = 5pt, clean = 4pt, full = 6pt.
 
+**`fullEditor` inner field container** (the editor for `.full`/`.standard` chrome, item 3 above): a nested `VStack(alignment: .leading, spacing: 8)` — distinct from the top-level `VStack` — wrapping, in order, the `editorOverlay`, a 1 pt `Rectangle` divider filled with `OpenClawChatTheme.divider` (`.padding(.horizontal, 2)`), and an `HStack(alignment: .center, spacing: 8)` holding the talk button (if present), connection pill (if shown), a `Spacer`, and the `sendButton`. This inner `VStack` carries `.padding(.horizontal, 10).padding(.vertical, 8)`, its own background `RoundedRectangle(cornerRadius: 14, style: .continuous)` filled with `OpenClawChatTheme.composerField` and overlaid with a `composerBorder` stroke, then `.padding(self.editorPadding)`. This inner `cornerRadius: 14` field surface is separate from the outer `.full` composer container's `cornerRadius: 18` background. (`ChatComposer.swift:503-532`)
+
 ### 16.3 Clean editor layout
 
+The clean editor wraps its row in an outer `VStack(alignment: .leading, spacing: 6)` and the whole `VStack` carries `.padding(.horizontal, 14).padding(.vertical, 4)` — these two padding values live at the `VStack` level, **not** on the editor surface. (`ChatComposer.swift:534, 568-569`)
+
 ```
-HStack(alignment: .bottom, spacing: 8)
-  attachmentPicker
-    .frame(width: cleanIconControlSize=32, height: cleanEditorMinHeight)
-  voiceNoteButton (if not talk-active)
-    .frame(width: 32, height: cleanEditorMinHeight)
-  editorOverlay
-    .padding(.vertical, cleanEditorTextPadding=10)
-    .padding(.horizontal, 14)
-    .frame(minHeight: cleanEditorMinHeight)
-    .modifier(CleanChatComposerSurface(cornerRadius: cleanEditorCornerRadius))
-  cleanTrailingControl
-    .frame(height: cleanEditorMinHeight, alignment: .bottom)
+VStack(alignment: .leading, spacing: 6)          // outer; .padding(.horizontal, 14).padding(.vertical, 4)
+  HStack(alignment: .bottom, spacing: 8)
+    attachmentPicker
+      .frame(width: cleanIconControlSize=32, height: cleanEditorMinHeight)
+    voiceNoteButton (if voiceNoteControl present and not talk-active)
+      .frame(width: cleanIconControlSize=32, height: cleanEditorMinHeight)
+    editorOverlay
+      .padding(.vertical, cleanEditorTextPadding=10)   // 10 pt applied HERE, on the pill surface
+      .padding(.horizontal, 14)
+      .frame(minHeight: cleanEditorMinHeight)
+      .modifier(CleanChatComposerSurface(cornerRadius: cleanEditorCornerRadius))
+    cleanTrailingControl
+      .frame(height: cleanEditorMinHeight, alignment: .bottom)
+  if showsConnectionPill: connectionPill.padding(.leading, 44)
 ```
 
-`cleanEditorMinHeight = max(44, textMinHeight + 10 * 2)`.
+Note the two distinct padding layers (do not conflate them): the outer `VStack` has `.padding(.vertical, 4)`, while the inner `editorOverlay` pill surface has `.padding(.vertical, cleanEditorTextPadding = 10)`. (`ChatComposer.swift:534-570`)
 
-`cleanEditorCornerRadius = cleanEditorMinHeight / 2` (pill shape).
+`cleanEditorMinHeight = max(44, textMinHeight + cleanEditorTextPadding * 2)`, where `cleanEditorTextPadding = 10`. (`ChatComposer.swift:1104-1113`)
+
+`cleanEditorCornerRadius = cleanEditorMinHeight / 2` (pill shape). Because `textMinHeight` grows with Dynamic Type (it is `max(base, scaledBodyLineHeight)`), both `cleanEditorMinHeight` and this derived corner radius change dynamically with the user's text-size setting. (`ChatComposer.swift:1104-1110`)
 
 `textMinHeight`: standard clean = 24pt, onboarding = 24pt, full = 28pt. Each is `max(base, scaledBodyLineHeight)` where `@ScaledMetric(relativeTo: .body) var scaledBodyLineHeight: CGFloat = 22`.
 
@@ -784,9 +818,9 @@ macOS: `.background(composerField fill) + .overlay(stroke composerBorder, lineWi
 
 ### 16.5 Clean trailing control (`cleanTrailingControl`)
 
-When draft is empty and no pending runs and `talkControl` exists: `compactTalkButton` — circle-filled mic icon (32×32pt icon inside a 44×44pt hit target).
+Exact condition (`cleanTrailingControl`): when `!viewModel.hasDraftToSend && viewModel.pendingRunCount == 0 && talkControl != nil`, it shows `compactTalkButton(talkControl)` — a circle-filled mic icon (32×32pt icon inside a 44×44pt hit target). `compactTalkButton` is returned **without** any outer `.frame(width:height:)` modifier (it manages its own sizing). (`ChatComposer.swift:576-577`)
 
-Otherwise: `sendButton` at `cleanControlHeight = 44pt`, visual size `cleanIconControlSize = 32pt`, corner radius `32/2 = 16`.
+Otherwise it shows `sendButton` with `.frame(width: cleanControlHeight, height: cleanControlHeight)` (`cleanControlHeight = 44pt`) — this explicit square frame is applied **only** on the `sendButton` branch, not the `compactTalkButton` branch. The button's visual size is `cleanIconControlSize = 32pt`, corner radius `32/2 = 16`. (`ChatComposer.swift:578-581`)
 
 ### 16.6 iOS text field (clean mode)
 
@@ -797,9 +831,11 @@ TextField("", text: $viewModel.input, axis: .vertical)
     .lineLimit(1...4)
     .fixedSize(horizontal: false, vertical: true)
     .submitLabel(.return)  // return inserts newline; send is the button
-    .padding(.horizontal, 0)  // cleanFieldTextInset = 0
-    .padding(.vertical, 0)    // cleanEditorTextPadding applied by parent
+    .padding(.horizontal, cleanFieldTextInset)                 // cleanFieldTextInset = 0
+    .padding(.vertical, composerChrome == .clean ? 0 : 6)      // 0 for clean, 6 for full chrome
 ```
+
+The horizontal inset is `cleanFieldTextInset = 0`. The **vertical** padding is conditional on chrome: `0` in `.clean` chrome (the parent pill supplies `cleanEditorTextPadding = 10`), but `6` in full chrome. (`ChatComposer.swift:742-743`)
 
 Placeholder: `Text(placeholderText)` in `OpenClawChatTypography.body`, `.foregroundStyle(.tertiary)`. Default placeholder text: `"Message…"`.
 
@@ -829,11 +865,13 @@ Visual size: clean = 32×32pt, full = `sendButtonSize = 44pt`. Corner radius: cl
 - Fill: `userAccent ?? OpenClawChatTheme.userBubble` (active) or `.clear` (clean disabled) or `secondary 0.32` (full disabled)
 - Foreground: `.white` (active or full chrome) or `.secondary.opacity(0.55)` (clean disabled)
 - Border opacity: active = 0.18, full disabled = 0.08, clean disabled = 0
-- Icon: `arrow.up` at `display(size: 13, weight: .semibold, relativeTo: .caption)`
+- Icon: `arrow.up` at `OpenClawChatTypography.display(size: 13, weight: .semibold, relativeTo: .caption)` (or a `.controlSize(.mini)` `ProgressView` while `viewModel.isSending`)
 
-**Stop state** (pending run, no draft):
-- Fill: `OpenClawChatTheme.danger` (system red)
-- Icon: `stop.fill` at same font
+**Stop state** (`viewModel.pendingRunCount > 0 && !viewModel.hasDraftToSend`):
+- Fill: `OpenClawChatTheme.danger` (system red — `UIColor.systemRed`), applied directly as `RoundedRectangle(cornerRadius: sendButtonCornerRadius).fill(OpenClawChatTheme.danger)` with no border overlay. (`ChatComposer.swift:1019-1022`)
+- Foreground: `.white`.
+- Icon: `stop.fill` at the same `display(size: 13, …)` font, or a `.controlSize(.mini)` `ProgressView` while `viewModel.isAborting` (the button is also disabled while aborting). (`ChatComposer.swift:1009-1014, 1025`)
+- Accessibility label: `"Stop response"`.
 
 ### 16.9 Slash command panel
 
@@ -849,7 +887,7 @@ macOS keyboard navigation: Up/Down arrows move highlight, Tab/Return accept, Esc
 
 Scroll affordance (> 4 matches): gradient fade + `chevron.compact.down` at 16pt semibold.
 
-Debounce for search updates: `.task(id: scopedFetchID)` with `Task.sleep(250_000_000 ns)`.
+Search updates: **no debounce.** The slash panel has no `Task.sleep` / `.task(id:)` timer. On every `.onChange(of: viewModel.input)` (and on focus changes) the composer calls `updateSlashPopoverPresentation()` synchronously, which computes `slashQuery` and, when the panel should show, calls `viewModel.loadSlashCommandsIfNeeded()` once (a cached-catalog load, not a per-keystroke fetch) and resets `slashHighlightIndex = 0`. Filtering against the loaded catalog is client-side via `viewModel.slashCommandMatches(query:filter:)`. (`ChatComposer.swift:727-728, 747-756, 958-971`) The 250 ms `Task.sleep` debounce + `.task(id: scopedFetchID)` belongs to `ChatSessionsSheet`'s server-side session search, not the slash panel — see §17.1. (`ChatSheets.swift:46, 96, 251-252`)
 
 ### 16.10 Context usage indicator
 

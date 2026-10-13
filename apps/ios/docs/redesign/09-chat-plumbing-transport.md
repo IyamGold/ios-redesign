@@ -15,8 +15,16 @@ File: `Sources/Chat/IOSGatewayChatTransport.swift`
 | Property | Type | Description |
 |---|---|---|
 | `gateway` | `GatewayNodeSession` | The active WebSocket gateway session. |
-| `globalAgentId` | `String?` | Lowercased, trimmed agent id injected at construction; `nil` when empty. Used as the `agentId` field for alias keys (e.g., `"main"`, `"global"`). |
-| `outboxGatewayID` | `String?` | When set, all outbox-route lease acquisition is gated on this specific gateway identity so stale routes never replay durable commands. |
+| `globalAgentId` | `String?` | Agent id injected at construction, normalized as **trimmed then lowercased**; stored as `nil` when the normalized result is empty (not an empty string). Used as the `agentId` field for alias keys (e.g., `"main"`, `"global"`). |
+| `outboxGatewayID` | `String?` | Gateway identity injected at construction, normalized as **trimmed only** (no lowercasing); stored as `nil` when the trimmed result is empty. When set, all outbox-route lease acquisition is gated on this specific gateway identity so stale routes never replay durable commands. |
+
+Init normalization (`IOSGatewayChatTransport.swift:142-152`):
+```swift
+let normalized = globalAgentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+self.globalAgentId = normalized?.isEmpty == false ? normalized : nil
+let normalizedGatewayID = outboxGatewayID?.trimmingCharacters(in: .whitespacesAndNewlines)
+self.outboxGatewayID = normalizedGatewayID?.isEmpty == false ? normalizedGatewayID : nil
+```
 
 `outboxRequiresSessionRoutingContract` returns `true` unconditionally, meaning every outbox lease requires the gateway to support `chatSendRoutingContract`. (`IOSGatewayChatTransport.swift:15-17`)
 
@@ -28,6 +36,24 @@ File: `Sources/Chat/IOSGatewayChatTransport.swift`
 | `compactionRequestTimeoutSeconds` | `0` | Zero = no timeout on `sessions.compact`. |
 | Logger subsystem | `ai.openclawfoundation.app` | OSLog subsystem for this transport. |
 | Logger category | `ios.chat.transport` | OSLog category. |
+
+### 1.2.1 Outbox Route Lease (`acquireOutboxRouteLease`)
+
+The durable outbox needs a stable, capability-confirmed route before it can replay queued commands. `acquireOutboxRouteLease()` (`IOSGatewayChatTransport.swift:154-188`) returns an `OpenClawChatTransportRouteLeaseResult`:
+
+1. Require a non-nil `outboxGatewayID` and resolve the current route via `gateway.currentRoute(ifGatewayID:)`. If either is missing → `.unavailable(reason: nil)`.
+2. Query `gateway.supportsServerCapability(.chatSendRoutingContract, ifCurrentRoute: route)`. If the capability probe itself fails (nil) → `.unavailable(reason: nil)`; if the gateway does not support the contract → `.unavailable(reason: OpenClawChatTransportUpgradeMessage.routingContract)` (prompts an upgrade).
+3. Acquire the session routing contract string via `sessionRoutingContract(ifCurrentRoute:)` (see below). On failure → `.unavailable(reason: nil)`.
+4. On success → `.available(OpenClawChatTransportRouteLease(...))`. The lease captures the route and contract and exposes three closures bound to that exact route: `sendTargetedMessage`, `requestTargetedHistory`, and the raw `sessionRoutingContract`. The send closure calls `sendMessage(..., ifCurrentRoute: route, distinguishPreDispatchRouteChange: true)` so a route change before dispatch surfaces as `notDispatched`.
+
+#### `agents.list` (routing-contract acquisition)
+
+Method: `agents.list`
+Timeout: 15 s
+Params: `"{}"` (literal empty object)
+Route-pinned: called with `ifCurrentRoute: route`.
+
+`sessionRoutingContract(ifCurrentRoute:)` (`IOSGatewayChatTransport.swift:190-209`) issues this RPC solely to build the routing contract. The response decodes to `AgentsListResult` (fields `scope`, `mainkey`, `defaultid`), then `OpenClawChatSessionRoutingContract.make(scope:mainKey:defaultAgentID:)` produces the contract string. A nil result throws `CancellationError`. This RPC is used only by the outbox lease path; ordinary live chat does not call it.
 
 ### 1.3 Session RPCs
 
@@ -106,15 +132,19 @@ Method: `sessions.compact`
 Timeout: `compactionRequestTimeoutSeconds` = 0 (no timeout)  
 Params: `{ key, agentId? }` via `SessionKeyParams`. Callers use a 60 s cooldown guard on the UI side.
 
+After the request returns, the transport calls `OpenClawSessionsCompactResponse.requireSuccess(from: response)` (`IOSGatewayChatTransport.swift:559-564`), which decodes the response and throws if the gateway did not report success. A failed compaction therefore propagates as a thrown error rather than silently resolving.
+
 #### `sessions.create` (fork path)
 
 Called via `forkSession(parentKey:)`. Uses `ForkSessionParams`:
 
 | Field | Value |
 |---|---|
-| `parentSessionKey` | resolved parent key |
+| `parentSessionKey` | **raw `parentKey` (not run through `sessionTarget`)** |
 | `fork` | `true` (always) |
-| `agentId` | extracted from parent key or `selectedGlobalAgentId` |
+| `agentId` | `Self.agentID(fromSessionKey: parentKey) ?? self.selectedGlobalAgentId(for: parentKey)` |
+
+The `agentId` resolution (`IOSGatewayChatTransport.swift:528-534`) first tries to extract an embedded agent id from the parent key (`agentID(fromSessionKey:)` — see §1.6; returns the segment after `agent:` when the key splits into ≥3 `:`-separated parts with `parts[0] == "agent"`). If the parent key carries no embedded agent, it falls back to `selectedGlobalAgentId(for: parentKey)`, which returns `globalAgentId` **only when the parent key is exactly `"global"`** and `nil` otherwise. Unlike the other session calls, `forkSession` passes the un-resolved `parentKey` directly as `parentSessionKey`.
 
 Returns the new session key from `OpenClawChatCreateSessionResponse.key`.
 
@@ -166,6 +196,14 @@ Method: `chat.abort`
 Timeout: 10 s  
 Best-effort. Errors are silently swallowed.
 
+#### `health`
+
+Method: `health`
+Timeout: `max(1, ceil(timeoutMs / 1000))` seconds (derived from the caller's `timeoutMs`).
+Params: none (`paramsJSON: nil`).
+
+`requestHealth(timeoutMs:)` (`IOSGatewayChatTransport.swift:772-776`) issues the `health` RPC and decodes `OpenClawGatewayHealthOK`, returning its `ok` flag. **If decoding fails, it defaults to `true`** (`(try? ...)?.ok ?? true`) — an undecodable-but-returned response is treated as healthy. The view model's health polling (`pollHealthIfNeeded`, driven by `tick` events and forced during bootstrap) calls this RPC.
+
 ### 1.5 Agent Wait RPC
 
 Method: `agent.wait`  
@@ -179,18 +217,26 @@ Returns `AgentWaitCompletion`. Terminal statuses: `"ok"`, `"completed"`, `"succe
 
 `sessionTarget(for:selectedAgentID:overrideAgentID:)` is the canonical key resolver.
 
-| Input pattern | Output `sessionKey` | Output `agentID` |
-|---|---|---|
-| `"agent:<agent>:<key>"` (already canonical) | unchanged | `overrideAgentID` only |
-| `"agent:..."` prefix but no embedded agent segment | unchanged | `nil` |
-| `"unknown"` | unchanged | `nil` |
-| `"global"` | `"global"` | `override ?? selected` |
-| Any other alias when `targetAgentID` is known | `"agent:<targetAgentID>:<key>"` | `nil` |
-| Any other alias when no agent known | unchanged | `nil` |
+The key, `selectedAgentID`, and `overrideAgentID` are each trimmed; `selectedAgentID` and `overrideAgentID` are also lowercased. The resolver checks the following branches **in order** (first match wins):
+
+| # | Input pattern (checked in order) | Output `sessionKey` | Output `agentID` |
+|---|---|---|---|
+| 1 | `agentID(fromSessionKey:) != nil` — i.e. key splits into ≥3 `:`-parts with `parts[0] == "agent"` and a non-empty `parts[1]` (already canonical) | unchanged | `override` only (ignores `selected`; nil when no override) |
+| 2 | key (lowercased) `hasPrefix("agent:")` but **no** parseable embedded agent segment | unchanged | `nil` |
+| 3 | key (lowercased) `== "unknown"` | unchanged | `nil` |
+| 4 | key (lowercased) `== "global"` | `"global"` | `targetAgentID` = `override ?? (non-empty selected)` |
+| 5 | any other alias and `targetAgentID` is known | `"agent:<targetAgentID>:<key>"` | `nil` (now embedded in key) |
+| 6 | any other alias and `targetAgentID` is nil | unchanged | `nil` |
 
 (`IOSGatewayChatTransport.swift:410-435`)
 
-When the resolved `sessionKey` is exactly `"global"`, `selectedGlobalAgentId(for:)` also injects `globalAgentId` as the `agentId` for patch/delete calls.
+The distinction between rows 1 and 2 matters for `overrideAgentID` injection: a canonical key that already embeds an agent still accepts an `overrideAgentID` as its `agentID` output, whereas a bare `agent:`-prefixed key with no parseable segment never emits an `agentID`.
+
+`agentID(fromSessionKey:)` (`IOSGatewayChatTransport.swift:300-307`): splits the trimmed key on `:` **without** omitting empty subsequences, requires `parts.count >= 3` and `parts[0].lowercased() == "agent"`, then returns trimmed `parts[1]` (or `nil` if empty).
+
+The instance overload `sessionTarget(for:overrideAgentID:)` passes `globalAgentId` as `selectedAgentID`.
+
+When the resolved `sessionKey` is exactly `"global"`, `selectedGlobalAgentId(for:)` injects `globalAgentId` as the `agentId` for patch/delete calls; for every other key it returns `nil`.
 
 ### 1.7 Event Subscription
 
@@ -208,14 +254,30 @@ When the resolved `sessionKey` is exactly `"global"`, `selectedGlobalAgentId(for
 
 (`IOSGatewayChatTransport.swift:798-840`)
 
+Decode rules per case: `health`, `chat`, `session.message`, and `agent` all drop the frame (`nil`) when `evt.payload` is missing. For `chat`/`session.message`/`agent`, a payload that fails to decode to the typed struct also drops the frame. For `health`, a present-but-undecodable payload yields `.health(ok: true)` (the `ok` flag defaults to `true` when decoding fails).
+
 ### 1.8 Model and Command Catalog RPCs
 
 | Method | Timeout | Notes |
 |---|---|---|
-| `models.list` | 15 s | No params. Returns `ModelsListResponse.models` decoded to `[OpenClawChatModelChoice]`. Empty names fall back to `model.id`. |
-| `commands.list` | 15 s | `{ scope: "text", includeArgs: true, agentId? }`. `agentId` is extracted from `sessionKey` or falls back to `globalAgentId`. |
+| `models.list` | 15 s | Params `nil` (none sent). Returns `ModelsListResponse.models` decoded to `[OpenClawChatModelChoice]`. |
+| `commands.list` | 15 s | `{ scope: "text", includeArgs: true, agentId? }`. See agent-id extraction below. |
 
-Command source mapping from the `"source"` field: `"native"` → `.command`, `"skill"` → `.skill`, `"plugin"` → `.plugin`, anything else → `.unknown`. (`IOSGatewayChatTransport.swift:706-712`)
+**`models.list` name handling** (`IOSGatewayChatTransport.swift:318-329`): each model's `name` is trimmed. If the **trimmed** name is empty, the choice's `name` becomes `model.id`; otherwise the choice uses the **original un-trimmed** `model.name` (not the trimmed copy). A rebuilder must preserve the original name's surrounding whitespace when non-empty. Other mapped fields: `modelID` ← `model.id`, `provider`, `contextWindow`, `reasoning`.
+
+**`commands.list` agent-id extraction** (`IOSGatewayChatTransport.swift:290-298, 591-594`): the `agentId` param is `agentID(fromSessionKey: sessionKey) ?? globalAgentId`. That is, if the session key is canonical (`parts.count >= 3`, `parts[0] == "agent"`), `parts[1]` is used; otherwise it falls back to `globalAgentId`.
+
+**Command choice mapping** (`mapCommandChoice`, `IOSGatewayChatTransport.swift:703-732`):
+
+- Source: the `"source"` field is trimmed+lowercased, then `"native"` → `.command`, `"skill"` → `.skill`, `"plugin"` → `.plugin`, anything else → `.unknown`.
+- `textAliases`: each entry trimmed; empty entries dropped.
+- `id`: a compound string built as `[source.rawValue, trimmedName, aliases.first ?? ""].joined(separator: ":")`. This non-obvious composite id must be reproduced exactly, since it is the `Identifiable` id for the slash-command catalog.
+- `name` ← `entry.name` (un-trimmed), `description` ← `entry.description`, `acceptsArgs` ← `entry.acceptsargs`.
+
+`OpenClawChatCommandChoice` exposes two computed properties that govern how a picked command is inserted into the composer (`ChatModels.swift:53-60`):
+
+- `preferredInvocation`: the first `textAlias` whose trimmed value starts with `/`, falling back to `"/\(name)"` when no alias qualifies.
+- `displayInvocation`: `preferredInvocation` trimmed of surrounding whitespace.
 
 ---
 
@@ -232,7 +294,7 @@ File: `apps/shared/OpenClawKit/Sources/OpenClawChatUI/ChatViewModel.swift` (and 
 | `messages` | `internal(set)` | Ordered `[OpenClawChatMessage]` — the live transcript. Mutated only through `replaceMessages(_:)`. |
 | `input` | `public var` | Composer text. Cleared immediately on send before any network await. |
 | `thinkingLevel` | `private(set)` | Current thinking level string. `"off"` when no gateway metadata forces otherwise. |
-| `thinkingLevelOptions` | `internal(set)` | Array of `OpenClawChatThinkingLevelOption` for the picker. Base set: `["off","minimal","low","medium","high"]`. |
+| `thinkingLevelOptions` | `internal(set)` | Array of `OpenClawChatThinkingLevelOption` for the picker. Each option has both `id` and `label`. The base set `baseThinkingLevelOptions` (`ChatViewModel.swift:564-570`) is five options whose `label` equals its `id`: `(id:"off",label:"off")`, `(id:"minimal",label:"minimal")`, `(id:"low",label:"low")`, `(id:"medium",label:"medium")`, `(id:"high",label:"high")`. |
 | `showsThinkingPicker` | `internal(set)` | Whether the picker is visible; `false` when gateway metadata allows only `"off"` or the model reports `reasoning: false`. |
 | `modelSelectionID` | `private(set)` | Provider-qualified model ID or `"__default__"`. |
 | `modelChoices` | `private(set)` | `[OpenClawChatModelChoice]` from `models.list`. |
@@ -269,10 +331,17 @@ Every switch to a new session increments `sessionGeneration: UInt64`. Every asyn
 
 1. `sessionKey == snapshot.key`
 2. `sessionGeneration == snapshot.generation`
-3. If `usesMutableAgentRouting`: `activeAgentId == snapshot.agentID`
-4. If `usesMutableContractRouting`: `sessionRoutingContract == snapshot.sessionRoutingContract`
+3. `!usesMutableAgentRouting || activeAgentId == snapshot.agentID`
+4. `!contractSensitive || sessionRoutingContract == snapshot.sessionRoutingContract`
 
-This prevents stale network responses from overwriting a session the user has already navigated away from.
+Condition 4's `contractSensitive` flag is computed **bidirectionally** (`ChatViewModel.swift:673-680`): it is true when `usesMutableContractRouting` holds for **either** the snapshot's contract **or** the current contract:
+
+```swift
+let contractSensitive = self.usesMutableContractRouting(for: snapshot.sessionRoutingContract) ||
+    self.usesMutableContractRouting(for: self.sessionRoutingContract)
+```
+
+So the contract equality check engages whenever either side uses mutable contract routing, not only when the snapshot does. This prevents stale network responses from overwriting a session the user has already navigated away from.
 
 `SessionSnapshot` (inner struct in `ChatViewModel+TranscriptCache.swift:8-14`):
 ```swift
@@ -343,9 +412,19 @@ Key fields relevant to behavior:
 | `contextTokens` | `Int?` | Token budget; denominator for usage fraction. |
 | `totalTokensFresh` | `Bool?` | When `false`, usage fraction is not computed (stale data). |
 
-Session list ordering (`OpenClawChatSessionListOrganizer.organize`): `pinnedAt desc → updatedAt desc → key asc`. When `pinnedAt` is nil and `isPinned` is true, `pinnedAt` is treated as `Double.greatestFiniteMagnitude`.
+Additional decoded fields on `OpenClawChatSessionEntry` (`ChatSessions.swift:82-201`), several of which affect sort/display/filter logic: `kind`, `category`, `archived`, `archivedAt`, `unread`, `surface`, `subject`, `room`, `space`, `lastReadAt`, `lastActivityAt`, `sessionId`, `systemSent`, `abortedLastRun`, `verboseLevel`, `inputTokens`, `outputTokens`, `thinkingOptions` (`[String]?`), `thinkingDefault`. Convenience computed flags: `isPinned` = `pinned == true`, `isArchived` = `archived == true`, `id` = `key`.
+
+Session list ordering (`OpenClawChatSessionListOrganizer.organize`, `ChatSessions.swift:207-221`): sort by `pinnedAt desc → updatedAt desc → key asc`. The effective pinned sort value is `pinnedAt ?? (isPinned ? .greatestFiniteMagnitude : 0)`:
+
+- `pinnedAt` present → used as-is.
+- `pinnedAt` nil **and** `isPinned == true` → `Double.greatestFiniteMagnitude` (floats to top).
+- `pinnedAt` nil **and** `isPinned == false` → `0`, so an unpinned session with no `pinnedAt` sorts normally by `updatedAt` (nil `updatedAt` → `0`), then `key` ascending.
+
+`OpenClawChatSessionListOrganizer.filter(_:search:)` (`ChatSessions.swift:225-239`) is the **offline fallback** for the server-side `sessions.list` search, used only when the gateway is unreachable. The query is trimmed+lowercased; an empty query returns the input unchanged. A session matches if any of `displayName`, `label`, `subject`, `sessionId`, or `key` (lowercased) **contains** the query substring.
 
 `resolvedMainSessionKey` reads `sessionDefaults?.mainSessionKey`, trimmed; falls back to `"main"` if nil or empty.
+
+`OpenClawChatSessionsListResponse` (`ChatSessions.swift:242-262`) decodes `ts` (`Double?`), `path` (`String?`), `count` (`Int?`), `defaults` (`OpenClawChatSessionsDefaults?`), and `sessions` (`[OpenClawChatSessionEntry]`).
 
 ### 2.6 Main Session Aliasing
 
@@ -377,9 +456,11 @@ File: `apps/shared/OpenClawKit/Sources/OpenClawChatUI/ChatModels.swift:190`
 | `errorMessage` | `errorMessage` | Non-nil only when `stopReason == "error"`. |
 | `toolCallId` | `toolCallId` or `tool_call_id` | Both forms decoded. |
 | `toolName` | `toolName` or `tool_name` | Both forms decoded. |
-| `usage` | `usage` | `OpenClawChatUsage` with `input`, `output`, `cacheRead`, `cacheWrite`, `cost`, `total` (also reads `totalTokens`). |
+| `usage` | `usage` | `OpenClawChatUsage` — see nested-struct note below. |
 
-Audio attachments: when `MediaPaths`/`MediaPath` and `MediaTypes`/`MediaType` fields are present, audio-type MIME entries are appended as `type: "file"` content items unless the `content` array already contains audio items.
+**`OpenClawChatUsage`** (`ChatModels.swift:63-110`) has token counts as `Int?`: `input`, `output`, `cacheRead`, `cacheWrite`, and `total`. `total` is decoded from the `total` key, falling back to `totalTokens` when `total` is absent. `cost` is **not a scalar** — it is a nested `OpenClawChatUsageCost` struct whose five fields (`input`, `output`, `cacheRead`, `cacheWrite`, `total`) are all `Double?`. A rebuilder must model cost as a nested object, not a number. On encode, `OpenClawChatUsage` writes `total` under the `total` key only (never `totalTokens`).
+
+Audio attachments (`ChatModels.swift:320-353`): the message decoder reads `MediaPaths`/`MediaPath` (array or single, into a `[String]`) and `MediaTypes`/`MediaType` (likewise). For each index where the paired media type is an `audio/*` MIME, it appends a content item of `type: "file"`, `mimeType:` the trimmed MIME, and **`fileName:` derived from `(mediaPath as NSString).lastPathComponent`** — the last path component of the media path. This appending is skipped entirely when the decoded `content` array already contains any `audio/*` item (`alreadyContainsAudio`).
 
 ---
 
@@ -406,13 +487,25 @@ Priority order for message deduplication and reconciliation:
 
 1. **`serverMessageId`** — uniquely identifies a persisted gateway row; preferred above all. Key format: `"<role>|serverid|<serverMessageId>"`.
 2. **`idempotencyKey`** — the client's run UUID (user turns) or gateway-stamped assistant key. Key format: `"<role>|idempotency|<key>"`.
-3. **Timestamp + content fingerprint + tool fields** — last resort for rows with neither. Key format: `"<role>|<timestamp>|<toolCallId>|<toolName>|<contentFingerprint>"`. A message with all empty fields returns `nil` (never deduped).
+3. **Timestamp + content fingerprint + tool fields** — last resort for rows with neither (`ChatViewModel+HistoryReconciliation.swift:141-152`). Key format: `"<role>|<timestamp>|<toolCallId>|<toolName>|<contentFingerprint>"`. The `role` is first trimmed+lowercased; a message whose trimmed role is empty returns `nil` up front. The `timestamp` segment is formatted `String(format: "%.3f", value)` **only when the timestamp is non-nil and finite**, otherwise the empty string. `toolCallId` and `toolName` are trimmed. The key returns `nil` **only when `timestamp`, `contentFingerprint`, `toolCallId`, and `toolName` are all empty simultaneously** — a present content fingerprint (or tool field) alone is enough to produce a key even with no timestamp.
 
-Content fingerprint joins `type`, `text`, `id`, `name`, `fileName` with unit separator `\u{001F}` for each content item, joined by record separator `\u{001E}`.
+Content fingerprint (`messageContentFingerprint`): for each content item joins `type`, `text`, `id`, `name`, `fileName` with unit separator `\u{001F}`, and joins items with record separator `\u{001E}`.
+
+Two related helper keys:
+- `userRefreshIdentityKey` (`:155-166`): user rows only; `"<role>|<toolCallId>|<toolName>|<contentFingerprint>"` (no timestamp); `nil` when fingerprint and both tool fields are empty.
+- `finalMessageReconciliationKey` (`:168-182`): assistant rows only; same shape as `userRefreshIdentityKey` but uses `finalMessageContentFingerprint`; `nil` when fingerprint and both tool fields are empty.
 
 ### 4.3 Reply Dedupe (`dedupeMessages` / `dedupeKey`)
 
-`dedupeKey` follows the same priority: `serverMessageId` → `idempotencyKey` → `timestamp + text`. Rows with no computable key pass through unconditionally. The first occurrence of a key in the array wins; later duplicates are dropped. (`ChatViewModel+HistoryReconciliation.swift:748-783`)
+`dedupeKey` (`ChatViewModel+HistoryReconciliation.swift:768-783`) follows the same priority but its fallback differs from `messageIdentityKey`:
+
+1. `serverMessageId` → `"<role>|serverid|<serverMessageId>"` (role here is the raw, un-normalized `message.role`).
+2. `idempotencyKey` → `"<role>|idempotency|<idempotencyKey>"`.
+3. Fallback → `"<role>|<timestamp>|<text>"`, where `text` is the message's content items' `text` values joined by newline (`\n`) then trimmed. This fallback is **plain role + timestamp + joined text** — it does **not** include `toolCallId`, `toolName`, or a content fingerprint.
+
+The fallback returns `nil` (row passes through, never deduped) in two cases: **(a) `timestamp` is nil** — a nil timestamp alone forces pass-through even when text is present; or **(b)** the trimmed joined `text` is empty. `serverMessageId` and `idempotencyKey` are normalized (trimmed, nil-if-empty) before use.
+
+The first occurrence of a key in the array wins; later duplicates are dropped. Rows that resolve to no key are appended unchanged.
 
 ### 4.4 ID Reconciliation (`reconcileMessageIDs`)
 
@@ -424,20 +517,29 @@ Audio attachment `durationSeconds` is preserved from the local row if the canoni
 
 ### 4.5 Run-Refresh Reconciliation (`reconcileRunRefreshMessages`)
 
-Used when `preservingOptimisticLocalMessages: true` — i.e., all post-send history refreshes where the user echo must survive until canonical history confirms it.
+Used when `preservingOptimisticLocalMessages: true` — i.e., all post-send history refreshes where the user echo must survive until canonical history confirms it. Signature: `reconcileRunRefreshMessages(previous:incoming:pendingLocalUserEchoIDs:)` (`ChatViewModel+HistoryReconciliation.swift:651-746`). Edge cases: empty `previous` → return `incoming`; empty `incoming` → return `previous`.
 
-1. Applies `reconcileMessageIDs` first.
-2. Builds counts of user-refresh identity keys in the incoming list.
-3. Pending local user echo rows whose idempotency key appears in incoming are removed (adopted). Ambiguous ones (no metadata) that are not in the incoming and trail the last canonical row are preserved. (`ChatViewModel+HistoryReconciliation.swift:651-746`)
+The algorithm counts how many of each user-turn identity the incoming set can "explain" and only preserves trailing/pending local rows beyond that count, so repeated identical-text sends do not consume a single canonical row twice:
+
+1. Run `reconcileMessageIDs(previous:incoming:)` → `reconciled`.
+2. Build `incomingIdempotencyKeys` (set), `incomingIdentityKeys` (set of `messageIdentityKey`), and `remainingIncomingUserRefreshCounts` = per-`userRefreshIdentityKey` occurrence counts over `reconciled`.
+3. **Canonical rows claim their count first.** For each `previous` message that has an identity key present in `incomingIdentityKeys` and a `userRefreshIdentityKey` with remaining count > 0, decrement that count. This ensures exact history rows own their incoming user count before any local-echo matching.
+4. **Pending local echoes** (`previous` user rows whose `id` ∈ `pendingLocalUserEchoIDs`): if the row's idempotency key is **not** in `incomingIdempotencyKeys`, keep it (ambiguous/uncorrelated → never lose a turn). If it **is** matched, it is considered adopted (dropped); and if it also has a `userRefreshIdentityKey` with remaining count > 0, decrement that count.
+5. **Trailing local users**: find the index of the last `previous` row whose identity key ∈ `incomingIdentityKeys` (`lastCanonicalPreviousIndex`); candidates are the `previous` rows **after** that index. Among those, keep a user row only when: it is not a pending-echo id (those handled in step 4); and either it has no identity key, or its identity key is absent from the incoming set, or (if it has a `userRefreshIdentityKey`) the remaining count is 0 — otherwise it is explained by the incoming and dropped (decrementing the count when consumed).
+6. `optimisticUserMessages` = pending-local survivors ++ trailing-local survivors. If empty, return `reconciled`.
+7. Re-insert each surviving optimistic user row into `reconciled` by timestamp: insert before the first existing row whose timestamp is strictly greater, else append. Rows with no timestamp are appended.
+8. Return `dedupeMessages(reconciled)`.
 
 ### 4.6 Provisional Final Messages
 
 When `chat.final` arrives from the gateway, the view model appends a "provisional final" assistant bubble (the optimistic streamed text made permanent) and stores metadata in `provisionalFinalMessagesByID`. Later, when the canonical `session.message` arrives (which may carry different text, a different timestamp, or no idempotency key), `adoptProvisionalFinalMessage` correlates it to the provisional row by:
 
-1. Run-identity key set (`runId` and `"<runId>:assistant"` both match).
-2. Fallback: `finalMessageReconciliationKey` (content fingerprint, tool fields) within the same user-turn boundary.
+1. Run-identity key set: the provisional row stores the bare `runId`, while the canonical `session.message` arrives keyed `"<runId>:assistant"`; the match uses `assistantRunIdentityKeys(for: provisionalRunId)` = `{runId, "<runId>:assistant"}` and checks membership of the incoming's normalized idempotency key (not raw equality).
+2. Fallback: `provisional.reconciliationKey == finalMessageReconciliationKey(incoming)` **and** `isSameUserTurnBoundary(provisional.scope.latestUserTurn, currentRunMessageScope().latestUserTurn)`.
 
-The canonical row's content replaces the provisional row's content while the original `UUID` is preserved (no layout jump). The provisional marker is then removed from `provisionalFinalMessagesByID`. (`ChatViewModel+HistoryReconciliation.swift:581-619`)
+The match scans `messages.indices` from the **last** index backward for a row that both carries a `provisionalFinalMessagesByID` entry and satisfies (1) or (2). The guard requires that the incoming has at least one of a normalized idempotency key or a reconciliation key.
+
+**Positioning (important):** on match, the provisional row is **removed from its current position and the adopted canonical row is appended at the end** of the array (`updated.remove(at:)` then `updated.append(adoptingCanonicalMessage(incoming, over: existing))`) — it does **not** replace in place. The adopted row keeps the provisional row's `UUID` (via `adoptingCanonicalMessage`, which also takes `serverMessageId`/`serverSeq`/content/etc. from the canonical incoming), so SwiftUI identity is stable, but its ordinal moves to the tail. The durable `session.message` arrives at its true transcript position and the subsequent `replaceMessages` → `orderedBySequence` re-sorts by `serverSeq`, so the final on-screen order is corrected; the append honors the case where a steering row was delivered after `chat.final`. The provisional marker is removed from `provisionalFinalMessagesByID`, the run's entry in `runMessageScopesByRunID` is dropped, then `replaceMessages(dedupeMessages(updated))`, `pruneProvisionalFinalMessages()`, and `pruneRunMessageScopes()` run. (`ChatViewModel+HistoryReconciliation.swift:581-619`)
 
 **Why this is necessary:** `chat.final` and `session.message` represent the same row but may serialize it differently (different timestamps, different content id fields). Without the provisional final correlation, the UI would show two bubbles for one reply.
 
@@ -449,6 +551,14 @@ When a `session.message` event arrives carrying an assistant message with a `ser
 - `runsAnsweredViaLiveStream` — retained for the life of the session so both `chat.final` and agent-terminal lifecycle handlers can skip their post-run history refetch (avoiding a redundant full transcript replacement). (`ChatViewModel.swift:2233-2239`)
 
 Runs absent from `runsAnsweredViaLiveStream` still trigger a refetch, preserving the fallback for silent gateways.
+
+### 4.8 Run-Scope Bounded Cleanup (`pruneRunMessageScopes`)
+
+`pruneRunMessageScopes` (`ChatViewModel+HistoryReconciliation.swift:473-488`) bounds two per-run maps:
+
+1. First, `runMessageScopesByRunID` is filtered to entries whose `session` snapshot still passes `isCurrentSession` (stale-session scopes are always dropped).
+2. If `runMessageScopesByRunID` still exceeds **64** entries, it is further filtered to only entries referenced by a current need — `pendingRuns` ∪ the `runId`s of live `provisionalFinalMessagesByID` values.
+3. If `runsAnsweredViaLiveStream` exceeds **64** entries, it is replaced by its intersection with `pendingRuns` (completion handlers read it synchronously before this prune, so dropping already-retired runs once the set grows large is safe).
 
 ---
 
@@ -471,7 +581,9 @@ File: `apps/shared/OpenClawKit/Sources/OpenClawChatUI/ChatViewModel+PendingRunTi
 
 ### 5.2 Send Flow
 
-1. Gate: `!isSubmittingDraft && !isSending && pendingRuns.isEmpty && hasDraftToSend`.
+1. Gate: `canSend` = `!isSubmittingDraft && !isSending && pendingRunCount == 0 && hasDraftToSend` (`ChatViewModel.swift:593-604`). Note it checks `pendingRunCount == 0`, not `pendingRuns.isEmpty` directly.
+   - `hasDraftToSend` = `(!input.trimmed.isEmpty) || (!attachments.isEmpty)` — a whitespace-only draft with no attachments cannot be sent.
+   - A sibling predicate `canSendDraft` = `!isSubmittingDraft && !isSending && hasDraftToSend` omits the `pendingRunCount == 0` check; it gates draft submission paths that are allowed while a run is still pending.
 2. Set `isSubmittingDraft = true` (gate against duplicate enqueues during slash catalog lookup).
 3. Handle local slash commands (`/new`, `/reset`, `/clear`, `/compact`) before network.
 4. Validate slash command draft (blocks commands with attachments).

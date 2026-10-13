@@ -41,7 +41,18 @@ All three screens inject their header as `.safeAreaInset(edge: .top, spacing: 0)
 | `padding(.top, …)` | `8 pt` |
 | `padding(.bottom, …)` | `27 pt` (Files, Skills); `14 pt` (Canvas archive) |
 
-Header title: `.system(size: 20, weight: .medium)`, `.foregroundStyle(Color.primary)`, centered in a `ZStack`, `lineLimit(1)`.
+Header title: `.system(size: 20, weight: .medium)`, `.foregroundStyle(Color.primary)`, centered in a `ZStack`.
+
+Title width/line clamping differs by screen:
+
+| Screen | `lineLimit` | `frame(maxWidth:)` | Cite |
+|--------|-------------|--------------------|------|
+| Files (`FilesGridScreen`) | `lineLimit(1)` | `200 pt` | `Sources/Design/FilesGridScreen.swift:64-65` |
+| Skills (`SkillsScreen`) | none | none | `Sources/Design/SkillsScreen.swift:66-67` |
+| Canvas archive / viewer (`CanvasPanelHeader`) | `lineLimit(1)` | `240 pt` | `Sources/Design/CanvasArtifacts.swift` (§5.9) |
+| Skill detail (`SkillPanelSheet`) | — | `188 pt` | §4.9 |
+
+The `frame(maxWidth: 200)` on the Files title keeps a long folder name from overlapping the leading/trailing nav buttons. The `SkillsScreen` title is the fixed string `"Skills"`, so it carries neither constraint.
 
 ### 1.4 Card Fill (tiles and info cards)
 
@@ -95,7 +106,7 @@ Sources/Design/FilesGridScreen.swift:29-49.
 
 ### 2.4 Tile (`tile(_:)`) Anatomy
 
-Each tile is a `Button` with `.buttonStyle(.plain)` and a `VStack(alignment: .leading, spacing: 10)`.
+Each tile is a `Button` with `.buttonStyle(.plain)` and a `VStack(alignment: .leading, spacing: 10)`. The VStack label carries `.contentShape(Rectangle())` so the whole tile footprint — including the gap between the icon well and the label block — is tappable, not just the drawn glyph/text (Sources/Design/FilesGridScreen.swift:165).
 
 **Icon well** (Sources/Design/FilesGridScreen.swift:131-149):
 
@@ -186,12 +197,12 @@ ZStack
     └── AgentWorkspaceDirectoryList(agentId:, path: "")
 ```
 
-`AgentWorkspaceDirectoryList` renders a `List` (`.insetGrouped`, `.scrollContentBackground(.hidden)`) with `NavigationLink` rows. Each row has:
-- An `Image(systemName:)` icon: `"folder"` (accent color) for directories, `"doc.text"` (secondary) for files.
-- `Text(entry.name)` at `OpenClawType.subhead`, primary.
-- An optional detail line (`OpenClawType.caption`, secondary) composed of formatted byte count and relative date, joined with ` • `.
+`AgentWorkspaceDirectoryList` renders a `List` (`.insetGrouped`, `.scrollContentBackground(.hidden)`) with `NavigationLink` rows. Each row is an `HStack(spacing: 12)` (Sources/Design/AgentWorkspaceFilesScreen.swift:108-125):
+- An `Image(systemName:)` icon: `"folder"` (`OpenClawBrand.accent`) for directories, `"doc.text"` (`Color.secondary`) for files, sized `.font(OpenClawType.subhead)` and clamped to `.frame(width: 24)` so the following `VStack` aligns regardless of glyph width.
+- `Text(entry.name)` at `OpenClawType.subhead`, primary, `lineLimit(1)`.
+- An optional detail line (`OpenClawType.caption`, secondary, `lineLimit(1)`) composed of formatted byte count and relative date, joined with ` • `.
 
-Pull-to-refresh calls `reload()`; "Load More" row appears when `entries.count < totalEntries`. Load More shows a `ProgressView` while `loadingMore` is true, or `"\(entries.count) of \(totalEntries)"` when idle.
+Pull-to-refresh calls `reload()`; the "Load More" row appears when `entries.count < totalEntries`. It is a `Button` whose `HStack` holds `Text("Load More")` (`OpenClawType.subheadMedium`), a `Spacer`, and either a `ProgressView` while `loadingMore` is true or `Text("\(entries.count) of \(totalEntries)")` (`OpenClawType.caption`, secondary) when idle. The whole row carries `.disabled(self.loadingMore)`, which blocks a second tap while a page fetch is in flight so load calls do not stack (Sources/Design/AgentWorkspaceFilesScreen.swift:129-147).
 
 Directory taps push another `AgentWorkspaceDirectoryList`. File taps push `AgentWorkspaceFilePreview`, which shows images (base64 + `image/*` MIME) as a zoomable `ScrollView` or text as `ChatCodeHighlightCache.highlighted(code:languageId:)` at `OpenClawType.monoSmall`. A toolbar share button writes a unique temp copy and presents `ChatTranscriptShareSheet`.
 
@@ -244,11 +255,13 @@ Each row is a horizontal `HStack(spacing: 14)` (Sources/Design/SkillsScreen.swif
 
 **Left: tappable area** (opens detail sheet):
 - `HStack(spacing: 14)`: icon tile + label block.
-- Wrapped in a `Button` with `.buttonStyle(.plain)`.
+- Wrapped in a `Button` with `.buttonStyle(.plain)`. The button label carries `.contentShape(Rectangle())` so empty space between the icon tile and the label block (and the trailing padding before the toggle) still fires the open action (Sources/Design/SkillsScreen.swift:133).
 
 **Label block** (`VStack(alignment: .leading, spacing: 2)`):
 - Name: `HStack(spacing: 2)` — `Text(name)` at `.system(size: 17)`, `Color.primary`, `lineLimit(1)` + `Image("SettingsChevronRightGlyph")` at `16 × 16 pt`, `Color.primary.opacity(0.6)`.
 - Description: `.system(size: 13)`, `Color.primary.opacity(0.6)`, `lineLimit(1)`.
+
+**Spacer**: a `Spacer(minLength: 0)` sits between the tappable button and the toggle, pushing the toggle to the trailing edge of the row (Sources/Design/SkillsScreen.swift:137).
 
 **Right: toggle** (only when `hasAdminScope == true`):
 - `Toggle("", isOn: …)`, `.labelsHidden()`, `.tint(Color(red: 52/255, green: 199/255, blue: 89/255))`.
@@ -349,6 +362,8 @@ Spacing above: `padding(.top, 16)`.
 Error text (if `installError != nil` and not installing): `.system(size: 14)`, `Color(red: 211/255, green: 21/255, blue: 21/255)`, centered, `padding(.top, 10)`.
 
 Install RPC: `skills.install { name, installId, timeoutMs: 120_000 }`, timeout `125 s`. On success, reloads; on failure, sets `installError` via `AgentProTab.skillMutationMessage(error)`.
+
+**Trailing spacer**: the scroll content column ends with `Spacer(minLength: 40)` after the install-button / error block, so the last card is not obscured by the sheet's home indicator (Sources/Design/SkillsScreen.swift:407).
 
 ---
 
@@ -451,6 +466,8 @@ The drawer's Canvas tab. Sources/Design/CanvasArtifacts.swift:262-357.
 
 **Entry point**: `ChatDrawerDestination.canvas` routes here via `drawerDestinationScreen` in `RootTabs`. The `onClose` callback re-opens the drawer with a spring animation (`duration: 0.35`). The screen draws its own header (the shared `DrawerCloseButton` overlay is suppressed).
 
+**Observation wiring**: the screen holds the shared index as `@State private var index = CanvasEmbedIndex.shared` (Sources/Design/CanvasArtifacts.swift:266). Wrapping the `@Observable` singleton in `@State` is what registers this view as an observer; when `ChatRootSurface` mutates `CanvasEmbedIndex.shared.embeds`, the `results` computed property re-reads `self.index.embeds` and the archive re-renders live. Reading `CanvasEmbedIndex.shared.embeds` directly (without the `@State` wrapper) would not establish the dependency.
+
 **Header** (`CanvasPanelHeader`): title `"Canvas"`, `leadingGlyph: "ChatBackGlyph"`. Padding: `padding(.top, 8)`, `padding(.bottom, 14)` on the outer safeAreaInset.
 
 **Search bar** (identical pattern to SkillsScreen):
@@ -480,7 +497,10 @@ Button(.plain)
         ├── Text(embed.title) — .system(size: 17, weight: .medium), Color.primary, lineLimit(1)
         └── Text("Canvas") — .system(size: 13), Color.primary.opacity(0.6)
     Spacer(minLength: 0)
+    .contentShape(Rectangle())   ← on the HStack label; makes the full row width tappable
 ```
+
+The button label carries `.contentShape(Rectangle())`, so tapping the empty trailing area of the row (past the title block, where the `Spacer` lives) still fires `onOpenEmbed` (Sources/Design/CanvasArtifacts.swift:332).
 
 **Inter-row divider**: a `Rectangle()` with `Color.primary.opacity(0.1)`, height `0.5 pt`, `padding(.leading, 63)`. Shown only between rows (never after the last row): guarded by `if index < rows.count - 1` (Sources/Design/CanvasArtifacts.swift:336-340).
 

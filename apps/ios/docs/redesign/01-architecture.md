@@ -48,6 +48,10 @@ Every downstream view reads `NodeAppModel`, `VoiceWakeManager`, `GatewayConnecti
 
 `applyWindowTint()` calls `window.tintColor = OpenClawBrand.uiAccent` on every connected `UIWindowScene` window. It runs on `.task` (initial layout) and on every `scenePhase` change. `Sources/OpenClawApp.swift:757`
 
+### Dynamic type refresh
+
+`body` attaches `.onReceive(NotificationCenter.default.publisher(for: UIContentSizeCategory.didChangeNotification))` and, on each content-size-category change, calls `OpenClawType.refreshUIKitAppearance(in: Self.connectedWindows())`. This re-applies the branded UIKit appearance so dynamic-type changes propagate to UIKit-rendered chrome, not just SwiftUI. `Sources/OpenClawApp.swift:721-725`
+
 ### Scene phase bridging
 
 `onChange(of: scenePhase)` propagates the new phase to:
@@ -396,6 +400,10 @@ When a canvas row is tapped in `CanvasArchiveScreen`, it sets `selectedCanvasEmb
 
 `Sources/RootTabs.swift:1641`
 
+### Swipe-back row-tap guard — `swipeBackActive`
+
+`PhoneTabSettingsHost` owns a `@State private var swipeBackActive = false` (`Sources/RootTabs.swift:1608`), bound into the `SwipeToGoBack` modifier (`isActive: $swipeBackActive`). While a back-swipe is in flight, route-push callbacks are gated on it so a swipe that passes over a settings row does not also push a new destination: `SettingsRootContainer.onOpenRoute` appends only `if !self.swipeBackActive`, and `VoiceSettingsScreenHost.onOpenWakeWords` appends `.wakeWords` only `if !self.swipeBackActive`. `Sources/RootTabs.swift:1647,1665,1677`
+
 ### `SwipeToGoBack` modifier
 
 Applied to every pushed settings destination. `Sources/RootTabs.swift:1677`
@@ -427,6 +435,28 @@ Applied to every pushed settings destination. `Sources/RootTabs.swift:1677`
 
 `Sources/Design/ChatProTab.swift:35`
 
+### Internal `@State` properties
+
+Beyond `viewModel`/`viewModelOwnerID`, several `@State` properties drive the host's behavior. `Sources/Design/ChatProTab.swift:12-27`
+
+| Property | Type | Role |
+|---|---|---|
+| `viewModel` | `OpenClawChatViewModel?` | The live chat view model (nil until first `syncChatViewModel`) |
+| `viewModelOwnerID` | `String` (`""`) | Cached cache-gateway owner ID; mismatch forces rebuild |
+| `viewModelTransportAgentID` | `String` (`""`) | Cached delivery/transport agent ID; mismatch forces rebuild |
+| `viewModelRoutingContract` | `String` (`""`) | Cached routing contract; mismatch triggers `syncSessionRoutingContract` without rebuild |
+| `viewModelPresentationAgentID` | `String` (`"main"`) | Agent ID frozen during attachment pin; shown in header |
+| `viewModelPresentationAgentName` | `String` (`"Main"`) | Agent display name frozen during attachment pin |
+| `viewModelPresentationAgentBadge` | `String` (`"M"`) | Agent badge frozen during attachment pin |
+| `viewModelHasVerifiedOfflineRoutingIdentity` | `Bool` (`false`) | Snapshot of offline-routing identity used while pinned; gates offline-queue placeholder |
+| `speech` | `OpenClawChatSpeechController?` | TTS controller passed into the chat view |
+| `showsTalkMode` | `Bool` (`false`) | Drives the talk-mode full-screen cover |
+| `didRecoverUndeliverableOutbox` | `Bool` (`false`) | One-shot guard for undeliverable-outbox recovery |
+| `transcriptShareItem` | `TranscriptShareItem?` | Backs the export-transcript share sheet |
+| `showsTranscriptExportError` | `Bool` (`false`) | Shows the transcript export failure alert |
+
+The three "presentation" values and `viewModelHasVerifiedOfflineRoutingIdentity` are captured by `captureCurrentPresentationIdentity()` and only refreshed while the attachment owner is **not** pinned, so the header identity and offline-queue affordance stay frozen during an in-progress voice recording. `Sources/Design/ChatProTab.swift:246-251`
+
 ### NavigationStack ownership
 
 When `ownsNavigationStack == false`, `ChatProTab` renders `content` directly without wrapping it in a `NavigationStack`, and hides the navigation bar with `.toolbar(.hidden, for: .navigationBar)`. This prevents duplicate chrome in the phone layout where `PhoneTabSettingsHost` already provides the stack. `Sources/Design/ChatProTab.swift:51`
@@ -455,13 +485,39 @@ Tapping the talk control inside `ChatRootSurface` sets `showsTalkMode = true`, w
 
 ### View model synchronization (`syncChatViewModel`)
 
-The view model is rebuilt (not just synced) when either:
-1. `chatViewModelOwnerID` changes — the gateway identity changed; the cached transcript belongs to a different gateway.
-2. `transportAgentID` changes — the delivery agent changed.
+`Sources/Design/ChatProTab.swift:204`
 
-It is *not* rebuilt if only the session key changes (`viewModel.syncSession(to:)` is called instead). This avoids tearing down the transport/cache while switching sessions on the same gateway.
+The method reads the current `chatSessionKey`, `chatViewModelOwnerID`, delivery agent ID (lowercased/trimmed into `transportAgentID`), and `chatSessionRoutingContract`, then takes exactly one of three paths:
 
-If `viewModel.isAttachmentOwnerPinned == true` (voice recording in progress), rebuild is deferred until the pin clears. `Sources/Design/ChatProTab.swift:204`
+1. **Rebuild** — when `requiresViewModelRebuild(currentOwnerID:nextOwnerID:currentTransportAgentID:nextTransportAgentID:)` is `true`, i.e. the cached `viewModelOwnerID` **or** `viewModelTransportAgentID` changed (gateway identity changed, so the cached transcript belongs to a different gateway; or the delivery agent changed). On rebuild, it updates all three cached IDs, re-captures the presentation identity, and assigns a fresh `makeChatViewModel(sessionKey:)`. If `viewModel == nil`, this same rebuild path runs to create the first view model. `Sources/Design/ChatProTab.swift:220-235`
+2. **Routing-contract sync (no rebuild)** — when owner and transport agent are unchanged but `viewModelRoutingContract != routingContract`, it updates the cached contract and calls `viewModel.syncSessionRoutingContract(appModel.chatSessionRoutingContract)` without tearing anything down. `Sources/Design/ChatProTab.swift:236-239`
+3. **Session sync** — in all cases that reach the end (and were not an early-returning rebuild), `viewModel.syncSession(to: sessionKey)` is called so only the session key changes while the transport/cache survives. If not attachment-pinned, the presentation identity is re-captured afterward. `Sources/Design/ChatProTab.swift:240-243`
+
+If `viewModel.isAttachmentOwnerPinned == true` (voice recording in progress), the rebuild path early-returns before mutating state — the rebuild is deferred until the pin clears and the pin-change observer replays it. `Sources/Design/ChatProTab.swift:228`
+
+### Header identity badge — `headerIdentityBadge`
+
+`Sources/Design/ChatProTab.swift:193`
+
+A flat circular avatar for the nav bar (no gradient/shadow, per Apple bar-button sizing):
+
+- `Text(agentBadge)` at `OpenClawType.avatar(size: agentBadge.count > 2 ? 12 : 15)` — 12 pt when the badge is longer than two characters, otherwise 15 pt.
+- `.foregroundStyle(.white)`, `.minimumScaleFactor(0.6)`, `.lineLimit(1)`.
+- `.frame(width: 30, height: 30)` inside `.background(Circle().fill(OpenClawBrand.accent))`.
+- `.accessibilityLabel(agentDisplayName)`.
+
+### Chat actions menu — `chatActionsMenu`
+
+`Sources/Design/ChatProTab.swift:334`
+
+A `Menu` whose label is `Image(systemName: "ellipsis.circle")`, `accessibilityLabel("Chat actions")`. Contents, in order:
+
+1. **"New Chat"** — `Label` with `Image(systemName: "plus.bubble")`; action `viewModel?.startNewSession()`. Disabled when `viewModel == nil || !gatewayConnected || isAttachmentOwnerPinned`.
+2. **"New Chat in Worktree"** (conditional) — only rendered when `activeAgent?.workspacegit == true`. `Label` with `Image(systemName: "arrow.triangle.branch")`; action `viewModel?.startNewSession(worktree: true)`. Same disabled condition.
+3. `Divider()`.
+4. **"Export Transcript"** — `Label` with `Image(systemName: "square.and.arrow.up")`; action `exportTranscript()`. Disabled when `viewModel == nil`.
+
+`exportTranscript()` writes a markdown file (`ChatTranscriptExporter.filename(...)`) under `temporaryDirectory/OpenClawTranscripts/`, then sets `transcriptShareItem`; on failure sets `showsTranscriptExportError`. `Sources/Design/ChatProTab.swift:381`
 
 ### Haptics
 
@@ -473,13 +529,19 @@ If `viewModel.errorText == OpenClawChatTransportUpgradeMessage.routingContract`,
 
 ### Agent badge derivation
 
+`currentAgentBadge` (`Sources/Design/ChatProTab.swift:515`):
+
 | Source | Priority |
 |---|---|
-| `agent.identity["emoji"]` (trimmed, non-empty, non-`?`) | 1st |
-| First 2 words' initials, uppercased | 2nd |
+| `agent.identity["emoji"]` via `normalizedBadgeEmoji` (trimmed, non-empty, non-`?`) | 1st |
+| First 2 words' initials, uppercased (`initialsBadge(for:)`) | 2nd |
 | `"OC"` fallback | Last |
 
-`Sources/Design/ChatProTab.swift:514`
+`initialsBadge(for:)` splits the display name on a separator predicate that treats **whitespace, `-`, and `_`** all as word separators — `split(whereSeparator: { $0.isWhitespace || $0 == "-" || $0 == "_" })` — so names like `"my-agent"` or `"my_agent"` become `"MA"`, not `"MY-AGENT"`-style initials. It then takes the first two words' first characters, uppercased; empty result falls back to `"OC"`. `Sources/Design/ChatProTab.swift:529-538`
+
+`normalizedBadgeEmoji(_:)` is a `nonisolated static func` reused in two places with subtly different outer fallbacks: in `ChatProTab.currentAgentBadge` a `nil` return falls through to the initials badge; in `RootTabs.homeCanvasBadge(for:)` (`Sources/RootTabs.swift:1434`) the same emoji/initials logic ultimately falls back to `"OC"` at the `RootTabs` layer. `Sources/Design/ChatProTab.swift:540-544`
+
+The presented badge/name/ID are read through `agentBadge`/`agentDisplayName`/`activeAgentID`, which return the frozen `viewModelPresentation*` values while `isAttachmentOwnerPinned`, otherwise the live `currentAgent*` values. `Sources/Design/ChatProTab.swift:499-527`
 
 ### Connection pill
 
@@ -497,13 +559,29 @@ If `viewModel.errorText == OpenClawChatTransportUpgradeMessage.routingContract`,
 
 ### Composer placeholder
 
+`messagePlaceholder` (`Sources/Design/ChatProTab.swift:457`):
+
 | State | Placeholder |
 |---|---|
-| Gateway connected | `"Message <agentName>..."` |
-| Offline queuing supported | `"Message <agentName>; sends when connected"` |
-| No connection, no queue | `"Connect to a gateway"` |
+| `gatewayConnected` | `"Message <agentName>..."` |
+| Not connected but `canQueueOffline` | `"Message <agentName>; sends when connected"` |
+| Neither | `"Connect to a gateway"` |
 
-`Sources/Design/ChatProTab.swift:457`
+### Offline queue gate — `canQueueOffline`
+
+`Sources/Design/ChatProTab.swift:467`
+
+This boolean gates both the "sends when connected" placeholder above and the composer/attachment enable state (`isComposerEnabled` / `isAttachmentInputEnabled` are `gatewayConnected || canQueueOffline`). It requires `viewModel?.supportsOfflineTextOutbox == true`, **and** then uses a different verified-identity source depending on the pin state:
+
+```swift
+self.viewModel?.supportsOfflineTextOutbox == true &&
+    (self.isAttachmentOwnerPinned
+        ? self.viewModelHasVerifiedOfflineRoutingIdentity
+        : self.appModel.hasVerifiedChatOfflineRoutingIdentity)
+```
+
+- **Attachment pinned:** uses the frozen snapshot `viewModelHasVerifiedOfflineRoutingIdentity` (captured by `captureCurrentPresentationIdentity`), so an in-progress recording keeps the queue affordance stable.
+- **Not pinned:** reads the live `appModel.hasVerifiedChatOfflineRoutingIdentity`.
 
 ### Starter prompts (empty state)
 
@@ -592,11 +670,14 @@ VStack(spacing: 0) {
 
 #### Identity header
 
+Outer `HStack(spacing: 10)` containing: the logo mark, a title `VStack(alignment: .leading, spacing: 2)`, a `Spacer(minLength: 8)`, and (drawer layout only) the inline `sidebarHideButton`. `Sources/RootTabs.swift:499,503,521`
+
 - `OpenClawProMark(size: 30, shadowRadius: 3)` — branded logo mark, accessibility hidden.
 - `Text("OpenClaw")` — `.headline` font, `.primary` color.
-- Status subtitle: `Image(systemName: "circle.fill")` at `.system(size: 7, weight: .bold)` + `Text(sidebarGatewayStatusTitle)` at `.captionMedium` font.
+- Status subtitle: inner `HStack(spacing: 4)` of `Image(systemName: "circle.fill")` at `.system(size: 7, weight: .bold)` + `Text(sidebarGatewayStatusTitle)` at `.captionMedium` font.
 - Padding: `.horizontal(18)`, `.vertical(12)`.
-- Bottom separator: 1-physical-pixel `Rectangle().fill(Color(uiColor: .separator))`.
+- `.background(Color(uiColor: .systemBackground))`.
+- Bottom separator (`.overlay(alignment: .bottom)`): 1-physical-pixel `Rectangle().fill(Color(uiColor: .separator))` (`frame(height: 1 / UIScreen.main.scale)`).
 
 `Sources/RootTabs.swift:498`
 
@@ -611,9 +692,9 @@ VStack(spacing: 0) {
 
 #### Sidebar list
 
-`.listStyle(.sidebar)`, `.tint(OpenClawBrand.accent)`, `.scrollContentBackground(.hidden)`. No visible section separators (`.listSectionSeparator(.hidden, edges: .all)`).
+`.listStyle(.sidebar)`, `.tint(OpenClawBrand.accent)`, `.scrollContentBackground(.hidden)`, plus `.background(Color(uiColor: .systemBackground))` (in addition to the column's own background). No visible section separators (`.listSectionSeparator(.hidden, edges: .all)`). `Sources/RootTabs.swift:550-565`
 
-Row: `Label(title, systemImage:)` at `.subheadSemiBold` font, `minimumScaleFactor(0.82)`, padding `.vertical(8) .horizontal(10)`. Active row: `foregroundStyle` is `OpenClawBrand.accent`; `listRowBackground` is `OpenClawBrand.accent.opacity(0.12)`. `Sources/RootTabs.swift:592`
+Row (`sidebarDestinationButton`): `Label(title ?? destination.sidebarTitle, systemImage: destination.systemImage)` at `.subheadSemiBold` font, `.lineLimit(1)`, `.minimumScaleFactor(0.82)`, `.truncationMode(.tail)`, padding `.vertical(8) .horizontal(10)`, then `.frame(maxWidth: .infinity, alignment: .leading)` and `.contentShape(Rectangle())` so the whole row width is a leading-aligned tap target. `.buttonStyle(.plain)`. Active row: `foregroundStyle` is `OpenClawBrand.accent` (else `.primary`); `listRowBackground` is `OpenClawBrand.accent.opacity(0.12)` (else `.clear`); `.listRowSeparator(.hidden, edges: .all)`. `Sources/RootTabs.swift:592-616`
 
 ### Sidebar groups and destinations
 
@@ -666,9 +747,65 @@ NavigationStack(path: $sidebarNavigationPath) {
 
 `sidebarNavigationPath` (a `[SettingsRoute]`) is cleared before every destination switch so stale settings detail screens cannot survive. `Sources/RootTabs.swift:1302`
 
-### Sidebar header leading action
+### Sidebar header leading action vs. inline hide button
 
-In **split** mode: always present (shows hide/show button). In **drawer** mode: shown only when sidebar is hidden (reveal button). The button uses `Image(systemName: "sidebar.left")` in split mode and `"xmark"` in drawer mode. `Sources/RootTabs.swift:785`
+There are **two distinct** sidebar-toggle controls. Do not conflate them — they use different SF Symbols.
+
+#### `sidebarHeaderLeadingAction` (`OpenClawSidebarHeaderAction?`, passed to detail screens)
+
+`Sources/RootTabs.swift:785`
+
+This is the leading action injected into each detail screen's header. Visibility is gated by `shouldShowSidebarRevealInDestinationHeader(isSidebarVisible:layoutMode:)`; when that returns `false`, the action is `nil`. When present:
+
+- **Visible state:** `OpenClawSidebarHeaderAction(systemName: "sidebar.left", accessibilityLabel: "Hide Sidebar", accessibilityIdentifier: sidebarHideButtonAccessibilityIdentifier, action: hideSidebar())`.
+- **Hidden state:** `OpenClawSidebarHeaderAction(systemName: "sidebar.left", accessibilityLabel: "Show Sidebar", accessibilityIdentifier: sidebarShowButtonAccessibilityIdentifier, action: showSidebar())`.
+
+Both the show and the hide variants use the **same** `"sidebar.left"` icon — the icon never changes between states, and it is never `"xmark"`. Only the accessibility label/identifier and the action differ. `Sources/RootTabs.swift:792-803`
+
+#### `sidebarHideButton` (inline, inside the sidebar identity header)
+
+`Sources/RootTabs.swift:823`
+
+A `Button` rendered inside `sidebarIdentityHeader` (only in drawer layout). Its icon *is* layout-dependent:
+
+```swift
+Image(systemName: self.isSidebarDrawerLayout ? "xmark" : "sidebar.left")
+    .font(OpenClawType.subheadSemiBold)
+```
+
+- Hit target: `.frame(width: 44, height: 44)` with `.contentShape(Rectangle())`.
+- `.buttonStyle(.plain)`, `.foregroundStyle(OpenClawBrand.accent)`.
+- `accessibilityLabel("Hide Sidebar")`, `accessibilityIdentifier(sidebarHideButtonAccessibilityIdentifier)`.
+
+So `"xmark"` belongs to this inline button in drawer layout, never to the header leading action. `Sources/RootTabs.swift:827-835`
+
+### Phone chat contextual return — `phoneChatReturnAction` / `PhoneChatReturn`
+
+`Sources/RootTabs.swift:806`
+
+On phone (`!usesSidebarTabs`), the chat header's leading action is `phoneChatReturnAction` rather than a drawer toggle. It is `nil` unless `phoneChatReturn` state is set; when set it returns:
+
+```swift
+OpenClawSidebarHeaderAction(
+    systemName: "chevron.left",
+    accessibilityLabel: "Back to \(phoneChatReturn.destination.title)",
+    accessibilityIdentifier: "OpenClawChatBackToControlDetailButton",
+    action: { self.openPhoneControlDetail(phoneChatReturn.destination) })
+```
+
+`phoneChatReturn` is a `@State var phoneChatReturn: PhoneChatReturn?` (`Sources/RootTabs.swift:29`). The struct is declared in `Sources/RootTabsNavigation.swift:6`:
+
+```swift
+struct PhoneChatReturn: Equatable {
+    let destination: SidebarDestination
+    let openChatRequestID: Int
+}
+```
+
+Lifecycle:
+- **Set** by `openChatFromControlDetail(_:)` (`Sources/RootTabs.swift:1316`): captures the return destination plus the current `appModel.openChatRequestID`, bumps `phoneChatSettingsResetRequestID` to pop the embedded Settings stack, then calls `selectSidebarDestination(.chat, preservingChatReturn: true)`. This renders the chat with a "Back to <destination>" chevron so the user can return to the control detail they came from.
+- **Cleared** when switching to any non-chat tab (`handlePhoneTabSelection`, `Sources/RootTabs.swift:1342`), on `selectSettingsRoute` (`Sources/RootTabs.swift:1366`), and by `selectSidebarDestination` unless `preservingChatReturn` is true and the destination is `.chat` (`Sources/RootTabs.swift:1299-1301`).
+- `handleOpenChatRequest(_:)` (`Sources/RootTabs.swift:1328`) suppresses a redundant `.chat` reselect when the incoming request ID matches the stored `openChatRequestID`, so the contextual return is not erased by the detail screen's own session-focus observation.
 
 ---
 

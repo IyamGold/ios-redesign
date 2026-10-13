@@ -12,6 +12,8 @@ This section covers every voice surface in the iOS app: the Talk tab that drives
 
 `TalkProTab` is the root view rendered inside the "Talk" tab. It accepts an optional `OpenClawSidebarHeaderAction` for the leading toolbar button on phone (the drawer reveal), an `ownsNavigationStack: Bool` flag that controls whether it wraps itself in a `NavigationStack`, and two closures: `openSettings` (general connection settings) and `openVoiceSettings` (voice-specific settings). When `ownsNavigationStack` is `true` (default), the tab provides its own navigation stack; when `false` (iPad sidebar re-use case), it renders naked content.
 
+The `init` declares `openVoiceSettings` as an optional `(() -> Void)?` defaulting to `nil`, and stores `self.openVoiceSettings = openVoiceSettings ?? openSettings` (`Sources/Design/TalkProTab.swift:26`). So `openVoiceSettings` is not independent — when the caller passes `nil`, voice-settings taps fall back to `openSettings`.
+
 ### 1.2 Persistent state (AppStorage)
 
 | Key | Type | Default | Purpose |
@@ -34,7 +36,7 @@ This section covers every voice surface in the iOS app: the Talk tab that drives
 
 | Property | Source |
 |---|---|
-| `gatewayConnected` | `GatewayStatusBuilder.build(appModel:) == .connected && !isDemoMode` |
+| `gatewayConnected` | `!appModel.isAppleReviewDemoModeEnabled && GatewayStatusBuilder.build(appModel:) == .connected` (`Sources/Design/TalkProTab.swift:201-204`) — demo mode forces `false` regardless of real gateway status |
 | `isDemoMode` | `appModel.isAppleReviewDemoModeEnabled` |
 | `isEnabled` | `appModel.talkMode.isEnabled || talkEnabled` |
 | `statusText` | `appModel.talkMode.statusText` |
@@ -71,12 +73,15 @@ The tint applied to the primary button:
 
 | Condition | Color |
 |---|---|
-| `isDemoMode` or `!gatewayConnected` | `.secondary` |
+| `isDemoMode` | `.secondary` |
+| `!gatewayConnected` | `.secondary` |
 | `.requestFailed` or `.loadFailed` | `OpenClawBrand.danger` |
 | `.missingScope`, `.requestingUpgrade`, `.upgradeRequested`, `.apiKeyMissing` | `OpenClawBrand.warn` |
 | `!isConfigLoaded` | `OpenClawBrand.warn` |
 | `isEnabled` | `OpenClawBrand.ok` |
 | default | `OpenClawBrand.accentHot` |
+
+Reconstruction note (`Sources/Design/TalkProTab.swift:412-430`): the two `.secondary` cases are sequential `if` guards checked before the permission `switch`. The `!isConfigLoaded → OpenClawBrand.warn` test and the final `isEnabled ? .ok : .accentHot` both live *inside* the `default:` branch of the permission `switch`; they are reached only when the permission state is not one of the explicit danger/warn cases. The table order reflects that nesting, not peer-level precedence.
 
 #### 1.4.3 TalkProPrimaryAction enum and button text
 
@@ -133,6 +138,8 @@ Waveform mode selection from `TalkProState.waveformMode(micLevel:)`:
 | `isEnabled` | `.indeterminate` |
 | default | `.still` |
 
+Reconstruction note (`Sources/Design/TalkProTab.swift:480-511`): these rows are evaluated top to bottom as independent `if` guards (the permission cases are a `switch`, the rest are sequential `if`s), returning on first match. The "connecting"/"thinking" status check is an independent `normalizedStatus.contains(...)` test — it is **not** gated by `isEnabled`, and there is no separate case for status text when `isEnabled == false`. The final line resolves `isEnabled ? .indeterminate : .still`.
+
 ### 1.5 View hierarchy and layout
 
 ```
@@ -143,13 +150,14 @@ TalkProTab.body
             ├── Section (optional — only when fallbackIssue != nil)
             │   └── TalkRuntimeIssueBanner                 // listRowInsets(EdgeInsets()), listRowBackground(.clear)
             ├── heroSection  (Section)
-            │   └── VStack(spacing: 16)                    // frame(maxWidth: .infinity), padding(.vertical, 8)
+            │   └── VStack(spacing: 16)                    // frame(maxWidth: .infinity), padding(.vertical, 8), listRowBackground(Color.clear)
             │       ├── TalkSiriWaveView(mode:)            // frame(height: 130), accessibilityHidden(true)
             │       ├── VStack(spacing: 4)
             │       │   ├── Text(state.title)              // OpenClawType.title3SemiBold, multilineTextAlignment(.center)
             │       │   └── Text(heroSubtitle)             // OpenClawType.subhead, .secondary, multilineTextAlignment(.center)
-            │       └── Button (primary action)            // borderedProminent, large, tint = state.color
-            │           └── Label(title, systemImage: icon)// OpenClawType.subheadSemiBold, .white foreground
+            │       └── Button (primary action)            // borderedProminent, controlSize(.large), tint = state.color
+            │           └── Label(title, systemImage: icon)// OpenClawType.subheadSemiBold, .white foreground,
+            │                                              //   frame(maxWidth: .infinity) so the button fills its width
             │                                              // disabled when primaryAction == .waiting
             ├── conversationSection  (Section "Conversation")
             │   ├── SettingsDetailRow("Agent", value: chatAgentName)
@@ -165,8 +173,11 @@ TalkProTab.body
             └── controlsSection  (Section "Controls")
                 ├── Toggle "Speakerphone"                  // OpenClawType.body, accessibilityIdentifier: "talk-speakerphone-control"
                 ├── Toggle "Background listening"          // OpenClawType.body, accessibilityIdentifier: "talk-background-listening-control"
-                └── Button "Voice & Talk Settings"        // systemImage "slider.horizontal.3", chevron.forward trailing
-                                                           // accessibilityIdentifier: "talk-voice-settings-control"
+                └── Button "Voice & Talk Settings" (action: openVoiceSettings)   // buttonStyle(.plain), accessibilityIdentifier: "talk-voice-settings-control"
+                    └── HStack                             // contentShape(Rectangle()) so the full row is tappable
+                        ├── Label("Voice & Talk Settings", systemImage: "slider.horizontal.3")  // OpenClawType.body, .primary foreground
+                        ├── Spacer()
+                        └── Image(systemName: "chevron.forward")  // OpenClawType.footnoteSemiBold, .tertiary foreground
 ```
 
 Navigation title: `"Talk"`. Toolbar has optional leading `OpenClawSidebarRevealButton` when `headerLeadingAction` is set.
@@ -181,9 +192,16 @@ Navigation title: `"Talk"`. Toolbar has optional leading `OpenClawSidebarRevealB
 5. `gatewayTalkVoiceModeSubtitle` (non-empty, trimmed) → use that
 6. default → "Routes voice to \(chatAgentName)."
 
-**transportText**: `"\(provider) • \(transport)"`, collapses to either value alone when the other is empty or `"Not loaded"`.
+**transportText** (`Sources/Design/TalkProTab.swift:234-244`): both `gatewayTalkProviderLabel` and `gatewayTalkTransportLabel` are trimmed, then:
+- If `provider` is empty **or** equals the sentinel `"Not loaded"` → return `transport` alone, or `"Not loaded"` if `transport` is also empty.
+- Else if `transport` is empty **or** equals `"Not loaded"` → return `provider` alone.
+- Else → `"\(provider) • \(transport)"`.
+
+The `"Not loaded"` sentinel is checked independently on each side; a side matching it is treated the same as empty.
 
 **activeModeText**: `"\(title) • \(subtitle)"` or just title if subtitle is empty; `"Not active"` if title is empty.
+
+**permissionText** (`Sources/Design/TalkProTab.swift:265-269`): if `gatewayTalkPermissionState.failureMessage` is non-nil it is returned directly; otherwise `gatewayTalkPermissionState.statusLabel` is returned. The failure message takes precedence over the status label.
 
 **speechLocaleText**: `"Automatic"` when locale is `TalkSpeechLocale.automaticID`, otherwise the raw locale string.
 
@@ -198,14 +216,23 @@ Navigation title: `"Talk"`. Toolbar has optional leading `OpenClawSidebarRevealB
 
 **Runtime issue sheet** (`showTalkIssueDetails`):
 - Shows only when `fallbackIssue != nil`
-- Content: `TalkRuntimeIssueDetailsSheet(issue:onOpenSettings:)`, `.openClawSheetChrome()`
+- Content: `TalkRuntimeIssueDetailsSheet(issue:onOpenSettings: openVoiceSettings)`, `.openClawSheetChrome()`
+
+**`fallbackIssue` gating** (`Sources/Design/TalkProTab.swift:206-209`): `fallbackIssue` first `guard self.gatewayConnected else { return nil }`, and only then returns `appModel.talkMode.gatewayTalkCurrentFallbackIssue`. It is therefore non-nil **only while the gateway is connected** (and, via `gatewayConnected`, not in demo mode). This gates both the top `TalkRuntimeIssueBanner` section in `content` and the runtime issue details sheet; neither appears when offline even if a stale fallback issue is still set on the manager.
 
 ### 1.8 Lifecycle
 
-`onAppear` calls `alignPersistedTalkState()` which:
-1. If demo mode and talk is somehow enabled → stop.
-2. If `requiresTalkPermissionAction` and talk is enabled → stop.
-3. Otherwise sync `@AppStorage talkEnabled` → `appModel.setTalkEnabled(_:)`.
+`onAppear` calls `alignPersistedTalkState()` which is an `if / else if / else if` chain (`Sources/Design/TalkProTab.swift:279-291`), so exactly one branch runs:
+1. If `isAppleReviewDemoModeEnabled` **and** (`talkEnabled || appModel.talkMode.isEnabled`) → `stopTalk()`.
+2. Else if `gatewayTalkPermissionState.requiresTalkPermissionAction` **and** (`talkEnabled || appModel.talkMode.isEnabled`) → `stopTalk()`.
+3. Else if `talkEnabled != appModel.talkMode.isEnabled` → `appModel.setTalkEnabled(self.talkEnabled)`. This third branch is the only one that syncs persisted state to the manager; it fires only when the two disagree (and the stop-triggering branches above did not apply).
+
+**handlePrimaryAction()** (`Sources/Design/TalkProTab.swift:302-316`) switches on `state.primaryAction`:
+- `.start` → `startTalk()`
+- `.stop` → `stopTalk()`
+- `.enablePermission` → `stopTalk()` **first**, then `showPermissionPrompt = true`. The stop runs before presenting the sheet so no capture is left running while the user re-requests approval.
+- `.openSettings` → `openPrimarySettings()`
+- `.waiting` → no-op (`break`)
 
 **startTalk()**: guards `!isAppleReviewDemoModeEnabled`, sets `talkEnabled = true`, calls `appModel.talkMode.updateMainSessionKey(appModel.chatSessionKey)`, then `appModel.setTalkEnabled(true)`.
 
@@ -416,12 +443,12 @@ private enum CaptureMode {
 
 ### 5.5 Noise floor calibration
 
-While `isListening && !isSpeaking && !noiseFloorReady`, each mic sample is collected. After 22 samples are gathered:
-- Sort ascending, take the lower half (min 6 samples).
-- Average them → `noiseFloor`.
-- `threshold = clamp(noiseFloor + 0.10, 0.12, 0.35)`.
-- Before calibration, `threshold = 0.18` (hardcoded default).
-- `lastAudioActivity` is updated whenever `raw >= threshold`.
+While `isListening && !isSpeaking && !noiseFloorReady`, each `raw` sample is appended to `noiseFloorSamples` (`Sources/Voice/TalkModeManager.swift:908-923`). When the count reaches `>= 22` (so the first calibration fires at 22 samples, not necessarily exactly 22):
+- Sort ascending, take the lower half via `take = max(6, sorted.count / 2)` (at least 6 samples).
+- Average that prefix slice → `noiseFloor`, then set `noiseFloorReady = true` and clear `noiseFloorSamples`.
+- `threshold = min(0.35, max(0.12, noiseFloor + 0.10))`.
+- Before calibration (`noiseFloor == nil` or `!noiseFloorReady`), `threshold = 0.18` (hardcoded default, `Sources/Voice/TalkModeManager.swift:925-929`).
+- `lastAudioActivity = Date()` is updated whenever `raw >= threshold`.
 
 ### 5.6 Silence window and endpointing
 
@@ -429,12 +456,16 @@ While `isListening && !isSpeaking && !noiseFloorReady`, each mic sample is colle
 
 ### 5.7 Speech recognition setup
 
-`SFSpeechAudioBufferRecognitionRequest` with `shouldReportPartialResults = true`, `taskHint = .dictation`. Audio tap bufferSize: `2048` frames, format matching the input node's native format. The mic level computation:
+`SFSpeechAudioBufferRecognitionRequest` with `shouldReportPartialResults = true`, `taskHint = .dictation`. Audio tap bufferSize: `2048` frames, format matching the input node's native format.
+
+The mic-level smoothing, noise-floor calibration, and `lastAudioActivity` update are **not** done in the speech-recognition setup directly — they live in the `AudioTapDiagnostics` RMS tap callback installed on the input node (`Sources/Voice/TalkModeManager.swift:899-933`). That callback receives an RMS `level` (a `Float`) and, hopping to the MainActor, computes:
 
 ```swift
-raw = clamp(Float(level) × 10.0, 0, 1)
-micLevel = micLevel × 0.80 + raw × 0.20
+raw = max(0, min(Double(level) × 10.0, 1.0))   // Double(level), not averagePower
+micLevel = (micLevel × 0.80) + (raw × 0.20)      // 0.80 / 0.20 EMA
 ```
+
+The same `raw` value feeds noise-floor calibration (§5.5) and the `lastAudioActivity = Date()` update whenever `raw >= threshold`.
 
 ### 5.8 Realtime restart policy
 
@@ -443,11 +474,13 @@ On `handleRealtimeSessionFinish()`:
 - Otherwise `attempt = previousRapidRestartCount + 1`.
 - `attempt == 1` → delay `500_000_000 ns`, restart.
 - `attempt == 2` → delay `2_000_000_000 ns`, restart.
-- `attempt >= 3` → no delay, set `bypassRealtimeOnNextStart = true`, fall back to speech pipeline.
+- `attempt >= 3` → `realtimeRestartDelayNanoseconds(attempt:)` returns `nil` (`Sources/Voice/TalkModeManager.swift:296-307`). The manager records a repeated-disconnect issue (`pendingRealtimeIssue` + `gatewayTalkLastIssueText = issue.diagnosticSummary`), sets `bypassRealtimeOnNextStart = true`, and **still calls** `scheduleRealtimeRestart(after: nil, generation:)`. So a restart is still scheduled with no delay; because `bypassRealtimeOnNextStart` is now set, the next `start()` skips realtime and uses the speech pipeline instead.
 
 ### 5.9 Session stop
 
 `stop()` clears all state, cancels tasks, deactivates the audio session with `.notifyOthersOnDeactivation`, and calls `TalkSystemSpeechSynthesizer.shared.stop()`. Any in-flight PTT continuation is resumed with status `"cancelled"`.
+
+Specific fields cleared/reset on stop (`Sources/Voice/TalkModeManager.swift:570-605`): `statusText = "Off"`, `pendingRealtimeIssue = nil`, `gatewayTalkCurrentFallbackIssue = nil`, `gatewayTalkActiveModeTitle = "Not active"`, `gatewayTalkActiveModeSubtitle = nil`, `gatewayTalkLastIssueText = nil`, `lastTranscript = ""`, `lastHeard = nil`; `silenceTask`, realtime restart state, realtime session, recognition, and speaking are all torn down. After deactivating the audio session, `stop()` also fires `Task { await self.unsubscribeAllChats() }` to drop gateway chat subscriptions.
 
 ### 5.10 Background handling
 
@@ -468,10 +501,10 @@ On `handleRealtimeSessionFinish()`:
 After receiving assistant text in `processTranscript`, TTS route is selected:
 
 1. **`gatewayTalkSpeak`** → `playGatewayTalkSpeak()` — uses `TalkGatewaySpeechClient` to synthesize via the gateway, plays PCM or buffered audio.
-2. **ElevenLabs local** → `playAssistant()` — resolves voice/model, calls `ElevenLabsTTSClient.streamSynthesize()`. Tries PCM first (sample rate from output format); if the API rejects PCM (e.g. `403 subscription_required`) sets `pcmFormatUnavailable = true` and retries with `mp3_44100_128`.
+2. **ElevenLabs local** → `playAssistant()` — resolves voice/model, calls `ElevenLabsTTSClient.streamSynthesize()`. Tries PCM first (sample rate from output format); if PCM playback fails and the stream failure is a rejected-PCM error (`isPCMFormatRejectedByAPI`, e.g. `403 subscription_required`) it sets `pcmFormatUnavailable = true` and retries with `mp3_44100_128` (`Sources/Voice/TalkModeManager.swift:1791-1796`). `pcmFormatUnavailable` **persists for the session**: once set, subsequent syntheses skip PCM and use `effectiveDefaultOutputFormat` (MP3) directly instead of re-probing PCM.
 3. **System fallback** → `TalkSystemSpeechSynthesizer.shared.speak(text:language:)` — used when API key/voiceId missing or on TTS error.
 
-The `chat.send` call includes `"thinking": "low"` and `"timeoutMs": 30000`.
+The `chat.send` payload (`Sources/Voice/TalkModeManager.swift:1556-1563`) is `["sessionKey": mainSessionKey, "message": message, "thinking": "low", "timeoutMs": 30000, "idempotencyKey": UUID().uuidString]`. The per-call `idempotencyKey` lets the gateway dedupe retried sends.
 
 ---
 
@@ -500,7 +533,10 @@ enum TalkModeRuntimeRoute: Equatable {
 }
 ```
 
-`usesRealtime` = `.realtimeRelay` or `.realtimeWebRTC`. `gatewayOwnsCredentials` = all except `.localElevenLabs`.
+Computed properties on `TalkModeRuntimeRoute`:
+- `usesRealtime` = `.realtimeRelay` or `.realtimeWebRTC`.
+- `gatewayOwnsCredentials` = all except `.localElevenLabs`.
+- `usesGatewayTalkSpeak` = `true` only for `.gatewayTalkSpeak` (`Sources/Voice/TalkModeManager.swift:1709`); selects the gateway-synthesized TTS path (route 1 in §5.12).
 
 ### 6.3 Provider selection (AppStorage)
 
@@ -620,6 +656,8 @@ Incoming `talk.event` events are dispatched by type:
 
 Output playback uses `PCMStreamingAudioPlaying.play(stream:sampleRate:)`. Output session IDs are used to detect stale completions when playback is interrupted and restarted.
 
+**Output playback idle scheduling** (`Sources/Voice/RealtimeTalkRelaySession.swift:828-847`): when playback is scheduled, `scheduleOutputPlaybackIdle(expectedEndMs:)` cancels any prior `outputIdleTask` and arms a new one after `idleDelayMs = max(350, expectedEndMs - nowMs + 500)` ms — a 500 ms buffer past the expected end, with a 350 ms floor (`nowMs = ProcessInfo.processInfo.systemUptime * 1000`). When the task fires it calls `refreshOutputPlaybackState`, which marks playback finished only once `timestampMs >= outputPlaybackExpectedEndMs + 500`. This idle timer is how `isOutputPlaying` is cleared when no explicit `audioDone`/`clear` event arrives.
+
 ### 8.5 Barge-in detection
 
 Constants:
@@ -634,7 +672,7 @@ When `isOutputPlaying` and mic RMS exceeds `bargeInRmsThreshold`, barge-in fires
 
 ### 8.6 Speaker echo suppression
 
-`shouldSuppressMicrophoneDuringOutput()` returns `true` when `AVAudioSession.currentRoute.outputs` contains `.builtInSpeaker`. When suppressed, mic frames are counted and logged but not sent. This prevents the built-in speaker from feeding back into the microphone and being treated as user input. Headsets keep barge-in because their output does not bleed into the mic.
+`shouldSuppressMicrophoneDuringOutput()` returns `true` when `AVAudioSession.currentRoute.outputs` contains `.builtInSpeaker`. In the mic tap (`Sources/Voice/RealtimeTalkRelaySession.swift:700-713`), when `isOutputPlaying` and suppression is active, the frame is recorded via `recordSuppressedOutputEchoFrame(...)` (counted and logged) and the closure returns `false` **before** reaching the barge-in level check. So suppression bypasses both the send path **and** the `handleInputLevelDuringOutput` barge-in check — the `rms >= bargeInRmsThreshold` test (§8.5) only runs when output is playing and suppression is *not* active. This prevents the built-in speaker from feeding back into the microphone and being treated as user input. Headsets keep barge-in because their output does not bleed into the mic (suppression is false, so the barge-in check still runs).
 
 ### 8.7 Startup timeout
 
@@ -713,18 +751,41 @@ The 1.8-second drain grace prevents the "Listening" status from flickering durin
 
 On `error.isMaximumDurationError`: calls `stop()` immediately to trigger a single session rotation (provider's hard limit reached before transport state catches up).
 
+#### 9.5.1 ICE connection state changes
+
+`peerConnection(_:didChange: RTCIceConnectionState)` hops to the MainActor, returns early if `stopped`, then (`Sources/Voice/TalkRealtimeWebRTCSession.swift:974-991`):
+
+| ICE state | Action |
+|---|---|
+| `.connected` / `.completed` | If not `assistantAudioActive`: `didChangeStatus("Listening")` |
+| `.disconnected` | `didChangeStatus("Reconnecting")` |
+| `.failed` / `.closed` | `didChangeStatus("Realtime disconnected")`, then `stop()` |
+| other | no-op |
+
+#### 9.5.2 Data channel state changes
+
+`dataChannelDidChangeState(_:)` hops to the MainActor, returns early if `stopped`, then switches on `readyState` (`Sources/Voice/TalkRealtimeWebRTCSession.swift:1004-1020`):
+
+| Data channel state | Action |
+|---|---|
+| `.open` | If not `assistantAudioActive`: `didChangeStatus("Listening")` |
+| `.closed` | `didChangeStatus("Realtime disconnected")`, then `stop()` |
+| other | no-op |
+
+(`peerConnection(_:didOpen:)` separately assigns the incoming channel to `self.dataChannel` and sets its delegate.)
+
 ### 9.6 Tool calls (openclaw_agent_consult / openclaw_agent_control)
 
 Tool arguments are buffered across `response.function_call_arguments.delta` events keyed by item ID or call ID. On `done` events, if args are non-empty and no task is in flight for that callId:
 
 - `openclaw_agent_consult` → `talk.client.toolCall` → wait for chat result via event stream + `agent.wait` polling (3 s slices, up to `toolResultTimeoutSeconds = 45 s`). After 6 s shows "Still asking OpenClaw". On failure: submits error result and falls back to spoken fallback message.
-- `openclaw_agent_control` → `talk.client.steer` → submit result.
+- `openclaw_agent_control` → `talk.client.steer` (timeout `toolCallTimeoutSeconds`) → on success submits `["result": message]` where `message` falls back to `"OpenClaw updated the active run."`; on failure submits `["error": "OpenClaw could not update the active run."]` (`Sources/Voice/TalkRealtimeWebRTCSession.swift:608-641`). Unlike the consult path, the control path does **not** show a "Still asking OpenClaw" status and uses this fixed error string rather than a spoken fallback.
 
 Tool results are submitted back to the WebRTC session as `conversation.item.create` with `type: "function_call_output"` followed by `response.create`.
 
 ### 9.7 Session key matching
 
-`matchesSessionKey(_:_:)` treats `"agent:main:main"` and `"main"` as equivalent to handle gateway-side session key normalization.
+`matchesSessionKey(_ incoming:_ current:)` (`Sources/Voice/TalkRealtimeWebRTCSession.swift:762-770`) trims and lowercases both keys, returns `true` on exact match, and otherwise treats `"agent:main:main"` and `"main"` as equivalent in either direction to handle gateway-side session key normalization. It is used (at line 713) to reject events whose session key does not match the current session.
 
 ### 9.8 Prefetch
 
@@ -824,11 +885,15 @@ public enum State: Equatable {
 
 ### 11.3 Timer task
 
-Wakes every `timerIntervalNanoseconds = 100_000_000 ns` (100 ms). Computes `elapsedSeconds = now - startedAt`. Auto-finishes when `elapsedSeconds >= durationLimit`.
+The duration timer and the waveform meter are **two independent `Task`s**, each sleeping 100 ms per iteration but started and cancelled separately.
+
+`startTimer()` (`apps/shared/OpenClawKit/Sources/OpenClawChatUI/VoiceNoteRecorder.swift:229-244`) launches `timerTask`, which wakes every `timerIntervalNanoseconds = 100_000_000 ns` (100 ms), confirms the state is still `.recording(startedAt, _)`, computes `elapsedSeconds = max(0, now() - startedAt)`, and calls `finish()` + returns when `elapsedSeconds >= durationLimit`. The timer task does **not** touch `liveLevels`.
 
 ### 11.4 Waveform metering
 
-`liveLevels: [Float]` — rolling window of 40 samples (`liveBarCapacity = 40`). Updated every 100 ms from `capture.currentPower()` (average dB). Level normalization: `(dB + 50) / 50` — maps −50 dB…0 dB to 0…1. Readings below −50 dB are clamped to 0.
+`startMetering()` (`apps/shared/OpenClawKit/Sources/OpenClawChatUI/VoiceNoteRecorder.swift:246-261`) launches a separate `meterTask` that drives the waveform. It is distinct from `timerTask` (§11.3); only `meterTask` writes `liveLevels`.
+
+`liveLevels: [Float]` — rolling window of 40 samples (`liveBarCapacity = 40`). On each 100 ms iteration, if `capture.currentPower()` returns a non-nil dB value, the normalized level is appended and the oldest element is dropped once the window exceeds 40. Level normalization (`normalizedLevel(_:)`, lines 269-273): `clamped = max(dB, -50)`, then `(clamped + 50) / 50` — maps −50 dB…0 dB to 0…1; readings below −50 dB clamp to 0. `startMetering()` resets `liveLevels = []` at start; `stopMetering()` cancels the task and clears the window.
 
 ### 11.5 Audio capture settings (AAC)
 

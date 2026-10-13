@@ -339,7 +339,8 @@ A pacing buffer decouples what the user sees from bursty network arrivals.
 | Text color | Passed in (`dark ? .white : .black`) |
 | Text animation | `.easeOut(duration: 0.12)` on `revealedCount` |
 | Alignment | `HStack(alignment: .bottom, spacing: 3)` |
-| Cursor | `StreamingCursor` (hidden when `caughtUp`) |
+| Inner text frame | `Text(revealed)` inside the HStack carries its OWN `.frame(maxWidth: .infinity, alignment: .leading)` so the text claims the full row width and the cursor trails at the end (`StreamingReplyBubble.swift:33–36`). This is in addition to the outer `.frame(maxWidth: .infinity, alignment: .leading)` the trailing-indicator applies to the whole bubble. |
+| Cursor | `StreamingCursor` (hidden via `.opacity(caughtUp ? 0 : 1)`) |
 
 ### `StreamingCursor`
 
@@ -375,7 +376,7 @@ Label transitions via `.animation(.easeInOut(duration: 0.25), value: label)` + `
 
 ### Tap
 
-Button action calls `onOpenSteps?()`, which opens the steps sheet. The node is disabled when not openable. `HStack(spacing: 6)`.
+Button action calls `onOpenSteps?()`, which opens the steps sheet. The node is `.disabled(!canOpen)` when not openable. The label is an `HStack(spacing: 6)` (collapsed label + optional chevron) carrying `.contentShape(Rectangle())`, and the whole button then gets `.frame(maxWidth: .infinity, alignment: .leading)` (`ChatRootSurface.swift:2137–2142`). Together these make the full-width empty area to the right of the text tappable, not just the glyphs.
 
 ### `ChatShimmerLabel` shimmer sweep
 
@@ -389,14 +390,22 @@ Driven by `TimelineView(.animation)` (immune to parent re-renders):
 | Base opacity | `Color.primary.opacity(0.35)` |
 | Sweep range | From `x: -band` to `x: phase * (width + band)` |
 | Text font | `.system(size: 16).italic()` |
+| Base text | `Text(text)` at base opacity, `.contentTransition(.opacity)`, overlaid by the sweep |
+| Mask text | The sweep gradient is `.mask { Text(text).font(Self.font).contentTransition(.opacity) }` — a SECOND identical `Text` with its own `.contentTransition(.opacity)` serves as the mask shape. Both the base and mask `Text` carry the transition so the glyphs crossfade in lockstep when `text` mutates; omitting it on the mask would render the shimmer differently during a label change (`ChatRootSurface.swift:2682–2705`) |
 | Text change animation | `.easeInOut(duration: 0.3)` on `text` |
-| Content transition | `.opacity` |
 
 ---
 
 ## 12. "Worked through N steps" Steps Sheet
 
 A custom bottom-sheet overlay (not a system `.sheet`) to achieve full edge-to-edge layout on iOS 26. It is always mounted as an `.overlay` on `ChatRootSurface`; `payload == nil` renders nothing. (`ChatRootSurface.swift:269–277`)
+
+### Stable-parent structure and overlay guards
+
+The body is a `GeometryReader { geo in ZStack(alignment: .bottom) { … } }` where the GeometryReader/ZStack is the STABLE always-mounted parent; the scrim and card are conditionally inserted INSIDE it so each runs its own transition (`ChatRootSurface.swift:2191–2218`). Two modifiers on the GeometryReader are load-bearing for a rebuild:
+
+- `.ignoresSafeArea()` on the `GeometryReader` — lets the scrim cover the full screen and the card sit bottom-flush under the home indicator. The inner `ZStack` is `.frame(maxWidth: .infinity, maxHeight: .infinity)`.
+- `.allowsHitTesting(self.payload != nil)` — when closed, the empty overlay must NOT eat taps meant for the chat beneath it. Without this, the always-mounted overlay would swallow touches even while hidden.
 
 ### Open/close animation
 
@@ -428,10 +437,11 @@ Driven by `withAnimation(stepsSheetSlide) { stepsSheet = ... }`. The card uses `
 | Title color | `Color.primary` |
 | Title text | `"Worked through N step[s]"` |
 | Header padding | `.top 14`, `.bottom 16` |
-| X button icon | Asset `ChatCloseGlyph`, `.template`, 22×22 pt, `Color.primary` |
+| X button icon | Asset `ChatCloseGlyph`, `.template`, resizable, `.scaledToFit`, 22×22 pt, `Color.primary` |
 | X button hit area | 40×40 pt |
-| X button background | `ChatGlassBackground(shape: Circle(), fill: glassFill)`, shadow `black.opacity(0.15)` radius 25 |
-| X button padding | `.horizontal 24` |
+| X button background | `ChatGlassBackground(shape: Circle(), fill: …)` with the fill computed inline per scheme — dark: `rgb(30, 30, 30).opacity(0.2)`, light: `rgb(245, 244, 250).opacity(0.2)` (`ChatRootSurface.swift:2274–2282`) |
+| X button shadow | `.shadow(color: .black.opacity(0.15), radius: 25, x: 0, y: 0)` |
+| X button padding | `.horizontal 24` (HStack containing the button + `Spacer`) |
 
 ### Step list
 
@@ -530,39 +540,60 @@ Padding: `.horizontal 8`, `.vertical 7`.
 
 ### Image bubble
 
-`VStack(spacing: 8)` wrapping `ChatImageMosaic` (see section 18) topped by a `ZStack(alignment: .bottomTrailing)` for the overlay-meta-chip when no caption:
-- Overlay chip: `RoundedRectangle(cornerRadius: 4)` fill `black.opacity(0.4)`, white time + tick icons, `.padding(.horizontal, 4)`, `.padding(.vertical, 2)`.
-- With caption: caption text `.system(size: 16)`, trailing meta row below it, `.padding(.horizontal, 8)`, `.padding(.bottom, 7)`.
-- Image bubble width fixed at 250 pt; `.padding(3)` around the whole VStack.
+`VStack(spacing: 8)` wrapping `ChatImageMosaic` (see section 18) topped by a `ZStack(alignment: .bottomTrailing)` for the overlay-meta-chip when no caption (`ChatRootSurface.swift:1953–1977`):
+- Overlay chip (when `row.text.isEmpty`): `overlayMetaChip` (`RoundedRectangle(cornerRadius: 4)` fill `black.opacity(0.4)`, white time + tick icons, `.padding(.horizontal, 4)`, `.padding(.vertical, 2)`) with `.padding(4)` inside the ZStack.
+- With caption (when `!row.text.isEmpty`): a `VStack(alignment: .trailing, spacing: 2)` containing the caption `Text(row.text)` at `.system(size: 16)`, `foreground` color, `.frame(maxWidth: .infinity, alignment: .leading)`, then the `metaRow`. The whole caption block gets `.padding(.horizontal, 8)` and `.padding(.bottom, 7)`.
+- Image bubble width fixed at 250 pt; `.padding(3)` around the whole VStack; background is the bubble shape filled `bubbleFill`.
 
-### Audio bubble
+### Audio bubble (`AudioBubbleContent`)
 
-Fixed width 242 pt, `HStack(spacing: 12)` inside `VStack(alignment: .trailing, spacing: 4)`:
-- Play/pause button (see section 15).
-- `ChatAmplitudeWaveform(levels:, color: foreground.opacity(0.4), activeColor: foreground, progress: playback.progress)` — 36 bars.
-- Duration label: `.system(size: 12)`, monospaced digit, `foreground` color.
+Fixed width 242 pt, `HStack(spacing: 12)` inside `VStack(alignment: .trailing, spacing: 4)` (`ChatRootSurface.swift:2046–2085`):
+- **Play/pause button.** When `playback.isPlaying`: `ChatPauseGlyph(color: foreground)` (see section 25). When idle: `Image(systemName: "play.fill")` at `.font(.system(size: 18))`, `.foregroundStyle(foreground)`. The button is `.disabled(self.data == nil)` so a byte-less (not-yet-rehydrated) chip is non-tappable; its `action` toggles playback only when `data != nil`.
+- `ChatAmplitudeWaveform(levels:, color: foreground.opacity(0.4), activeColor: foreground, progress: playback.progress)` — 36 bars, `.frame(maxWidth: .infinity, alignment: .leading)`, `.clipped()`.
+- Duration label: `.system(size: 12)`, `.monospacedDigit()`, `.lineLimit(1)`, `.fixedSize()`, `foreground` color. Shows `playback.currentTime` while playing (when `> 0`), else `durationSeconds`.
 - `metaRow` below.
 
-Padding: `.horizontal 12`, `.vertical 8`.
+Padding: `.horizontal 12`, `.vertical 8`. Waveform levels load via `.task(id: self.data)` at `barCount: 36`, so they reload whenever the `data` reference changes (e.g., provisional→canonical row swap) (`ChatRootSurface.swift:2086–2089`).
 
-### File card bubble
+### Attachment stacking (audio / file)
 
-Fixed 237×87 pt, `HStack(spacing: 0)`:
-- `ChatFileThumbnail` 75×75 pt on leading, `.padding(.leading, 7)`, `.padding(.vertical, 6)`.
-- File title: `.system(size: 16)`, `lineLimit(2)`, centered.
+Audio and file attachments each render inside a `VStack(alignment: .trailing, spacing: 5)` with a fixed stacking order — the media first, then an optional caption bubble below it (`ChatRootSurface.swift:1873–1892`):
+
+- **Audio stack (`audioStack`):** the audio bubble, then — only when `!row.text.isEmpty` — the `textBubble` below it (a typed caption becomes a separate bubble).
+- **File stack (`fileStack`):** `ForEach(fileChips)` of file card bubbles, then — only when `!row.text.isEmpty` — the `textBubble` below them.
+
+The 5 pt inter-element spacing and the media-above-caption order are load-bearing for the trailing-aligned layout.
+
+### File card bubble (`fileCardBubble`)
+
+Fixed 237×87 pt, `ZStack(alignment: .topLeading)` of the bubble-shaped fill behind an `HStack(spacing: 0)` (`ChatRootSurface.swift:1905–1928`):
+- `ChatFileThumbnail` 75×75 pt on leading, `.padding(.leading, 7)`, `.padding(.vertical, 6)`. `fileName` = `chip.fileName ?? chip.title`; `fallbackLabel` = `chip.fileExtension?.uppercased() ?? "FILE"`.
+- File title: `Text(chip.title)`, `.system(size: 16)`, `foreground` color, `lineLimit(2)`, `.multilineTextAlignment(.center)`, `.frame(maxWidth: .infinity)`, `.padding(.horizontal, 8)`.
 - `metaRow` overlaid at `.bottomTrailing`, `.padding(.trailing, 10)`, `.padding(.bottom, 2)`.
+
+#### `ChatFileThumbnail` internals
+
+`ZStack` at a fixed 75×75 pt frame (`ChatAudioComponents.swift:124–174`):
+
+| Element | Value |
+|---|---|
+| Background | `RoundedRectangle(cornerRadius: 5, style: .continuous)` filled `Color.white.opacity(0.15)` |
+| Thumbnail (when generated) | `Image(uiImage:)`, resizable, `.scaledToFill`, 75×75 pt, clipped to `RoundedRectangle(cornerRadius: 5)` |
+| Fallback label (no thumbnail) | `Text(fallbackLabel)` at `.font(.system(size: 13, weight: .semibold))`, `.foregroundStyle(.white.opacity(0.7))` |
+| Thumbnail generation | `QLThumbnailGenerator.shared.generateBestRepresentation` for a `Request(fileAt:size: CGSize(75, 75), scale: 3, representationTypes: .thumbnail)` |
+| Load trigger | `.task(id: self.fileName)` — runs once when `thumbnail == nil` and `payload != nil`; payload is written to a temp file (removed via `defer`) for QuickLook |
 
 ---
 
 ## 15. Assistant Message (`ChatAssistantMessage`)
 
-**No bubble.** Full transcript width. `VStack(alignment: .leading, spacing: 10)`:
+**No bubble.** Full transcript width. `VStack(alignment: .leading, spacing: 10)` with `.frame(maxWidth: .infinity, alignment: .leading)`, children in this order (`ChatRootSurface.swift:2315–2336`):
 
-| Element | Condition |
-|---|---|
-| `ChatImageMosaic` | `!row.images.isEmpty` |
-| `ChatFormattedText(text:, isUser: false, textColor:, reveal:)` | `!row.text.isEmpty` |
-| Timestamp | `!row.isStreaming && row.timestamp != nil` — `.system(size: 12)`, `(dark ? white : black).opacity(0.6)` |
+| Order | Element | Condition |
+|---|---|---|
+| 1 | `ChatImageMosaic(images: row.images)` — placed ABOVE the text so assistant-delivered images read as part of the reply (same tap→viewer→zoom→save path as user images) | `!row.images.isEmpty` |
+| 2 | `ChatFormattedText(text:, isUser: false, textColor:, reveal:)` | `!row.text.isEmpty` |
+| 3 | Timestamp | `!row.isStreaming && row.timestamp != nil` — `.system(size: 12)`, `(dark ? white : black).opacity(0.6)` |
 
 The `reveal` parameter is `true` only for the row whose id equals `revealReplyID` (the just-finalized live answer). This triggers the top-to-bottom wipe.
 
@@ -599,7 +630,7 @@ content
   }
 ```
 
-`ChatRevealWipe` is an animatable `Shape` (not a gradient—a `Double` feeding gradient stops does not tween). The path is a rectangle from `y: -overshoot` to `y: -overshoot + fraction * (height + 2 * overshoot)`, overshooting by `feather * 2 = 32 pt` top and bottom so the blurred edge falls outside the text. Width overshoots by 20 pt on each side to prevent side clipping. Animation: `.linear(duration: revealDuration)`.
+`ChatRevealWipe` is an animatable `Shape` (not a gradient—a `Double` feeding gradient stops does not tween; `animatableData` get/set proxies `fraction`). In `path(in:)` the fraction is first clamped to `0–1` via `let clamped = CGFloat(max(0, min(1, self.fraction)))` before any geometry is computed (`ChatRootSurface.swift:2916–2920`). The path is a rectangle from `y: -overshoot` to `y: -overshoot + clamped * (height + 2 * overshoot)`, overshooting by `feather * 2 = 32 pt` top and bottom so the blurred edge falls outside the text. Width overshoots by 20 pt on each side (`x: -20`, `width: rect.width + 40`) to prevent side clipping; height is `max(0, bottom - top)`. Animation: `.linear(duration: revealDuration)`.
 
 A streaming reply that was visible before finalization sets `awaitingReplyReveal = false` so its finalized row does NOT play the wipe — the text was already fully revealed progressively. Only tool-run answers (footprint-only during the run) still wipe. (`ChatRootSurface.swift:468–473`)
 
@@ -673,7 +704,7 @@ Shared between user and assistant messages. Tile shape: `RoundedRectangle(corner
 |---|---|
 | 1 | Single tile 244×244 pt |
 | 2 | `HStack(spacing: 2)`: 129×244 + 113×244 |
-| 3+ | `HStack(spacing: 2)`: 129×244 left + `VStack(spacing: 2)` right with 113×121 top + 113×121 bottom; if >3, the bottom-right tile overlays a `black.opacity(0.5)` scrim and a `"+ N"` counter (`.system(size: 24)`, tracking `-2.4`, white) |
+| 3+ | `HStack(spacing: 2)`: 129×244 left + `VStack(spacing: 2)` right with 113×121 top + 113×121 bottom; if >3, the bottom-right tile overlays a `rgb(10, 10, 10).opacity(0.5)` scrim (near-black `#0A0A0A`, NOT pure `black`) and a `"+ N"` counter (`.system(size: 24)`, tracking `-2.4`, white). The scrim is `tile.fill(...)` at 113×121 pt with `.allowsHitTesting(false)` (`ChatImageViewer.swift:37`) |
 
 Tapping any tile presents `ChatImageViewer` as a `fullScreenCover`.
 
@@ -687,7 +718,7 @@ Full-screen, black background, `TabView` with `.page` style (index dots hidden):
 |---|---|
 | Background fade on drag | `1 - min(dragOffset.height / 400, 0.6)` |
 | Scale on drag | `max(1 - dragOffset.height / 2000, 0.85)` |
-| Dismiss gesture | Downward drag > 120 pt height and height > width |
+| Dismiss gesture | Downward drag > 120 pt height; see dismiss-gesture guards below |
 | Snap-back animation | `.spring(duration: 0.3)` |
 | Double-tap zoom | Toggles between 1× and 2.5×, spring `.spring(duration: 0.3)` |
 | Pinch zoom range | 1×–4× |
@@ -696,11 +727,27 @@ Full-screen, black background, `TabView` with `.page` style (index dots hidden):
 | Gestures hidden during zoom | Dismiss drag disabled when `anyZoomed` |
 | Status bar | Hidden |
 
+### Dismiss-gesture guards
+
+The dismiss `DragGesture(minimumDistance: 15)` is attached via `.simultaneousGesture`. Both the tracking (`.onChanged`) and the activation (`.onEnded`) have distinct guards (`ChatImageViewer.swift:129–147`):
+
+- **`.onChanged`** only updates `dismissDrag` when ALL of: `!anyZoomed`, `value.translation.height > 0` (downward only), AND `abs(height) > abs(width)` (more vertical than horizontal). A sideways-then-down drag never starts tracking the dismiss, so paging between images is not hijacked.
+- **`.onEnded`** closes only when `!anyZoomed` AND `value.translation.height > 120`; otherwise `dismissDrag` springs back to `.zero` via `.spring(duration: 0.3)`.
+
+### Zoom pan (`ZoomablePagedImage`)
+
+Each paged image owns pinch, double-tap, and a pan gesture (`ChatImageViewer.swift:199–247`):
+
+- Pan is attached via `.highPriorityGesture(self.scale > 1 ? self.pan : nil)` — it is **only active while zoomed in** (`scale > 1`); at 1× the gesture is `nil` so the paging/dismiss gestures own the drag.
+- Pan offsets **accumulate across gestures**: `.onChanged` sets `offset = lastOffset + value.translation`, and `.onEnded` commits `lastOffset = offset`, so a second drag continues from where the first ended rather than snapping back to origin.
+- `resetZoom()` (double-tap to 1×, pinch-snap below 1.05×, or `.onDisappear`) zeroes `scale`, `lastScale`, `offset`, `lastOffset`, and `anyZoomed`.
+
 ### Overlay buttons
 
-`HStack`, `.padding(.horizontal, 20)`, `.padding(.top, 8)`. Hidden when drag is non-zero (`.opacity(dismissDrag == .zero ? 1 : 0)`):
-- Close: Asset `ChatCloseGlyph`, 24×24 pt icon, 40×40 pt hit area, `ChatGlassBackground(fill: rgb(30,30,30).opacity(0.2))`, white.
-- Save: Asset `ChatDownloadGlyph` / `checkmark` SF symbol, same sizing. Success haptic `OpenClawHaptics.success()`. Reverts after 1.5 s via `.smooth(duration: 0.2)`.
+`HStack`, `.padding(.horizontal, 20)`, `.padding(.top, 8)`. Hidden when drag is non-zero (`.opacity(dismissDrag == .zero ? 1 : 0)`). Both buttons share the `glassButton` builder: icon frame 24×24 pt, outer hit frame 40×40 pt, `.foregroundStyle(.white)`, background `ChatGlassBackground(fill: rgb(30,30,30).opacity(0.2))` (default `Capsule` shape, no hairline) (`ChatImageViewer.swift:149–174`).
+
+- **Close:** Asset `ChatCloseGlyph`, `.renderingMode(.template)`, resizable `.scaledToFit`.
+- **Save:** default state asset `ChatDownloadGlyph` (`.template`, resizable, `.scaledToFit`). **Saved state** renders `Image(systemName: "checkmark")` at `.font(.system(size: 18, weight: .semibold))` — an SF symbol, NOT a 24×24 asset (it inherits the shared 24×24 outer group frame but has no explicit image frame of its own). Tapping writes the current image to the photo album, fires `OpenClawHaptics.success()`, and sets `saved = true` with `.smooth(duration: 0.2)`. A `Task.sleep(.seconds(1.5))` then reverts `saved = false`, again with `.smooth(duration: 0.2)` — there is no `.easeOut` pairing. The close button's glass fill never changes; the 24×24 asset sizing applies to the default-state icons only.
 
 ---
 
@@ -741,8 +788,10 @@ Tapping:
 |---|---|
 | Recording | `recordingField` on `fieldPillBackground` |
 | Voice note staged | `StagedVoiceNoteField` on `ChatGlassBackground(shape: RoundedRectangle(cornerRadius: 15), fill: composerGlassFill, hairline: true)` |
-| No attachments | `inputField` on `fieldPillBackground` |
-| Attachments present | `VStack(spacing: 8)` with `pendingAttachmentStrip` above `inputField`, wrapped in `ChatGlassPanel(cornerRadius: 15)` |
+| No attachments | `inputField` with `.frame(minHeight: 36)` on `fieldPillBackground` |
+| Attachments present | `VStack(alignment: .leading, spacing: 8)` with `pendingAttachmentStrip` above `inputField`, then `.padding(5)`, backed by `ChatGlassPanel(fill: composerGlassFill, cornerRadius: 15)` (`ChatRootSurface.swift:1140–1146`) |
+
+The `.padding(5)` sits between the inner `VStack` and the `ChatGlassPanel` background, insetting the strip + field from the panel edge.
 
 The field content is wrapped in a `GeometryReader` background measuring `proxy.size.height` → `inputHeight`. Animated with `.spring(duration: 0.3)` on `viewModel.attachments.isEmpty`.
 
@@ -826,13 +875,13 @@ Tray-backdrop (full-screen tap catcher): `Color.black.opacity(0.001)`, closes th
 
 ### Image tile
 
-100×100 pt, `RoundedRectangle(cornerRadius: 10)`, `scaledToFill`. Dismiss button at `.topTrailing`: `ChatCloseGlyph` 12×12 pt, black, on a white `Circle`, 34×34 pt hit area, `.padding(4)`. Removal animated with `.spring(duration: 0.25)`.
+100×100 pt, `RoundedRectangle(cornerRadius: 10)`, `scaledToFill`. Dismiss button at `.topTrailing` (`ChatRootSurface.swift:1463–1484`): `ChatCloseGlyph` (`.template`, resizable, `.scaledToFit`) at 12×12 pt, `.foregroundStyle(.black)`, with `.padding(2)` around the icon, on a white `Circle` background. The button label then gets `.frame(width: 34, height: 34, alignment: .topTrailing)` + `.contentShape(Rectangle())` (so the 34×34 hit area extends inward over the image and isn't lost to the horizontal scroll gesture), and the whole `Button` gets an outer `.padding(4)`. The inner `.padding(2)` (icon→circle gap) and outer `.padding(4)` (button→neighbors gap) are distinct. Removal animated with `.spring(duration: 0.25)` plus `OpenClawHaptics.tap()`.
 
 ### File card tile (no preview)
 
-100×100 pt `RoundedRectangle(cornerRadius: 10)` filled `bubbleRed` (`rgb(195, 63, 51)`):
-- Extension label (top): `.system(size: 16)`, `white.opacity(0.6)`, `.padding(.leading, 6)`, `.padding(.top, 10)`.
-- File name (bottom): `.system(size: 16)`, white, `lineLimit(1)`, `.padding(.horizontal, 8)`, `.padding(.bottom, 11)`.
+100×100 pt, `ZStack(alignment: .topLeading)` with a `RoundedRectangle(cornerRadius: 10)` filled `bubbleRed` (`rgb(195, 63, 51)`) behind two labels (`ChatRootSurface.swift:1488–1509`):
+- Extension label (top): `fileExtensionLabel` (the filename's `pathExtension` uppercased, or `"FILE"` when empty), `.system(size: 16)`, `white.opacity(0.6)`, `.padding(.leading, 6)`, `.padding(.top, 10)`.
+- File name (bottom): the filename with its extension stripped via `(fileName as NSString).deletingPathExtension` (or `"file"` when the name is empty), `.system(size: 16)`, white, `lineLimit(1)`. Pinned to the bottom via `.frame(maxWidth: .infinity)` then `.frame(maxHeight: .infinity, alignment: .bottom)`, with `.padding(.horizontal, 8)` and `.padding(.bottom, 11)`.
 
 ---
 
@@ -851,12 +900,12 @@ Duration label format: `"%d:%02d"` (e.g., `"0:42"`).
 
 ### `StagedVoiceNoteField`
 
-`HStack(spacing: 12)`:
-- Play/pause button.
-- `ChatAmplitudeWaveform` 44 bars, `Color.primary.opacity(0.4)` inactive, `Color.primary` active.
-- Duration label: `.system(size: 12)`, monospaced digit.
+`HStack(spacing: 12)` (`ChatAudioComponents.swift:84–122`):
+- Play/pause button. When `playback.isPlaying`: `ChatPauseGlyph(color: Color.primary)`. When idle: `Image(systemName: "play.fill")` at `.font(.system(size: 16))` — note this is **16 pt**, 2 pt smaller than `AudioBubbleContent`'s 18 pt play icon (section 14). Foreground `Color.primary`.
+- `ChatAmplitudeWaveform` 44 bars, `Color.primary.opacity(0.4)` inactive, `Color.primary` active, `progress: playback.progress`, `.frame(maxWidth: .infinity, alignment: .leading)`, `.clipped()`.
+- Duration label: `.system(size: 12)`, `.monospacedDigit()`, `.lineLimit(1)`, `.fixedSize()`, `Color.primary`. Shows `playback.currentTime` while playing (when `> 0`), else `durationSeconds`.
 
-Padding: `.horizontal 14`, `minHeight: 36`.
+Padding: `.horizontal 14`, `minHeight: 36`. Levels load via `.task(id: self.data)` at `barCount: 44`.
 
 ---
 
@@ -894,12 +943,26 @@ Padding: `.horizontal 14`, `minHeight: 36`.
 
 ### `ChatGlassBackground`
 
-Generic background shape with iOS 26 `.glassEffect(.regular)` support, falling back to `.regularMaterial` + color fill overlay on older OS.
+Generic insettable-shape background parameterized by `shape`, `fill: Color`, and `hairline: Bool`. The branch order differs by OS and is load-bearing (`ChatRootSurface.swift:2803–2833`):
+
+- **iOS 26+:** `self.shape.fill(self.fill)` FIRST, then `.glassEffect(.regular, in: self.shape)` applied as a modifier on top. Because `.glassEffect` is a modifier over the already-filled shape, the Liquid Glass renders OVER the tint fill (the fill shows through/under the glass). (Audit framing "glass then fill on top / fill over glass" is backwards — see correction note.)
+- **Pre-iOS 26:** `self.shape.fill(.regularMaterial)` with `.overlay { self.shape.fill(self.fill) }` — material first, color fill layered on top as an overlay.
+
+After the OS branch, if `hairline == true`, a `self.shape.strokeBorder(Color.white.opacity(0.2), lineWidth: 0.3)` is overlaid.
 
 | Property | Value |
 |---|---|
 | Default shape | `Capsule(style: .continuous)` |
-| Hairline border | `Color.white.opacity(0.2)`, lineWidth 0.3 (optional) |
+| Hairline border | `Color.white.opacity(0.2)`, lineWidth 0.3 (optional; default `hairline: false`) |
+
+### `ChatGlassPanel`
+
+A rounded-rectangle sibling of `ChatGlassBackground` used for the composer attachment panel (section 20) and the attachment tray (section 21). Parameters: `fill: Color`, `cornerRadius: CGFloat` (no shape or hairline parameter). Same OS-branched layering as `ChatGlassBackground` (`ChatRootSurface.swift:2880–2898`):
+
+- **iOS 26+:** `RoundedRectangle(cornerRadius:, style: .continuous).fill(self.fill)` then `.glassEffect(.regular, in: .rect(cornerRadius: self.cornerRadius))` on top (glass over fill).
+- **Pre-iOS 26:** `RoundedRectangle(...).fill(.regularMaterial)` with `.overlay { RoundedRectangle(...).fill(self.fill) }`.
+
+There is no hairline on `ChatGlassPanel`.
 
 ### Key colors
 

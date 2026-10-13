@@ -94,6 +94,8 @@ All pushed destinations (Approvals, Permissions, Notifications, Voice Settings, 
 - Content inset via `.safeAreaInset(edge: .top, spacing: 0)` with the shared header (so the header is always above the scroll area, not inside it).
 - `.toolbar(.hidden, for: .navigationBar)` — native nav bar is hidden; this header owns navigation chrome.
 
+**Header-attachment pattern is `.safeAreaInset`, not `.overlay`, everywhere.** The screens with custom headers (Channels §4.4, Wake Words §4.7) do NOT use `SettingsDestinationChrome` but still attach their header the same way: `.safeAreaInset(edge: .top, spacing: 0) { header }` on the body `ZStack`. A rebuilder must not substitute `.overlay` for the header on any of these screens — the Connection sheet's close button (§5.3) is the only Settings header element that uses `.overlay`.
+
 **Header** (same markup for root screen and all destinations):
 
 ```
@@ -118,14 +120,14 @@ Source: `SettingsDestinationScreens.swift:16–68`.
 
 ### 1.7  Shared Component: `OpenClawToggleIndicator`
 
-Used by all toggle rows in destination screens (`settingsToggle`):
-
 - `Capsule()` frame 52×32 pt. Fill: `OpenClawBrand.accent` when on, `Color.secondary.opacity(0.35)` when off.
 - Overlay `Circle()` 28×28 pt with `Color.white` fill, 2 pt padding, `shadow(color: .black.opacity(0.14), radius: 1, x: 0, y: 1)`. Aligned `.trailing` when on, `.leading` when off.
 
-Toggle rows wrap the indicator in a full-width `Button` (`.buttonStyle(.plain)`) because native `Toggle` misses whole-row taps on iOS 26.
+Toggle rows that use this indicator wrap it in a full-width `Button` (`.buttonStyle(.plain)`) because native `Toggle` misses whole-row taps on iOS 26.
 
-Source: `OpenClawProComponents.swift:536–551`, `SettingsProTabSections.swift:1174–1198`.
+**Scope — do NOT assume universal use in the redesigned destinations.** `OpenClawToggleIndicator` (and the `settingsToggle` helper) belongs to the legacy `SettingsProTab` list surface. The redesigned **`VoiceSettingsScreen`** does NOT use it: both its master switch ("Talk Mode") and every sub-toggle ("Voice Wake", "Background Listening", "Speakerphone") are bare SwiftUI `Toggle(isOn:)` controls — see §4.6. A rebuilder must use native `Toggle` for Voice Settings, not the custom indicator.
+
+Source: `OpenClawProComponents.swift:536–551`, `SettingsProTabSections.swift:1174–1198`, `SettingsDestinationScreens.swift:581–648` (native-`Toggle` carve-out).
 
 ---
 
@@ -215,14 +217,14 @@ Source: `SettingsRootScreen.swift:92–112`.
 ```
 VStack(alignment: .leading, spacing: 5)
 ├── Text(title)                           // SF Pro medium 17pt, Color.primary.opacity(0.5)
-│   .padding(.leading, 17)
+│   .padding(.leading, 17)                // ← 17pt leading is on the Text, NOT the VStack
 └── VStack(spacing: 17)                  // row spacing = 17pt → ~34pt between row centers
     { content() }
     .padding(.vertical, 12)
     .openClawSectionBackground(cardFill)  // cornerRadius 12, continuous
 ```
 
-The section card uses `.openClawSectionBackground` which provides `cornerRadius: 12`. Horizontal padding is **NOT** on the card; it lives on each row via `rowInset()` so `OpenClawRowDivider` spans the full card width edge-to-edge.
+The `.padding(.leading, 17)` is applied to the header `Text` itself (inside the outer `VStack`), not to the `VStack`. The section card uses `.openClawSectionBackground` which provides `cornerRadius: 12`. Horizontal padding is **NOT** on the card; it lives on each row via `rowInset()` so `OpenClawRowDivider` spans the full card width edge-to-edge.
 
 Source: `SettingsRootScreen.swift:151–165`.
 
@@ -234,10 +236,13 @@ Button(onOpenConnection) {
     ├── Image("SettingsWifiGlyph")       // 22×22pt, template, OpenClawBrand.welcomeLink blue
     └── Text("Connection")               // OpenClawType.body, OpenClawBrand.welcomeLink blue
     Spacer(minLength: 0)
-    .padding(.leading, 16)
+    .padding(.leading, 16)               // leading-only; NO trailing padding
     .frame(height: 50, maxWidth: .infinity)
     .openClawSectionBackground(cardFill)
+}                                        // NO .buttonStyle(.plain) — default iOS button style
 ```
+
+Padding is **leading-only** (`.padding(.leading, 16)`); do not add symmetric trailing padding. The right edge is produced by `Spacer(minLength: 0)` expanding inside `.frame(maxWidth: .infinity)`. The button also **does not** apply `.buttonStyle(.plain)` (unlike the card rows in §3.6), so the pill shows the default iOS tap-highlight state; this absence is intentional, not an oversight.
 
 Source: `SettingsRootScreen.swift:168–188`.
 
@@ -282,12 +287,14 @@ Source: `SettingsRootScreen.swift:190–222`.
 ### 3.7  Default Agent Row
 
 Non-tappable row (no `Button` wrapper). Trailing varies:
-- If `hasAdminScope == true` AND `agentOptions.count > 1`: a `Menu` listing all agents. Menu label uses `pickerTrailing(name)` (see §3.8).
-- Otherwise: plain `Text(name)` in `OpenClawType.callout`, `Color.primary.opacity(0.6)`.
+- If `hasAdminScope == true` AND `agentOptions.count > 1`: a `Menu` listing all agents. Menu label uses `pickerTrailing(defaultAgent?.name ?? "—")` (see §3.8).
+- Otherwise: plain `Text(defaultAgent?.name ?? "—")` in `OpenClawType.callout`, `Color.primary.opacity(0.6)`.
 
-The agent name is trimmed whitespace; empty name falls back to `agent.id`. The selection resolves: `selectedAgentId` > `gatewayDefaultAgentId` > first in list.
+**Displayed label fallback is the em dash `"—"`, NOT `agent.id`.** Both the `Menu` label and the plain-text branch render `self.defaultAgent?.name ?? "—"`. The `agent.id` fallback is a different thing: it is used only inside `SettingsRootContainer.agentOptions` when *building picker option labels* (so each menu entry has a stable display string), never in the trailing display label. A rebuilder must render `"—"` when there is no default agent, not an id.
 
-Source: `SettingsRootScreen.swift:224–252`, `SettingsRootScreen.swift:382–401`.
+The displayed name itself is the agent's `name` as stored. The selection resolves: `selectedAgentId` > `gatewayDefaultAgentId` > first in list.
+
+Source: `SettingsRootScreen.swift:224–252` (display label), `SettingsRootScreen.swift:382–401` (`agentOptions` id fallback).
 
 ### 3.8  Theme Row and Picker Trailing
 
@@ -401,26 +408,30 @@ Source: `SettingsDestinationScreens.swift:90–242`.
 ```
 SettingsDestinationChrome(title: "Notifications")
 └── ScrollView
-    └── Button(action: requestOrOpenSettings) {
+    └── Button(action: requestOrOpenSettings) {   // Button is a DIRECT child of ScrollView — no wrapper VStack
         HStack
         ├── Text("Allow Notifications") — OpenClawType.body, OpenClawBrand.welcomeLink
         ├── Spacer(minLength: 0)
         └── Text(authorized ? "Enabled" : "Disabled") — OpenClawType.callout, Color.primary.opacity(0.6)
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 16)        // ↓ these four modifiers are all on the Button, NOT a wrapper view
         .frame(height: 50)
         .openClawSectionBackground(cardFill)
-        .padding(.horizontal, 24)
-        .padding(.top, 4)
     }
+    .padding(.horizontal, 24)
+    .padding(.top, 4)
 ```
+
+The `Button` is the only (direct) child of the `ScrollView`; there is no enclosing `VStack`. The pill geometry modifiers (`.padding(.horizontal, 16)`, `.frame(height: 50)`, `.openClawSectionBackground`) are on the button's label content, and the outer `.padding(.horizontal, 24)` / `.padding(.top, 4)` are on the button itself.
 
 **Button behavior (`requestOrOpenSettings`):**
 - If authorization status is `.notDetermined`: calls `UNUserNotificationCenter.requestAuthorization(options: [.alert, .badge, .sound])`. On grant, sets `authorized = true`.
 - Any other status: opens `UIApplication.openSettingsURLString`.
 
+**Authorized determination (`refreshAuthorization`):** `authorized = (status == .authorized || status == .provisional)`. Both `.authorized` **and `.provisional`** render "Enabled"; a rebuilder that treats only `.authorized` as enabled would wrongly show "Disabled" for provisionally authorized users.
+
 **Refresh triggers:** `.onAppear` + `UIApplication.didBecomeActiveNotification`.
 
-Source: `SettingsDestinationScreens.swift:246–311`.
+Source: `SettingsDestinationScreens.swift:246–311` (provisional at `287–291`; button-as-direct-child at `255–270`).
 
 ### 4.4  Channels Screen (`ChannelsScreen` / `ChannelsScreenHost`)
 
@@ -432,24 +443,31 @@ Source: `SettingsDestinationScreens.swift:246–311`.
 ZStack {
     Text("Channels") — SF Pro medium 20pt, Color.primary
     HStack {
-        back button — 40×40 glass circle (same as other headers)
+        back button — 40×40 glass circle; Image(systemName: "chevron.left") SF Pro semibold 17pt,
+                       .background { ChatGlassBackground(shape: Circle(), fill: glassFill) }
+                       — NO individual .shadow on the button
         Spacer()
         if hasAdminScope && !channels.isEmpty:
             Button("Edit" / "Done") {
                 withAnimation(.smooth(duration: 0.2)) { editing.toggle() }
             }
             .font(OpenClawType.subhead)
+            .foregroundStyle(Color.primary)
             .frame(width: 55, height: 33)
-            .background { ChatGlassBackground(fill: glassFill) }
+            .background { ChatGlassBackground(fill: glassFill) }   // shape: OMITTED (default shape, NOT Circle())
     }
     .padding(.horizontal, 24)
-    .shadow(color: .black.opacity(0.15), radius: 25, x: 0, y: 0)
+    .shadow(color: .black.opacity(0.15), radius: 25, x: 0, y: 0)   // shadow is on the HStack, not any button
 }
 .padding(.top, 8)
 .padding(.bottom, 29)
 ```
 
 Header bottom padding is **29 pt** (vs 21 pt for other destinations).
+
+**Shadow placement (differs from `SettingsDestinationChrome`):** In the shared chrome (§1.6) the glass circle back button carries its own `.shadow(…radius: 25…)`. Here the back button has **no** individual shadow; the `.shadow(color: .black.opacity(0.15), radius: 25, x: 0, y: 0)` sits on the enclosing `HStack` (after `.padding(.horizontal, 24)`). The same structural pattern applies to the Wake Words header (§4.7).
+
+**Edit/Done glass background:** the `Edit`/`Done` button's `ChatGlassBackground(fill: glassFill)` **omits the `shape:` argument**, so it uses `ChatGlassBackground`'s default shape — do **not** pass `shape: Circle()` (which is used only for the 40×40 circular buttons).
 
 **Body:**
 
@@ -492,7 +510,15 @@ Same capsule geometry as channel pill, but uses `ChatPlusGlyph` in `OpenClawBran
 
 **Remove flow:** Tapping the remove button fires `OpenClawHaptics.error()` immediately, then calls `onRemoveChannel`. The host calls `channels.logout` for every account of the channel, then reloads.
 
-**Data reload:** re-fetches on `task(id: reloadKey)` where reloadKey = `"\(isConnected)-\(scenePhase == .active)"`. Refreshes when gateway connection state or scene phase changes.
+**Data reload:** re-fetches on `task(id: reloadKey)` where the `ChannelsScreenHost` reload key is exactly:
+
+```swift
+private var reloadKey: String {
+    "\(self.appModel.isOperatorGatewayConnected)-\(self.scenePhase == .active)"
+}
+```
+
+The connection term is `appModel.isOperatorGatewayConnected` — there is **no** `isConnected` property at this call site, so wiring based on a generic `isConnected` boolean would not compile. Refreshes when gateway connection state or scene phase changes.
 
 Source: `SettingsDestinationScreens.swift:313–557`.
 
@@ -503,6 +529,14 @@ Used inside `SettingsProTabSections.destination(for: .channels)` and `ChatDrawer
 **Layout:** `VStack(alignment: .leading, spacing: 14)` containing:
 1. `summaryCard` (optional, `showsSummaryCard: Bool`): `ProCard` with `ProIconBadge`, title "Channels / Integrations", detail text, `ProValuePill` status chip.
 2. `channelsCard`: `ProCard(padding: 0, radius: SettingsLayout.cardRadius)` with `ProPanelHeader("Message Routing", value: count)` and per-channel `SettingsChannelRow`.
+
+**Two distinct dividers — note the different leading insets:**
+- **Between `SettingsChannelRow`s** (channel-to-channel, inside `channelsCard`): `Divider().padding(.leading, 58)`. Rendered only for `index > 0` in the `ForEach` over channel entries. If no channel plugins are reported, a `ProStatusRow` empty state is shown instead (icon `"tray"`, title "No channel plugins reported", detail "Install or enable channel plugins on the gateway, then refresh.", value "empty", color `.secondary`).
+- **Between accounts** (inside a single `SettingsChannelRow`): `Divider().padding(.leading, 38)` (see per-account section below).
+
+A rebuilder must not apply 38 pt to all dividers; the channel-level divider is 58 pt.
+
+Source: `SettingsChannelsDestination.swift:88–98` (channel-level 58pt divider + empty state).
 
 **Per-channel row** (`SettingsChannelRow`):
 
@@ -535,11 +569,20 @@ HStack(spacing: 10)
 │   ├── Text(displayName) — OpenClawType.captionSemiBold
 │   └── Text(detailText) — OpenClawType.caption2, .secondary
 ├── Spacer(minLength: 8)
-└── Menu { Start/Stop/Logout buttons } label: { Image(systemName: "ellipsis.circle" | "hourglass" | "lock.shield") }
+└── Menu { Start/Stop/Logout buttons } label: { Image(systemName: actionMenuIcon(account)) }
     .buttonStyle(.bordered).controlSize(.mini)
-    .disabled(!canAdmin || isBusy)
+    .disabled(!canAdmin || isBusy(account))
 .padding(.vertical, 8)
 ```
+
+**Menu icon precedence (`actionMenuIcon`) — exact branch order:**
+1. If `isBusy(account)` → `"hourglass"` (checked first).
+2. Else if `!canAdmin` → `"lock.shield"`.
+3. Else → `"ellipsis.circle"`.
+
+`isBusy(account)` is true when `busyOperation?.channelID == entry.id && busyOperation?.accountID == account.id`. A rebuilder cannot infer this precedence from the icon set alone; busy always wins over the admin-lock icon.
+
+Source: `SettingsChannelsDestination.swift:448–460`.
 
 **Channel status values:** "connected" → "running" → "linked" → "configured" → "not set". Color: ok (connected/running), warn (lastError), accent (configured but idle), secondary (unconfigured).
 
@@ -559,7 +602,8 @@ Source: `SettingsChannelsDestination.swift`.
 SettingsDestinationChrome(title: "Voice Settings")
 └── ScrollView
     └── VStack(alignment: .leading, spacing: 26)
-        ├── Toggle row "Talk Mode" — master switch
+        ├── Toggle(isOn: $talkModeEnabled) { Text("Talk Mode") } — master switch
+        │   // bare SwiftUI Toggle — NOT OpenClawToggleIndicator (see §1.7 carve-out)
         │   .padding(.horizontal, 17)
         │   .frame(height: 50)
         │   .openClawSectionBackground(cardFill)
@@ -597,7 +641,7 @@ Section leading inset is **15 pt** (vs 17 pt on the root screen). Row inset is a
 - Picker row: "Provider" — same pattern.
 - "Wake Words" → navigation button (chevron right).
 
-**Toggle row** (`toggleRow`):
+**Toggle row** (`toggleRow`): a **bare SwiftUI `Toggle`** wrapped only in `rowInset` (15 pt horizontal). This screen does **not** use `OpenClawToggleIndicator` anywhere — neither the master switch nor these sub-toggles (see §1.7).
 ```
 rowInset(Toggle(isOn: isOn) {
     Text(title) — OpenClawType.body, Color.primary
@@ -689,7 +733,11 @@ HStack(spacing: 12)
 
 `WakeWords.resetRed` = `Color(red: 195/255, green: 63/255, blue: 51/255)`.
 
-**Add word alert:** `alert("New Wake Word", isPresented: $showsAddAlert)` with a `TextField("wake word", text: $newWord)` and "Add" / "Cancel" buttons. "Add" trims + lowercases, skips if empty or duplicate, fires `OpenClawHaptics.tap()`, then `onAddWord(trimmed)`.
+**Add button (header):** tapping the `+` button runs `self.newWord = ""` **then** `self.showsAddAlert = true`. The pre-reset to `""` is required — without it, reopening the alert would show the previously typed word.
+
+**Add word alert:** `alert("New Wake Word", isPresented: $showsAddAlert)` with a `TextField("wake word", text: $newWord)`, "Add" / "Cancel" buttons, and a **message body** `Text("The phrase your gateway listens for.")`. "Add" trims + lowercases, skips if empty or duplicate, fires `OpenClawHaptics.tap()`, then `onAddWord(trimmed)`.
+
+Source: `SettingsDestinationScreens.swift:810–818` (message body), `837–838` (`newWord` pre-reset).
 
 **Storage + host:** `WakeWordsScreenHost` owns `@State var words` seeded from `VoiceWakePreferences.loadTriggerWords()`. Add/remove/reset calls `VoiceWakePreferences.sanitizeTriggerWords`, saves to prefs, and calls `appModel.setGlobalWakeWords(sanitized)` asynchronously.
 
@@ -718,19 +766,21 @@ SettingsDestinationChrome(title: "Licenses")
 **Card:**
 
 ```
-VStack(spacing: 17)                           // 17pt between rows
+VStack(spacing: 17)                           // ← all of these modifiers are on THIS inner VStack
 ForEach (index, document) in documents:
 ├── row(document)
 └── if index < count - 1: divider
 .padding(.vertical, 14)
-.padding(.horizontal, 15)
-.openClawSectionBackground(cardFill)          // dark: .black, light: .white
-.padding(.horizontal, 24)
+.padding(.horizontal, 15)                      // 15pt horizontal is on the inner VStack, not an outer container
+.openClawSectionBackground(cardFill)           // cardFill = (dark ? .black : .white), both explicit
+.padding(.horizontal, 24)                       // page inset applied AFTER the card background
 .padding(.top, 4)
 .accessibilityIdentifier("settings-licenses-list")
 ```
 
-Note: `cardFill` for `LicensesScreen` is `dark: .black` (not `rgb(10,10,10)`). Source: `LicenseDocuments.swift:156`.
+The `.padding(.horizontal, 15)` and `.padding(.vertical, 14)` are on the inner row `VStack` (the content inside the card background); the `.padding(.horizontal, 24)` page inset is applied **after** `.openClawSectionBackground`, so the 15 pt sits inside the card and 24 pt sits outside it.
+
+Note: `cardFill` for `LicensesScreen` is explicitly `colorScheme == .dark ? .black : .white` — the dark value is pure `.black` (not `rgb(10,10,10)` as other section cards use) and the light value `.white` is set explicitly, not relied on as a default. Source: `LicenseDocuments.swift:155–157`.
 
 **License row:**
 ```
@@ -882,7 +932,15 @@ HStack {
 .openClawSectionBackground(cardFill)
 ```
 
-"Full access" confirmation dialog: "Switch to full access mode requires you to scan a new QR code."
+**"Full access" confirmation dialog** (`confirmationDialog(..., isPresented: $confirmingFullAccess, titleVisibility: .visible)`):
+- **Title:** `"Switch to full access?"`
+- **Action button:** `"Scan QR Code"` (calls `onScanFullAccess()`) — NOT "Switch".
+- **Cancel button:** `"Cancel"` (role `.cancel`).
+- **Message body:** `"Switching to full access mode requires you to scan a new QR code to take effect."`
+
+(The phrase "Switching to full access mode requires you to scan a new QR code to take effect." is the message body, not the title.)
+
+Source: `ConnectionSheet.swift:244–258`.
 
 ### 5.7  Access Note (limited access only)
 
@@ -903,7 +961,18 @@ HStack {
 
 `confirmationDialog("Disconnect from this gateway?", titleVisibility: .visible)` with "Disconnect" (destructive) + "Cancel", message "This clears saved gateway credentials and reopens onboarding."
 
-On confirm, `onDisconnect()` is called: calls `onClose()` then `GatewayOnboardingReset.reset(...)` to clear all credentials and re-open onboarding.
+On confirm, the dialog's destructive button invokes the `onDisconnect` closure. `ConnectionSheet` itself only calls `self.onDisconnect()` (`ConnectionSheet.swift:89`); the real work lives in the `ConnectionSheetHostView` closure, which runs in this exact order:
+
+```swift
+onDisconnect: {
+    self.onClose()                      // 1. dismiss the sheet synchronously first
+    Task { await self.disconnect() }    // 2. then async: GatewayOnboardingReset.reset(...)
+}
+```
+
+So the sheet is closed **before** the async reset runs, and the reset (`GatewayOnboardingReset.reset(appModel:instanceId:)`) is wrapped in a detached `Task` — it clears all gateway credentials and re-opens onboarding. A rebuilder must dismiss first, then run the reset asynchronously, not the reverse.
+
+Source: `ConnectionSheet.swift:84–98`, `SettingsRootScreen.swift:419–453`.
 
 ### 5.9  Data Wiring (`ConnectionSheetHostView`)
 

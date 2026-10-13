@@ -143,8 +143,11 @@ GeometryReader (proxy)
     │   ├── drawerCanvas.ignoresSafeArea()                  ← inner backdrop fills edges under transform
     │   └── drawerContent(topInset:, trailingInset:)        ← scrollable list + scrim + header
     │       (ZStack, alignment: .topLeading)
+    │       │   .frame(maxHeight: .infinity, alignment: .top)  ← fills full height
+    │       │   .ignoresSafeArea(edges: .top)                  ← extends under the notch
     │       ├── ScrollView (scrollIndicators: .hidden)
     │       │   └── VStack(alignment: .leading, spacing: 0)
+    │       │       │   .frame(maxWidth: .infinity, alignment: .leading)  ← fills width, left-aligned
     │       │       ├── VStack(spacing: 23) — destination rows × 7
     │       │       ├── VStack(spacing: 22) — "Main" section (padding .top 32)
     │       │       │   ├── Text("Main")
@@ -275,6 +278,20 @@ Source: `Sources/Design/ChatDrawer.swift:125-126, 149-177`
 - Reset to `nil` on `.onEnded`.
 
 Source: `Sources/Design/ChatDrawer.swift:48-50, 157-163`
+
+#### Closed-State Offset Floor Clamp
+
+When the drawer is closed and `openSwipeEngaged == true`, the accumulated offset is floored at zero:
+
+```swift
+if self.openSwipeEngaged == true {
+    self.dragOffset = max(0, value.translation.width)
+}
+```
+
+Source: `Sources/Design/ChatDrawer.swift:161-163`
+
+The `max(0, …)` prevents the chat from sliding left past `x = 0` during an open-swipe (a leftward finger jitter within an engaged rightward drag cannot drag the panel negative). This floor applies only in the closed state. When the drawer is already open, the raw `value.translation.width` is assigned directly (no `max(0,…)`), so a leftward drag can reduce the offset toward close — the `currentOffset(open:)` clamp alone bounds it to `[0, openOffset]`.
 
 #### Minimum Distance
 
@@ -412,33 +429,49 @@ The scrim is placed as a full-width overlay inside `drawerContent`'s `ZStack`, a
 ## 11. Drawer Header
 
 ```
-HStack
+HStack                                        ← no explicit spacing: (SwiftUI default)
 ├── Text("OpenClaw")
 │     .font(.system(size: 25.6, weight: .semibold))
 │     .foregroundStyle(Color.primary)
 ├── Spacer(minLength: 0)
-└── Button (compose / new session)
+└── Button { onNewSession(); close() }         ← .buttonStyle(.plain)
       label:
         Image("ChatPlusGlyph") — template, 20×20 pt
           .foregroundStyle(Color.primary)
-          .frame(40×40)
+          .frame(width: 34, height: 34)         ← hit area / glass circle
           .background { ChatGlassBackground(shape: Circle(), fill: glassFill) }
           .shadow(color: .black.opacity(0.15), radius: 25, x: 0, y: 0)
+.padding(.leading, 14)                          ← header's OWN internal leading
+.padding(.trailing, 8)                          ← header's OWN internal trailing
 ```
 
 Source: `Sources/Design/ChatDrawer.swift:233-264`
 
 | Property | Value |
 |---|---|
+| HStack spacing | none specified — SwiftUI default (`.padding(.leading, 14)` / `.padding(.trailing, 8)` plus the `Spacer` do the spacing) |
 | Title font | `.system(size: 25.6, weight: .semibold)` |
 | Title color | `Color.primary` |
-| Compose glyph | `"ChatPlusGlyph"` (template image), 20×20 pt |
-| Compose button hit area | `frame(width: 40, height: 40)` |
+| Compose glyph | `"ChatPlusGlyph"` (template image), 20×20 pt inner frame |
+| Compose button hit area | `.frame(width: 34, height: 34)` (the glass circle; NOT 40×40) |
+| Compose button style | `.buttonStyle(.plain)` — suppresses the default system press highlight |
 | Compose button background | `ChatGlassBackground(shape: Circle(), fill: glassFill)` |
 | Compose button shadow | `.black.opacity(0.15)`, radius `25`, x `0`, y `0` |
-| Header leading padding | `8` pt (`.padding(.leading, 8)` on the whole `drawerHeader`, applied in `drawerContent`) |
-| Header trailing padding | `trailingInset` (= `proxy.size.width - openOffset + 16`) |
-| Header top padding | `topInset + 8` |
+| Header's own leading padding | `14` pt (`.padding(.leading, 14)` on the `drawerHeader` HStack itself, line 262) |
+| Header's own trailing padding | `8` pt (`.padding(.trailing, 8)` on the `drawerHeader` HStack itself, line 263) |
+| Container leading padding | `8` pt (`.padding(.leading, 8)` added by `drawerContent`, line 340) |
+| Container trailing padding | `trailingInset` (= `proxy.size.width - openOffset + 16`, line 341) |
+| Container top padding | `topInset + 8` (line 342) |
+
+Source: `Sources/Design/ChatDrawer.swift:234, 249, 260, 262-263, 340-342`
+
+### Compound Insets
+
+The header's content insets are the sum of the header's OWN padding and the container padding `drawerContent` applies to it:
+
+- **Effective leading inset** of the "OpenClaw" title from the `ScrollView`/screen strip edge = container `8` + header `14` = **`22` pt**.
+- **Effective trailing gap**: the container adds `trailingInset` (keeps the header left of the chat panel), and the header's own `.padding(.trailing, 8)` gives the compose button a fixed `8` pt gap from the header's right boundary, independent of `trailingInset`.
+- **Top**: `topInset + 8` places the header just below the notch.
 
 Tapping the compose button calls `onNewSession()` then `close()`, switching to a fresh session and closing the drawer simultaneously.
 
@@ -586,16 +619,24 @@ State:
 ```
 
 Flow:
-1. Long-press any session row → context menu with "Rename" (`pencil` SF Symbol).
+1. Long-press any session row → context menu with "Rename" (`pencil` SF Symbol). This "Rename" item is **always present**, including on the Main session row — it sits outside the `if pinnable` block, so suppressing pinning on Main (`pinnable: false`) does not remove its Rename option.
 2. Tap "Rename": sets `renameText = title`, `renameTargetID = id`.
-3. Alert is presented (bound to `renameTargetID != nil`).
+3. Alert is presented via a **computed `Binding<Bool>`** (not a plain `@State Bool`), derived from `renameTargetID`:
+
+   ```swift
+   .alert("Rename chat", isPresented: Binding(
+       get: { renameTargetID != nil },
+       set: { if !$0 { renameTargetID = nil } }))
+   ```
+
+   The `get` returns `true` whenever a target is set; the `set` clears `renameTargetID` when the alert dismisses. A rebuilder must mirror this derived binding — a separate `@State var showRenameAlert: Bool` would desync from `renameTargetID`.
 4. Alert has a `TextField("Name", text: $renameText)`, "Cancel" button (role `.cancel`), and "Save" button.
-5. "Save": calls `onRenameSession(id, renameText)`, then clears `renameTargetID`.
-6. Alert dismiss (Cancel or background tap): clears `renameTargetID`.
+5. "Save": calls `onRenameSession(id, renameText)` (guarded by `if let id = renameTargetID`), then clears `renameTargetID`.
+6. Alert dismiss (Cancel button or the binding's `set(false)`): clears `renameTargetID`.
 
-Source: `Sources/Design/ChatDrawer.swift:407-411, 346-361`
+Source: `Sources/Design/ChatDrawer.swift:407-413, 346-361`
 
-The alert text label is `"Rename chat"`.
+The alert title string is `"Rename chat"`.
 
 ### Pin / Unpin (context menu)
 
@@ -687,9 +728,17 @@ Source: `Sources/Design/CronJobsScreen.swift:31-50`
 
 ---
 
-## 20. ScrollView Insets
+## 20. ScrollView Insets and Container Frame
 
-Inside `drawerContent`, the content `VStack` receives:
+### Content VStack Frame
+
+Before any padding, the content `VStack(alignment: .leading, spacing: 0)` applies `.frame(maxWidth: .infinity, alignment: .leading)` (line 322). This fills the available horizontal space inside the `ScrollView` and left-aligns the rows so the active pill and row labels anchor to the left edge rather than centering.
+
+Source: `Sources/Design/ChatDrawer.swift:322`
+
+### Content VStack Padding
+
+Inside `drawerContent`, the content `VStack` receives (after the frame above):
 
 | Edge | Value | Reason |
 |---|---|---|
@@ -699,3 +748,14 @@ Inside `drawerContent`, the content `VStack` receives:
 | `.bottom` | `scaleBleed + 24` = `90 + 24 = 114` pt | Last row rests at the visible bottom; the ScrollView's clip sits off-screen. |
 
 Source: `Sources/Design/ChatDrawer.swift:322-332`
+
+### Outer `drawerContent` ZStack Frame
+
+The outer `ZStack(alignment: .topLeading)` of `drawerContent` (which holds the `ScrollView`, the `drawerTopScrim`, and the `drawerHeader`) applies two modifiers after its children:
+
+| Modifier | Reason |
+|---|---|
+| `.frame(maxHeight: .infinity, alignment: .top)` | Forces the content container to fill the full available height and top-align, so the `ScrollView` runs the whole screen height rather than sizing to content. |
+| `.ignoresSafeArea(edges: .top)` | Extends the container under the notch so the `ScrollView`'s top clip and the scrim's top edge land at the physical screen top (not below the status bar), eliminating a visible mid-screen seam above "OpenClaw". |
+
+Source: `Sources/Design/ChatDrawer.swift:344-345`

@@ -89,8 +89,8 @@ All `Font` values are `UIFontMetrics`-scaled (Dynamic Type) relative to the stat
 
 | UIKit context | Font token | Base size | Max point size |
 |---|---|---|---|
-| `UINavigationBar` inline title | Inter SemiBold, `.headline`-relative | 17 | 22 |
-| `UINavigationBar` large title | Display heavyTitle, `.largeTitle`-relative | 34 | 44 |
+| `UINavigationBar` inline title | Display opticalSemiBold (Red Hat Display), `.headline`-relative | 17 | 22 |
+| `UINavigationBar` large title | Display heavyTitle (Red Hat Display), `.largeTitle`-relative | 34 | 44 |
 | `UITabBarItem` normal | Inter Medium, `.caption2`-relative | 11 | 13 |
 | `UITabBarItem` selected | Inter SemiBold, `.caption2`-relative | 11 | 13 |
 | `UISegmentedControl` normal | Inter Medium, `.footnote`-relative | 13 | 16 |
@@ -210,7 +210,7 @@ Drawer canvas (`ChatDrawer.swift`):
 
 ### 3.2 Top Scrim — Chat Surface and Drawer
 
-Both the chat `topScrim` (`ChatRootSurface.swift:996`) and the drawer `drawerTopScrim` (`ChatDrawer.swift:210`) use an identical pattern:
+Both the chat `topScrim` (`ChatRootSurface.swift:996`) and the drawer `drawerTopScrim` (`ChatDrawer.swift:210`) use an identical **material / tint / mask** pattern but differ in frame height:
 
 - **Material:** `.ultraThinMaterial` (blurs scrolling content beneath)
 - **Dark-mode tint overlay:** canvas color at 72% opacity (dark mode only; light mode: opacity 0)
@@ -218,8 +218,17 @@ Both the chat `topScrim` (`ChatRootSurface.swift:996`) and the drawer `drawerTop
   - `black.opacity(0.6)` at location 0
   - `black.opacity(0.6)` at location 0.55
   - `.clear` at location 1.0
-- **Effect:** mask caps blur at ~50% so content shows through dimly, then fades to invisible
-- **Frame:** height 110 pt, full-width, `ignoresSafeArea(edges: .top)`, `allowsHitTesting(false)`
+- **Effect:** mask holds `black.opacity(0.6)` from location 0 to 0.55 (blur applied at ~half strength so sharp content shows through), then fades to `.clear` at location 1.0
+- **Common frame modifiers:** full-width (`frame(maxWidth: .infinity)`), `ignoresSafeArea(edges: .top)`, `allowsHitTesting(false)`
+
+**Frame height differs between the two:**
+
+| Scrim | Height | Citation |
+|---|---|---|
+| Chat `topScrim` | fixed 110 pt | `Sources/Design/ChatRootSurface.swift:996` |
+| Drawer `drawerTopScrim` | dynamic: `topInset + headerReserve` = `safeAreaInsets.top + 62` pt | `Sources/Design/ChatDrawer.swift:227` |
+
+The drawer scrim is parameterized by the passed-in `topInset` (the window's top safe-area inset) plus the 62 pt `headerReserve`; it is NOT a fixed 110 pt. A rebuilder must thread the safe-area top inset into the drawer scrim height, not hard-code 110.
 
 ---
 
@@ -276,21 +285,70 @@ Call site: `ChatGlassPanel(fill: composerGlassFill, cornerRadius: 15)`.
 
 ### 4.3 `openClawGlassSurface(radius:)` View Modifier
 
-Defined in `OpenClawProComponents.swift`. Default `radius` = `OpenClawProMetric.controlRadius` (12).
+Defined in `OpenClawProComponents.swift:206–218, 244`. Default `radius` = `OpenClawProMetric.controlRadius` (12).
 
 **iOS 26+:** `.glassEffect(.regular, in: .rect(cornerRadius: radius))`
 **iOS < 26:** `.background(.regularMaterial, in: RoundedRectangle(cornerRadius: radius, style: .continuous))`
 
 Used for glass-button and drawer control surfaces not in the chat composer.
 
+### 4.3a `openClawGlassButton(prominent:tint:)` View Modifier
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:165–194, 236`
+
+Applies a platform-native glass button style. All four branches first apply `.font(OpenClawType.subheadSemiBold)`, then set `buttonStyle` and `tint`.
+
+| Platform | prominent | buttonStyle | tint |
+|---|---|---|---|
+| iOS 26+ | `true` | `.glassProminent` | `tint ?? OpenClawBrand.accent` |
+| iOS 26+ | `false` | `.glass` | `tint` (may be `nil`) |
+| iOS < 26 | `true` | `.borderedProminent` | `tint ?? OpenClawBrand.accent` |
+| iOS < 26 | `false` | `.bordered` | `tint` (may be `nil`) |
+
+### 4.3b `OpenClawGlassControlGroup` Container
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:344–356`
+
+Wraps its content. On iOS 26+ wraps in `GlassEffectContainer(spacing: 8)` so grouped glass controls merge/morph correctly; on iOS < 26 it is a plain passthrough (renders `content` directly, no container). Used around the action-button `HStack` in `OpenClawNoticeBanner`.
+
+### 4.3c `openClawTabBarBehavior()` View Modifier
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:196–204, 240`
+
+On iOS 26+ applies `.tabBarMinimizeBehavior(.onScrollDown)` (the tab bar minimizes as the user scrolls down); on iOS < 26 it is a passthrough. New tab content must apply this modifier to match the system minimize behavior.
+
 ### 4.4 `openClawCraftSurface(cornerRadius:shadow:)`
+
+**Source:** `apps/ios/Sources/Design/OpenClawBrand.swift:244–273`
 
 Activation/onboarding card surface. Default `cornerRadius` = 24, `shadow` = true.
 
 Layers (bottom to top):
 1. `RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).fill(activationSurface)` + optional shadow `(black.opacity(0.07), radius: 16, x: 0, y: 8)`
-2. `.overlay(alignment: .top)`: `strokeBorder(Color.white.opacity(0.36), lineWidth: 0.5)` with `.blendMode(.plusLighter)`
-3. `.overlay`: `strokeBorder(activationHairline, lineWidth: 0.5)`
+2. `.overlay(alignment: .top)`: `RoundedRectangle(...).stroke(Color.white.opacity(0.36), lineWidth: 0.5)` with `.blendMode(.plusLighter)`
+3. `.overlay`: `RoundedRectangle(...).stroke(activationHairline, lineWidth: 0.5)`
+
+> Both overlays use `.stroke(...)`, **not** `.strokeBorder(...)`. This is material: `.stroke` straddles the shape edge (half the 0.5 pt line inside, half outside the rounded-rect path), whereas `.strokeBorder` would inset the entire line inside the shape. Rebuild with `.stroke` on the `RoundedRectangle` or the hairline position/clipping will be wrong (`OpenClawBrand.swift:266`, `:271`).
+
+### 4.5 `proInsetSurface(tint:radius:)` View Modifier
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:146–163, 232`
+
+Tinted inset panel background. Used by `ProMetricTile`; needed by any rebuilder adding tinted inset panels.
+
+| Layer | Value |
+|---|---|
+| Fill | `Color(uiColor: .tertiarySystemGroupedBackground)` (note: tertiary, NOT `secondarySystemGroupedBackground`) |
+| Border | `RoundedRectangle(...).strokeBorder(tint.opacity(0.18 dark / 0.10 light), lineWidth: 1)` |
+| Shape | `RoundedRectangle(cornerRadius: radius, style: .continuous)` |
+
+### 4.6 `openClawSheetChrome()` View Modifier
+
+**Source:** `apps/ios/Sources/Design/OpenClawBrand.swift:234–243`
+
+Standard chrome for any presented sheet. Applies BOTH:
+1. `.tint(OpenClawBrand.accent)` — without this, navigation/button tint inside the sheet falls back to system blue.
+2. `.background { OpenClawBrand.sheetBackground.ignoresSafeArea() }` — the `sheetBackground` gradient from §3.1.
 
 ---
 
@@ -464,53 +522,202 @@ Standard card panel. `isProminent` controls background fill and shadow.
 | Border line width | 1 pt | 1 pt |
 | Shadow | none | dark mode: `black.opacity(0.14), radius: 5, y: 2` / light: `black.opacity(0.045), radius: 5, y: 2` |
 
+### 6.7a `ProSectionHeader`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:69–98`
+
+Grouped-list section header. `HStack` of a title plus an optional trailing action.
+
+| Part | Value |
+|---|---|
+| Title font | `OpenClawType.footnoteMedium` |
+| Title color | `.secondary` |
+| Title case | `.uppercase` when `uppercase == true` (default `true`); otherwise unchanged |
+| Horizontal padding | `OpenClawProMetric.pagePadding` (16 pt) |
+| Trailing action (with `action`) | `Button` whose label is `Text(actionTitle).font(footnoteMedium)`, `foregroundStyle(OpenClawBrand.accent)` |
+| Trailing action (no `action`) | `Text(actionTitle).font(footnoteMedium).foregroundStyle(.secondary)` |
+
+### 6.7b `ProCard`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:100–116`
+
+Generic content card. Pads its content, stretches to full width (leading-aligned), then applies `proPanelSurface` (§6.7).
+
+| Property | Default |
+|---|---|
+| `tint` | `nil` |
+| `isProminent` | `false` |
+| `padding` | 12 pt |
+| `radius` | `OpenClawProMetric.cardRadius` (16 pt) |
+
+### 6.7c `OpenClawNoticeBanner`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:363–446`
+
+Banner built on `ProCard(tint:, padding: 14)`.
+
+Structure:
+- Outer: `ProCard(tint: tint, padding: 14)` containing `VStack(alignment: .leading, spacing: 12)`.
+- Row 1: `HStack(alignment: .top, spacing: 12)` of a `ProIconBadge(systemName: icon, color: tint)` and a `VStack(alignment: .leading, spacing: 6)`.
+  - Title row: `HStack(alignment: .firstTextBaseline, spacing: 8)` — `Text(title).font(subheadSemiBold)`, `Spacer(minLength: 0)`, `Text(ownerLabel).font(captionSemiBold).foregroundStyle(.secondary)`.
+  - `Text(message).font(footnote).foregroundStyle(.secondary)`.
+  - Detail (optional): `.accent(value)` → `Text.font(captionMedium).foregroundStyle(tint)`; `.requestID(value)` → `Text("Request ID: \(value)").font(monoSmallMedium).foregroundStyle(.secondary).textSelection(.enabled)`.
+- Row 2 (only if a primary or secondary action exists): `OpenClawGlassControlGroup { HStack(spacing: 10) { ... } }`. Primary button: `openClawGlassButton(prominent: true).controlSize(.small)`; secondary button: `openClawGlassButton().controlSize(.small)`. Both labels use `captionSemiBold`.
+
+### 6.7d `OpenClawAdaptiveHeaderRow`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:448–531`
+
+Responsive header. Uses `ViewThatFits(in: .horizontal)` to pick the first layout that fits: horizontal first, then stacked.
+
+| Part | Value |
+|---|---|
+| Horizontal layout | `HStack(alignment: .top, spacing: 12)` — leading, title block (`layoutPriority(1)`), `Spacer(minLength: 8)`, accessory (`fixedSize(horizontal: true, vertical: false)`) |
+| Stacked layout | `VStack(alignment: .leading, spacing: 10)` — top `HStack(alignment: .top, spacing: 12)` of leading + title block + `Spacer(minLength: 8)`; bottom `HStack` with `Spacer(minLength: 0)` then accessory |
+| Title block | `VStack(alignment: .leading, spacing: 4)` |
+| Title | `titleFont` (default `OpenClawType.title3SemiBold`), `lineLimit(2)`, `minimumScaleFactor(0.86)` |
+| Subtitle | `subtitleFont` (default `OpenClawType.subhead`), `.secondary`, `lineLimit(subtitleLineLimit)` (default 2) |
+
+### 6.7e `ProPanelHeader`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:763–807`
+
+| Part | Value |
+|---|---|
+| Layout | `HStack(spacing: 8)` — title, optional value, `Spacer(minLength: 8)`, action control |
+| Title font | `OpenClawType.subheadSemiBold` |
+| Value font | `OpenClawType.caption2Bold`, `.secondary` |
+| Padding | H: 14 pt, top: 12 pt, bottom: 8 pt (asymmetric) |
+| Action (icon) | if `actionIcon` set: `Button { Image(systemName: actionIcon) }` with accessibility label |
+| Action (text) | else if `actionTitle` set: `Button { Text(actionTitle).font(captionSemiBold) }` |
+
+### 6.7f `ProStatusRow`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:809–848`
+
+| Part | Value |
+|---|---|
+| Layout | `HStack(alignment: .top, spacing: 12)` |
+| Leading | `ProIconBadge(systemName: icon, color: color)` |
+| Text block | `VStack(alignment: .leading, spacing: 4)` — `Text(title).font(subheadSemiBold).lineLimit(1)`, `Text(detail).font(caption).foregroundStyle(.secondary).lineLimit(2)` |
+| Trailing | `VStack(alignment: .trailing, spacing: 6)` — optional `ProValuePill`, optional `Button` with `.buttonStyle(.bordered).controlSize(.mini)` and `captionSemiBold` label |
+| Padding | H: 14 pt, V: 10 pt |
+| Spacer | `Spacer(minLength: 8)` between text block and trailing |
+
+### 6.7g `ProMetricTile`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:694–726`
+
+| Part | Value |
+|---|---|
+| Outer layout | `VStack(alignment: .leading, spacing: 10)` |
+| Icon row | `HStack` — `Image(systemName:).font(captionSemiBold).foregroundStyle(color)`, `frame(24×24)`, `background(color.opacity(0.18 dark / 0.10 light), in: Circle())`, then `Spacer(minLength: 4)` |
+| Value/title block | `VStack(alignment: .leading, spacing: 2)` — `Text(value).font(headlineBold).lineLimit(1).minimumScaleFactor(0.72)`, `Text(title).font(caption2Medium).foregroundStyle(.secondary).lineLimit(1)` |
+| Padding | 11 pt (all sides) |
+| Width | `frame(maxWidth: .infinity, alignment: .leading)` |
+| Background | `proInsetSurface(tint: color, radius: OpenClawProMetric.controlRadius)` (§4.5) |
+
+### 6.7h `ProMetricGrid`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:737–761`
+
+`LazyVGrid` of `ProMetricTile`s with `spacing: 10` and `.padding(.horizontal, OpenClawProMetric.pagePadding)`.
+
+| Condition | Column count |
+|---|---|
+| `horizontalSizeClass == .compact` | always 1 |
+| otherwise | `min(max(metrics.count, 1), 3)` flexible columns |
+
+### 6.7i `ProStatusDot`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:599–607`
+
+Standalone `Circle().fill(color).frame(width: 8, height: 8)`. A plain 8×8 pt color-keyed dot — distinct from `OpenClawStatusBadge` (which is a 7 pt dot inside a labeled pill).
+
+### 6.7j `OpenClawProMark`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:628–638`
+
+Branded mascot mark: `OpenClawMascotView()` framed at `size × size` (default 42×42 pt) with shadow `color: OpenClawBrand.accent.opacity(0.18), radius: shadowRadius` (default 10), `y: shadowRadius / 3` (≈3.3 pt). `accessibilityLabel("OpenClaw")`.
+
+### 6.7k `OpenClawSidebarRevealButton` / `OpenClawSidebarHeaderLeadingSlot`
+
+**Source:** `apps/ios/Sources/Design/OpenClawProComponents.swift:307–342`
+
+`OpenClawSidebarRevealButton` — an SF Symbol button:
+- Label: `Image(systemName:).font(OpenClawType.subheadSemiBold)`, framed `compactControlSize × compactControlSize` (36×36 pt), `.contentShape(Rectangle())`.
+- `.buttonBorderShape(.circle)`.
+- `.openClawGlassButton(tint: OpenClawBrand.accent)` (§4.3a) — without this it renders as a plain icon.
+- Optional `.accessibilityIdentifier(...)`.
+
+`OpenClawSidebarHeaderLeadingSlot` wraps that button in a `frame(width: 44, height: 44, alignment: .center)` (full 44 pt tap slot).
+
+### 6.7l `OpenClawActivationGlyph`
+
+**Source:** `apps/ios/Sources/Design/OpenClawBrand.swift:219–232`
+
+`OpenClawMascotView(floats: false)` framed `size × size` with a proportional shadow:
+`color: OpenClawBrand.activationGlow.opacity(0.18)`, `radius: size * 0.12`, `x: 0`, `y: size * 0.05`. `accessibilityHidden(true)`. Rebuild the shadow as proportions of `size`, not fixed values.
+
 ### 6.8 Button Styles
 
 #### `OpenClawPrimaryActionButtonStyle`
 
+**Source:** `apps/ios/Sources/Design/OpenClawBrand.swift:276–353`
+
 | Part | Value |
 |---|---|
 | Height default | 54 pt |
-| Corner radius | `height / 2` (fully rounded) |
+| Corner radius | `height / 2` (fully rounded) — note the stored `cornerRadius` property default of 18 is unused; `resolvedCornerRadius` always returns `height / 2` |
 | Font | `OpenClawType.subheadSemiBold` |
-| Foreground (enabled) | `activationPrimaryActionText` (white) |
-| Background gradient | `(0.93, 0.27, 0.25)` → `(0.91, 0.25, 0.24)`, top → bottom |
-| Top highlight overlay | `white.opacity(0.14)` → `white.opacity(0)` over top 48% of height |
-| Bottom highlight overlay | `white.opacity(0)` → `white.opacity(0.08)` over bottom 34% of height |
-| Border stroke | `activationPrimaryAction.opacity(0.72)`, line width 0.75 |
-| Shadow (enabled) | `activationPrimaryAction.opacity(0.08), radius: 1, y: 1` + `radius: 2, y: 2` |
-| Press scale | 0.98, `.smooth(duration: 0.14)` |
-| Disabled gradient | `activationDisabledGradient` |
+| Foreground (enabled) | `activationPrimaryActionText` (white); also set as `.tint` |
+| Foreground (disabled) | `Color.secondary` (NOT white); also set as `.tint` |
+| Background gradient (enabled) | `(0.93, 0.27, 0.25)` → `(0.91, 0.25, 0.24)`, top → bottom |
+| Background gradient (disabled) | `activationDisabledGradient` |
+| Top highlight overlay | `white.opacity(0.14 enabled / 0.06 disabled)` → `white.opacity(0)`, `.top` → `.center`, over top 48% of height |
+| Bottom highlight overlay | `white.opacity(0)` → `white.opacity(0.08 enabled / 0.03 disabled)`, `.top` → `.bottom`, over bottom 34% of height |
+| Border stroke (enabled) | `activationPrimaryAction.opacity(0.72)`, line width 0.75 |
+| Border stroke (disabled) | `activationNeutralStroke`, line width 0.75 |
+| Shadow (enabled) | `activationPrimaryAction.opacity(0.08), radius: 1, y: 1` + `radius: 2, y: 2` (two layers; `.clear` when disabled) |
+| Press scale | 0.98 (enabled only), `.smooth(duration: 0.14)` |
 
 #### `OpenClawSecondaryActionButtonStyle`
+
+**Source:** `apps/ios/Sources/Design/OpenClawBrand.swift:355–415`
 
 | Part | Value |
 |---|---|
 | Height default | 50 pt |
-| Corner radius | `height / 2` |
+| Corner radius | `height / 2` (stored `cornerRadius` default 18 is unused) |
 | Font | `OpenClawType.subheadSemiBold` |
 | Foreground (enabled) | `activationPrimaryAction` |
+| Foreground (disabled) | `.secondary` |
 | Background gradient | `activationSecondaryActionTop` → `activationSecondaryActionBottom`, top → bottom |
-| Top highlight overlay | `white.opacity(0.42)` → `white.opacity(0)` over top 48% |
+| Top highlight overlay | `white.opacity(0.42)` → `white.opacity(0)`, `.top` → `.center`, over top 48% |
 | Border stroke | `activationHairline`, line width 0.75 |
-| Shadow opacity default | `0.035` (configurable) |
-| Press scale | 0.98, `.smooth(duration: 0.14)` |
+| Shadow (enabled) | TWO layers, both `black.opacity(shadowOpacity)`: `(radius: 1, y: 1)` and `(radius: 2, y: 2)`. `shadowOpacity` defaults to `0.035` (configurable). `.clear` when disabled |
+| Press scale | 0.98 (enabled only), `.smooth(duration: 0.14)` |
 
 #### `OpenClawCloseButtonStyle`
 
+**Source:** `apps/ios/Sources/Design/OpenClawBrand.swift:417–461`
+
 | Part | Value |
 |---|---|
-| Min width | 36 pt |
+| Min width | 36 pt (`frame(minWidth:)`) |
 | Height | 36 pt |
+| Label sizing | `.fixedSize(horizontal: true, vertical: false)` — prevents multi-word labels from wrapping |
 | Horizontal padding | 7 pt |
 | Font | `OpenClawType.subheadSemiBold` |
-| Foreground | `activationPrimaryAction` |
-| Background | `activationNeutralGradient` capsule |
-| Top highlight | `white.opacity(0.55)` stroke, `.plusLighter` blend, line width 0.5 |
-| Border | `activationNeutralStroke`, line width 0.6 |
-| Shadow | `black.opacity(0.045), radius: 1, y: 1` + `black.opacity(0.03), radius: 4, y: 2` |
-| Press opacity | 0.66 |
-| Press scale | 0.98, `.smooth(duration: 0.14)` |
+| Foreground (enabled) | `activationPrimaryAction` |
+| Foreground (disabled) | `Color.secondary` |
+| Background | `activationNeutralGradient` capsule (`Capsule(style: .continuous)`) |
+| Top highlight | `Capsule`.`stroke(white.opacity(0.55), lineWidth: 0.5)`, `.plusLighter` blend, top-aligned overlay |
+| Border | `Capsule`.`stroke(activationNeutralStroke, lineWidth: 0.6)` |
+| Hit shape | `.contentShape(Capsule(style: .continuous))` — expands the tap target to the full capsule, not just the glyph bounds |
+| Shadow (enabled) | `black.opacity(0.045), radius: 1, y: 1` + `black.opacity(0.03), radius: 4, y: 2` (`.clear` when disabled) |
+| Press opacity | 0.66 (enabled only) |
+| Press scale | 0.98 (enabled only), `.smooth(duration: 0.14)` |
 
 ### 6.9 `ProProgressBar`
 
@@ -625,7 +832,9 @@ The `.warning` and `.secured1` patterns are the two that ship in production (use
 
 **Source:** `apps/ios/Sources/Design/ChatSessionPrefs.swift`
 
-`@Observable @MainActor final class ChatSessionPrefs`. Singleton (`ChatSessionPrefs.shared`). Persists a `Set<String>` of pinned session keys in `UserDefaults` under the key `"chat.sessions.pinned"`.
+`@Observable @MainActor final class ChatSessionPrefs`. Singleton (`ChatSessionPrefs.shared`). Holds an in-memory `Set<String>` of pinned session keys, persisted in `UserDefaults` under the key `"chat.sessions.pinned"`.
+
+**Persistence encoding (`ChatSessionPrefs.swift:14, 26`):** the set is stored as a plain `[String]` array via `UserDefaults.standard.set(Array(self.pinned), forKey:)` and read back via `UserDefaults.standard.stringArray(forKey:)`. It is NOT JSON-encoded and not a plist set — a rebuilder using a different encoding (e.g. JSON `Data`) will produce incompatible persistence. Set ordering is not preserved across launches (it round-trips through a `Set`).
 
 | Method | Effect |
 |---|---|

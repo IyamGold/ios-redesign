@@ -73,6 +73,48 @@ This is the top-level orchestrator. It owns Bonjour discovery, TLS fingerprint p
 | `discoveryDebugLog` | `[GatewayDiscoveryModel.DebugLogEntry]` | Discovery observation loop. |
 | `pendingTrustPrompt` | `TrustPrompt?` | Set when a first-time TLS fingerprint must be reviewed by the user. |
 
+### Internal connection-tracking state (not observed)
+
+Besides the published properties, the controller keeps private bookkeeping that drives the connect lifecycle (`Sources/Gateway/GatewayConnectionController.swift:113–134`):
+
+| Property | Type | Role |
+|---|---|---|
+| `didAutoConnect` | `Bool` | Latches true after any auto/explicit connect so `maybeAutoConnect()` does not fire again until reset. |
+| `pendingTrustConnect` | `GatewayPendingTrustConnect?` | The full connect payload parked while a trust prompt is on screen (see below). |
+| `trustProbeGeneration` | `UInt64` | Incremented whenever a trust prompt is cleared so a late-arriving probe result cannot restore a stale prompt. |
+| `connectAttemptGeneration` | `UInt64` | Monotonic generation guarding all in-flight connect work. |
+| `pendingForgetCleanups` | `[String: (id: UUID, task: Task<Void, Never>)]` | In-flight forget-cleanup tasks keyed by stableID. |
+| `pendingConnectionStableID` | `String?` | **StableID of the connection attempt currently in flight.** `forgetGateway` reads it (`Sources/Gateway/GatewayConnectionController.swift:542`, `550`): if it equals the forgotten stableID, the controller cancels pending attempts and releases auto-connect suppression; if it names a *different* target, `disconnectForgottenGateway(preservingPendingConnectAttempt: true)` is used so the other attempt survives. Cleared by `clearPendingTrustPrompt()`. |
+
+#### GatewayPendingTrustConnect (private struct)
+
+Holds everything needed to finish a connect after the user accepts a first-time TLS fingerprint (`Sources/Gateway/GatewayConnectionController.swift:1521–1529`):
+
+```swift
+private struct GatewayPendingTrustConnect {
+    let url: URL
+    let stableID: String
+    let isManual: Bool
+    let authOverride: GatewayConnectionController.ManualAuthOverride?
+    let allowStoredDeviceAuth: Bool
+    let suppressionLease: GatewayConnectionController.AutoConnectSuppressionLease
+    let gatewayGeneration: UInt64?
+}
+```
+
+`url`/`stableID`/`isManual` identify the endpoint; `authOverride` + `allowStoredDeviceAuth` carry the manual/setup-link credential policy; `suppressionLease` and `gatewayGeneration` tie the deferred connect back to the originating attempt so a stale accept cannot resurrect a superseded attempt.
+
+### selectReachableSetupLink(_:)
+
+`func selectReachableSetupLink(_ link: GatewayConnectDeepLink) async -> GatewayConnectDeepLink` (`Sources/Gateway/GatewayConnectionController.swift:176–193`).
+
+A setup deep link can carry more than one connection endpoint (e.g. a LAN route and a Tailnet route). This method picks the one actually reachable from the phone before the link is persisted:
+
+1. If `link.connectionEndpoints.count <= 1`, returns the link unchanged.
+2. Calls `requestLocalNetworkAccess(reason: "setup_route_probe")`.
+3. Iterates endpoints in order, TCP-probing each with `GatewaySetupRouteProbeBudget.tcpConnectTimeoutSeconds` (2.0 s) and queue label `"ai.openclaw.gateway.setup-route-<index>"`.
+4. Returns `link.selectingEndpoint(endpoint)` for the first reachable endpoint; if none are reachable, returns the original link unchanged.
+
 ### TrustPrompt
 
 ```swift
@@ -125,14 +167,21 @@ On init:
 
 ```swift
 static func resolvedManualPort(host: String, port: Int) -> Int? {
-    if port > 0 { return port <= 65535 ? port : nil }
-    let lower = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    if lower.hasSuffix(".ts.net") || lower.hasSuffix(".ts.net.") { return 443 }
+    if port > 0 {
+        return port <= 65535 ? port : nil
+    }
+    let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !trimmedHost.isEmpty else { return nil }
+    if trimmedHost.hasSuffix(".ts.net") || trimmedHost.hasSuffix(".ts.net.") {
+        return 443
+    }
     return 18789
 }
 ```
 
-- Port `0` or negative → default: `.ts.net` hosts get 443, everything else gets 18789.
+- Port `> 0` → valid if `<= 65535`, otherwise `nil`.
+- Port `0` or negative with an **empty** host (after whitespace trim) → returns `nil` (`Sources/Gateway/GatewayConnectionController.swift:76`). There is no default-port fallback when the host is blank.
+- Port `0` or negative with a non-empty host → default: trimmed/lowercased host ending `.ts.net` or `.ts.net.` gets `443`, everything else gets `18789`.
 - Port `> 65535` → invalid, returns `nil`.
 
 ### TLS policy for manual connects
@@ -171,8 +220,9 @@ helperText = "Secure connection is required for this host." (when requiresTLS)
 Same structure but:
 - Uses `resolvedManualPort` and `resolveManualUseTLS`.
 - Computes stableID as `manual|<host>|<port>`.
-- TLS probe runs on first-time connects (no stored pin) **and** on `forceReconnect`.
-- For `forceReconnect` with an existing pin: probe confirms reachability. If the fingerprint is already trusted, falls through to connect without re-prompting. If there is no stored pin yet, prompts trust.
+- TLS probe runs only when `resolvedUseTLS && (stored == nil || forceReconnect)` (`Sources/Gateway/GatewayConnectionController.swift:410`). In words: on first-time connects (no stored pin) **and** on `forceReconnect` — but **only when TLS is in effect**. A plaintext manual connect (`resolvedUseTLS == false`) never probes.
+- For `forceReconnect` with an existing pin: the probe confirms reachability. When the probe returns a fingerprint and a pin is already stored, the code falls through to connect without re-prompting — implemented as `guard stored == nil else { break }` (`Sources/Gateway/GatewayConnectionController.swift:424`), i.e. a `break` that exits the probe block and proceeds to the normal connect path. When there is no stored pin yet, it parks a `pendingTrustConnect` and sets `pendingTrustPrompt` to ask the user.
+- On probe `.failure`, calls `appModel.failGatewayPreconnectVerification(...)` with the mapped TLS problem and returns.
 - Includes `ManualAuthOverride` handling: setup-link credentials are endpoint-scoped and suppress device auth.
 
 #### connectActiveGateway
@@ -199,13 +249,23 @@ Async cleanup task:
 
 Forget cleanups are tracked in `pendingForgetCleanups: [String: (id: UUID, task: Task<Void, Never>)]`. If `connectDiscoveredGateway` or `connectManual` is called for an ID with a pending forget cleanup, it awaits the cleanup task before proceeding.
 
+#### refreshActiveGatewayRegistrationFromSettings()
+
+`func refreshActiveGatewayRegistrationFromSettings()` (`Sources/Gateway/GatewayConnectionController.swift:640`) re-applies the active gateway's config with freshly read capabilities/commands/permissions so a settings change (toggling camera, location, voice-wake, etc.) takes effect on the live node session without a user reconnect. It spawns a task that calls the private async worker `refreshActiveGatewayRegistrationFromSettingsAsync()` (`Sources/Gateway/GatewayConnectionController.swift:646–665`):
+
+1. Guards on an `appModel`, a non-nil `appModel.activeGatewayConnectConfig`, and `appModel.gatewayAutoReconnectEnabled` — all must hold or the refresh is a no-op.
+2. Captures `appModel.gatewayConnectGeneration`.
+3. Rebuilds node options via `makeConnectOptions(stableID:deviceAuthGatewayID:allowStoredDeviceAuth:)` using the existing config's values.
+4. Constructs a new `GatewayConnectConfig` reusing the existing `url`, `stableID`, `tls`, `token`, `bootstrapToken`, `password` and only swapping in the refreshed `nodeOptions`.
+5. Calls `appModel.applyGatewayConnectConfig(refreshedConfig, expectedGeneration: generation)`.
+
 ### Auto-connect logic
 
 `maybeAutoConnect()` fires whenever discovery updates occur and no suppression is active, `didAutoConnect == false`, the app model has no active server name, and `UserDefaults.standard.bool(forKey: "gateway.autoconnect")` is true:
 
 1. If the active registry entry is a manual gateway with a saved host/port and a stored TLS pin → auto-connect.
 2. If the active entry is discovered and visible in `gateways` with a stored TLS pin → `connectDiscoveredGateway`.
-3. If the active entry is discovered but not visible → fall back to the most recently connected manual gateway (by `lastConnectedAtMs`; tie-broken by reverse stableID order).
+3. If the active entry is discovered but not visible → fall back to the most recently connected manual gateway via `mostRecentlyConnectedManualGateway()`. On a successful fallback the controller also calls `GatewaySettingsStore.setActiveGateway(stableID: fallback.stableID)` so the active selection moves to the manual gateway it actually connected (`Sources/Gateway/GatewayConnectionController.swift:899–905`). Selection mechanics: `mostRecentlyConnectedManualGateway()` (`Sources/Gateway/GatewayConnectionController.swift:1026–1037`) filters registry entries to `kind == .manual`, then uses a single `max { ... }` comparison (not a sort) over `lastConnectedAtMs` (missing values treated as `Int.min`); ties are broken by `lhs.stableID > rhs.stableID` (reverse stableID order).
 4. Check `gateway.manual.enabled` (legacy UserDefaults) and `gateway.manual.host`/`port`/`tls`.
 5. Check `gateway.preferredStableID` and `gateway.lastDiscoveredStableID` against current discovered gateways.
 6. If exactly one discovered gateway has a stored TLS pin → auto-connect to it.
@@ -228,7 +288,7 @@ Discovery is never started before `localNetworkAccessRequested` is set to true. 
 1. `probeTLSFingerprint(host:port:url:queueLabel:)` is called: TCP reachability first (3s budget), then TLS handshake probe (10s budget).
 2. On `.fingerprint(fp)`: `pendingTrustPrompt` and `pendingTrustConnect` are both set.
 3. User taps **Accept** → `acceptPendingTrustPrompt()`: persists the fingerprint via `persistTLSFingerprint`, upserts registry entry, clears prompt, calls `startAutoConnect`.
-4. User taps **Decline** → `declinePendingTrustPrompt()`: clears prompt, sets status to "Offline", calls `resumeAutoConnect`.
+4. User taps **Decline** → `declinePendingTrustPrompt()` (`Sources/Gateway/GatewayConnectionController.swift:796–803`): captures the suppression lease from `pendingTrustConnect`, clears the prompt, sets status to `"Offline"`, and — only if a lease was present — calls `resumeAutoConnect(after: lease)` so the suppression taken when the probe started is released.
 5. Clearing the prompt also atomically increments `trustProbeGeneration`, so any late-arriving probe result from a superseded probe cannot restore a stale prompt.
 
 ### TLS certificate rotation
@@ -246,15 +306,23 @@ Discovery is never started before `localNetworkAccessRequested` is set to true. 
 
 #### Capability list (currentCaps)
 
-Always included:
-- `canvas`, `screen`, `device`, `talk`, `photos`, `contacts`, `calendar`, `reminders`
+The array is built in this exact order (`Sources/Gateway/GatewayConnectionController.swift:1628–1668`); conditional caps are inserted at specific positions, not appended at the end:
 
-Conditionally included:
-- `camera` — if `UserDefaults.object(forKey: "camera.enabled")` is nil (default on) OR `bool(forKey: "camera.enabled")` is true.
-- `voiceWake` — if `VoiceWakePreferences.enabledKey` bool is true.
-- `location` — if `location.enabledMode` (stored as String in UserDefaults) parses to any `OpenClawLocationMode` value other than `.off`.
-- `watch` — if `WatchMessagingService.isSupportedOnDevice()`.
-- `motion` — if `CMMotionActivityManager.isActivityAvailable() || CMPedometer.isStepCountingAvailable()`.
+1. `canvas` (always)
+2. `screen` (always)
+3. `camera` — if `UserDefaults.object(forKey: "camera.enabled")` is nil (default on) OR `bool(forKey: "camera.enabled")` is true.
+4. `voiceWake` — if `VoiceWakePreferences.enabledKey` bool is true.
+5. `location` — if `location.enabledMode` (stored as String in UserDefaults, default `"off"`) parses to any `OpenClawLocationMode` value other than `.off`.
+6. `device` (always)
+7. `talk` (always)
+8. `watch` — if `WatchMessagingService.isSupportedOnDevice()`.
+9. `photos` (always)
+10. `contacts` (always)
+11. `calendar` (always)
+12. `reminders` (always)
+13. `motion` — if `motionAvailable()` (see below).
+
+So the always-included caps are `canvas`, `screen`, `device`, `talk`, `photos`, `contacts`, `calendar`, `reminders`; the conditional caps `camera`, `voiceWake`, `location`, `watch`, `motion` sit at the ordered positions above.
 
 #### Command list (currentCommands)
 
@@ -277,32 +345,49 @@ Populated by reading system authorization status at connect time (async; runs on
 | `"contacts"` | `CNContactStore.authorizationStatus == .authorized\|.limited` |
 | `"calendar"` | `EKAuthorizationStatus == .fullAccess\|.writeOnly` |
 | `"reminders"` | `EKAuthorizationStatus == .fullAccess\|.writeOnly` |
-| `"motion"` | `CMMotionActivityManager.authorized \|\| CMPedometer.authorized` |
+| `"motion"` | `CMMotionActivityManager.authorizationStatus() == .authorized \|\| CMPedometer.authorizationStatus() == .authorized` (`Sources/Gateway/GatewayConnectionController.swift:1750–1753`). Note this is the per-type **authorization status**, distinct from the capability gate `motionAvailable()`, which instead checks `CMMotionActivityManager.isActivityAvailable() \|\| CMPedometer.isStepCountingAvailable()` (`Sources/Gateway/GatewayConnectionController.swift:1784–1786`). |
 | `"watchSupported"` | `WatchMessagingService.currentStatusSnapshot().supported` |
 | `"watchPaired"` | `WatchMessagingService.currentStatusSnapshot().paired` |
 | `"watchAppInstalled"` | `WatchMessagingService.currentStatusSnapshot().appInstalled` |
 | `"watchReachable"` | `WatchMessagingService.currentStatusSnapshot().reachable` |
 
-Because permission reads can suspend long enough for a model-owned reconnect reset to start, `waitForGatewaySessionResetIfNeeded()` is called again immediately after the permissions are resolved, before the synchronous `applyGatewayConnectConfig` call (see inline comment at `Sources/Gateway/GatewayConnectionController.swift:1111`).
+Because permission reads can suspend long enough for a model-owned reconnect reset to start, `waitForGatewaySessionResetIfNeeded()` is called again (`Sources/Gateway/GatewayConnectionController.swift:1112`) immediately after `makeConnectOptions` resolves the permissions and immediately before the synchronous `applyGatewayConnectConfig` call at `Sources/Gateway/GatewayConnectionController.swift:1122` (see inline comment at `Sources/Gateway/GatewayConnectionController.swift:1110–1111`). A generation guard (`generation == appModel.gatewayConnectGeneration`) runs after each barrier so a superseded attempt bails out.
 
 ### GatewayTLSFingerprintProbe (private inner class)
 
 ```swift
-private final class GatewayTLSFingerprintProbe: NSObject, URLSessionDelegate, URLSessionTaskDelegate
+private final class GatewayTLSFingerprintProbe: NSObject, URLSessionDelegate, URLSessionTaskDelegate,
+    @unchecked Sendable
 ```
+
+#### GatewayTLSFingerprintProbeFailure
+
+The probe's result is `GatewayTLSFingerprintProbeResult` = `.fingerprint(String)` or `.failure(GatewayTLSFingerprintProbeFailure)`. The failure enum has **four** cases (`Sources/Gateway/GatewayConnectionController.swift:20–25`):
+
+| Case | Meaning |
+|---|---|
+| `.endpointUnreachable` | TCP/DNS-level reachability failure before any TLS data. |
+| `.tlsHandshakeTimeout` | The handshake did not finish within the budget (or the backstop timer fired). |
+| `.tlsUnavailable` | Handshake failed, or the task completed without ever presenting a server-trust challenge. |
+| `.certificateUnavailable` | A server-trust challenge **was** received but the leaf certificate / fingerprint could not be extracted from the trust chain. Distinct from `.tlsUnavailable`. |
+
+#### Behavior
 
 - Uses an ephemeral `URLSession` configured with `timeoutIntervalForRequest` and `timeoutIntervalForResource` both set to `tlsHandshakeTimeoutSeconds` (10 s).
 - Opens a `webSocketTask(with:)` to trigger the TLS handshake.
-- In `urlSession(_:didReceive:completionHandler:)`: extracts the leaf certificate from `SecTrustCopyCertificateChain`, computes SHA-256 of its DER data (CryptoKit `SHA256.hash`), formats as 64 lowercase hex characters.
-- Calls `completionHandler(.cancelAuthenticationChallenge, nil)` to abort the connection after reading the cert.
-- On task completion without a challenge (TLS unavailable) → `.failure(.tlsUnavailable)`.
-- On URL error mapping:
+- In `urlSession(_:didReceive:completionHandler:)` (`Sources/Gateway/GatewayConnectionController.swift:1884–1903`):
+  - If the challenge's authentication method is **not** `NSURLAuthenticationMethodServerTrust` (or there is no `serverTrust`), calls `completionHandler(.performDefaultHandling, nil)` and returns without finishing.
+  - Otherwise computes the leaf-certificate fingerprint via `certificateFingerprint(trust)` (extracts the leaf from `SecTrustCopyCertificateChain`, computes SHA-256 of its DER data with CryptoKit `SHA256.hash`, formats as 64 lowercase hex characters), then **always** calls `completionHandler(.cancelAuthenticationChallenge, nil)` to abort the connection after reading the cert.
+  - If the fingerprint is non-nil → `finish(.fingerprint(fp))`.
+  - If the fingerprint is nil (cert chain unavailable) → `finish(.failure(.certificateUnavailable))` — **not** `.tlsUnavailable`.
+- On task completion (`didCompleteWithError`) with **no** error — i.e. the task ended without a server-trust challenge → `.failure(.tlsUnavailable)`.
+- On task completion with an error, maps `URLError` codes (only when `nsError.domain == URLError.errorDomain`; any other domain → `.tlsUnavailable`):
   - `.timedOut` → `.tlsHandshakeTimeout`
   - `.cannotFindHost`, `.dnsLookupFailed`, `.cannotConnectToHost`, `.notConnectedToInternet`, `.internationalRoamingOff`, `.callIsActive`, `.dataNotAllowed` → `.endpointUnreachable`
   - `.networkConnectionLost`, `.secureConnectionFailed`, `.cannotParseResponse`, `.badServerResponse` → `.tlsUnavailable`
   - Unknown → `.tlsUnavailable`
-- A DispatchQueue timer fires at `timeoutSeconds` and calls `finish(.failure(.tlsHandshakeTimeout))` as a hard backstop in case URLSession never delivers a delegate callback.
-- `OSAllocatedUnfairLock<ProbeState>` ensures exactly one `finish` call is honored (idempotent).
+- A backstop timer is scheduled with `DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds)` (`Sources/Gateway/GatewayConnectionController.swift:1879`) — i.e. on the **global utility queue**, not a private probe queue — and calls `finish(.failure(.tlsHandshakeTimeout))` in case URLSession never delivers a delegate callback.
+- `finish(_:)` is guarded by `OSAllocatedUnfairLock<ProbeState>` so exactly one result is honored (idempotent). On the honored call it tears down the socket with `task.cancel(with: .goingAway, reason: nil)` (WebSocket close code `.goingAway`, nil reason) then `session.invalidateAndCancel()` before invoking the completion handler (`Sources/Gateway/GatewayConnectionController.swift:1925–1926`).
 
 ### ManualAuthOverride
 
@@ -319,7 +404,7 @@ struct ManualAuthOverride: Equatable {
 - `explicit(token:bootstrapToken:password:targetStableID:suppressStoredDeviceAuth:)` — trims and nils-out empty values.
 - `normalized(token:bootstrapToken:password:)` — returns `nil` if all three are nil/empty.
 - `persisted(instanceId:targetStableID:)` — loads the current credential bundle and returns a matching override.
-- `SetupAuth` inner struct bundles credentials from a deep link. Its `manualAuthOverride` always sets `suppressStoredDeviceAuth: true` because setup-link credentials are endpoint-scoped and must not fall back to device auth.
+- `SetupAuth` inner struct bundles credentials from a deep link (`token`, `bootstrapToken`, `password`, `targetStableID`, all non-optional `String`; `Sources/Gateway/GatewayConnectionController.swift:1395–1403`). It exposes a computed `var hasBootstrapToken: Bool { !self.bootstrapToken.isEmpty }`. Its `manualAuthOverride` always sets `suppressStoredDeviceAuth: true` because setup-link credentials are endpoint-scoped and must not fall back to device auth.
 - `currentManualInput(token:pendingOverride:password:targetStableID:)` — when the endpoint changes relative to a pending setup-link override, it strips any field the user did not explicitly replace to prevent forwarding source credentials to a different gateway.
 
 ---
@@ -369,8 +454,8 @@ TXT values are whitespace-trimmed; empty values are treated as nil/absent. The c
 
 ### Name prettification
 
-`prettifyInstanceName` applied to the decoded Bonjour service name and to `displayName` TXT:
-1. Collapse internal whitespace runs to single spaces.
+`prettifyInstanceName` applied to the decoded Bonjour service name and to `displayName` TXT (`Sources/Gateway/GatewayDiscoveryModel.swift:165–169`):
+1. Normalize whitespace with `split(whereSeparator: \.isWhitespace).joined(separator: " ")` — this splits on **any** whitespace (spaces, tabs, newlines), dropping empty runs, and rejoins with single spaces.
 2. Strip ` (OpenClaw)` suffix.
 3. Strip trailing ` (N)` numeric suffix using regex `\s+\(\d+\)$`.
 4. Trim leading/trailing whitespace.
@@ -381,13 +466,19 @@ Uses `OpenClawBonjour.gatewayServiceDomains` (from `OpenClawKit`) and `OpenClawB
 
 ### Debug log
 
-Bounded at 200 entries (oldest dropped when exceeded). Enabled via `setDebugLoggingEnabled(true)`. The enabled flag is read from `UserDefaults.standard.bool(forKey: "gateway.discovery.debugLogs")` in `GatewayConnectionController.init`.
+Bounded at 200 entries. When `appendDebugLog` pushes past 200, it drops `debugLog.count - 200` entries from the front in **one** `removeFirst(_:)` call (`Sources/Gateway/GatewayDiscoveryModel.swift:160–162`) — a batch trim, not one-at-a-time. The enabled flag is read from `UserDefaults.standard.bool(forKey: "gateway.discovery.debugLogs")` in `GatewayConnectionController.init`.
+
+`setDebugLoggingEnabled(_:)` (`Sources/Gateway/GatewayDiscoveryModel.swift:43–51`):
+- When set to **disabled**, immediately clears `debugLog = []`.
+- When transitioning from disabled to **enabled**, appends two snapshot entries: `"debug logging enabled"` and `"snapshot: status=<statusText> gateways=<count>"`.
+- Appends are no-ops while logging is disabled (`appendDebugLog` guards on the enabled flag).
 
 ### Lifecycle
 
 - `start()`: idempotent (returns immediately if browsers already exist). Creates one browser per domain.
 - `stop()`: cancels all browsers, clears `gatewaysByDomain`, `statesByDomain`, resets `gateways = []`, sets `statusText = "Stopped"`.
-- `recomputeGateways()`: merges all per-domain result lists, sorts by `localizedCaseInsensitiveCompare`, logs added/removed counts.
+- Sorting is **two-pass**: each domain's `onResults` handler sorts that domain's list by `localizedCaseInsensitiveCompare` (`Sources/Gateway/GatewayDiscoveryModel.swift:99`) before storing it, and `recomputeGateways()` sorts again after merging all per-domain lists (`Sources/Gateway/GatewayDiscoveryModel.swift:122`).
+- `recomputeGateways()`: flattens all per-domain result lists, sorts the merged list by `localizedCaseInsensitiveCompare`, and logs added/removed counts.
 
 ---
 
@@ -407,11 +498,19 @@ Config(intervalSeconds: 15, timeoutSeconds: 5, maxFailures: 3)
 
 ### Behavior
 
-- Runs a loop: execute `check()` with a timeout, increment/reset failure counter, sleep for `intervalSeconds`.
-- `onFailure` is called when `failures >= max(1, config.maxFailures)`, then `failures` is reset to 0.
-- Each check is wrapped with `AsyncTimeout.withTimeout(seconds: timeoutSeconds, onTimeout: { timeoutError })`. Any error from `check()` or the timeout counts as a failure.
-- Sleep uses `nanoseconds = UInt64(intervalSeconds * 1_000_000_000)`. If `intervalSeconds == 0`, calls `Task.yield()` instead.
-- `stop()` cancels the task and sets `task = nil`; calling `start()` again after `stop()` creates a fresh task.
+`start(check:onFailure:)` signature (`Sources/Gateway/GatewayHealthMonitor.swift:26–28`):
+
+```swift
+func start(
+    check: @escaping @Sendable () async throws -> Bool,
+    onFailure: @escaping @Sendable (_ failureCount: Int) async -> Void)
+```
+
+- Runs a `@MainActor` loop: execute `check()` with a timeout, increment/reset failure counter, sleep for `intervalSeconds`.
+- `onFailure(failures)` is called with the current failure count (an `Int`) when `failures >= max(1, config.maxFailures)`, then `failures` is reset to 0. `onFailure` takes a `failureCount: Int` parameter.
+- `runCheck` (`Sources/Gateway/GatewayHealthMonitor.swift:66–73`) clamps the timeout to `max(0.0, timeoutSeconds)`. **If the clamped timeout is `0`, it skips the timeout wrapper entirely and runs `(try? check()) ?? false` directly.** Otherwise it wraps the check with `AsyncTimeout.withTimeout(seconds: timeout, onTimeout: { timeoutError })`; any error from `check()` or the timeout counts as a failure (returns `false`).
+- Sleep: computes `interval = max(0.0, config.intervalSeconds)` (negative interval clamped to 0; `Sources/Gateway/GatewayHealthMonitor.swift:50`), then `nanos = UInt64(interval * 1_000_000_000)`. If `nanos > 0` it sleeps; if `nanos == 0` it calls `Task.yield()` instead.
+- `stop()` cancels the task and sets `task = nil`; `start()` first calls `self.stop()`, so calling `start()` again replaces any prior task with a fresh one.
 
 ---
 
@@ -496,7 +595,7 @@ private struct GatewayCredentialBundle: Codable {
 }
 ```
 
-Keychain account format: `"gateway-credentials.<instanceId>.<stableID>"`.
+Keychain account format: `"gateway-credentials.\(instanceId).\(stableID)"`, built by `gatewayCredentialBundleAccount(instanceId:stableID:)` (`Sources/Gateway/GatewaySettingsStore.swift:776–777`).
 
 **Migration path:** Legacy per-field accounts (`gateway-token.<instanceId>`, `gateway-bootstrap-token.<instanceId>`, `gateway-password.<instanceId>`) and legacy bundle account (`gateway-credentials.<instanceId>`) are cleaned up after successful migration to scoped accounts.
 
@@ -547,12 +646,13 @@ A dual-sink logger: `os.Logger(subsystem: "ai.openclawfoundation.app", category:
 static func probe(host: String, port: Int, timeoutSeconds: Double, queueLabel: String) async -> Bool
 ```
 
-- Validates `port` in `1...65535`; returns `false` immediately otherwise.
+- Validates `port` in `1...65535` and that `NWEndpoint.Port(rawValue:)` succeeds; returns `false` immediately otherwise.
 - Creates an `NWConnection(host:port:using: .tcp)` (plain TCP, no TLS).
+- Creates a **fresh** `DispatchQueue(label: queueLabel)` per call (not a shared queue), using the caller-supplied `queueLabel` as the label (`Sources/Gateway/TCPProbe.swift:14`).
 - Uses `withCheckedContinuation`; `OSAllocatedUnfairLock<Bool>` guards against double-resume.
-- Watches `.ready` state → `finish(true)`, `.failed` or `.cancelled` → `finish(false)`.
-- Fires a `DispatchQueue.asyncAfter` on the probe's own queue at `timeoutSeconds` to call `finish(false)` as the hard backstop.
-- `connection.cancel()` is called after the result is determined.
+- Watches `.ready` state → `finish(true)`; `.failed` or `.cancelled` → `finish(false)`.
+- Fires `queue.asyncAfter(deadline: .now() + timeoutSeconds)` on that same per-call queue to call `finish(false)` as the hard backstop.
+- Inside `finish`, once the lock marks the probe finished, `connection.cancel()` is called **before** `cont.resume(returning: ok)` (`Sources/Gateway/TCPProbe.swift:25–26`) — cancel precedes resume.
 
 ---
 
@@ -618,9 +718,9 @@ func currentStatus(timeoutMs: Int = 1500) async -> OpenClawNetworkStatusPayload
 ```
 
 - Creates a one-shot `NWPathMonitor` on a fresh `DispatchQueue(label: "ai.openclawfoundation.app.network-status")`.
-- First path update → `NSLock`-guarded `markCompleted()` → cancel monitor → resume continuation.
-- `timeoutMs` backstop (default 1500 ms) → if no path update arrives, resume with fallback payload.
-- The `NetworkStatusState` lock prevents both the timer and the path update from resuming the continuation.
+- First path update → `markCompleted()` → cancel monitor → resume continuation.
+- `timeoutMs` backstop (default 1500 ms), scheduled with `queue.asyncAfter(deadline: .now() + .milliseconds(timeoutMs))` → if no path update arrives first, resume with the fallback payload.
+- Completion is single-shot via `NetworkStatusState`, a **separate private `final class NetworkStatusState: @unchecked Sendable`** (`Sources/Device/NetworkStatusService.swift:66–79`) — not inlined. It wraps an `NSLock` + `completed` bool; `markCompleted()` returns `true` exactly once, so whichever of the path handler or the timeout fires first wins and the loser is dropped.
 
 ### OpenClawNetworkStatusPayload fields
 
@@ -629,7 +729,7 @@ func currentStatus(timeoutMs: Int = 1500) async -> OpenClawNetworkStatusPayload
 | `status` | `NWPath.status` mapped to `OpenClawNetworkPathStatus`: `.satisfied`, `.requiresConnection`, `.unsatisfied`. |
 | `isExpensive` | `NWPath.isExpensive` |
 | `isConstrained` | `NWPath.isConstrained` |
-| `interfaces` | `[OpenClawNetworkInterfaceType]`: checks wifi, cellular, wiredEthernet in order; if none, emits `.other`. |
+| `interfaces` | `[OpenClawNetworkInterfaceType]`: appends `.wifi` if `path.usesInterfaceType(.wifi)`, `.cellular` if `.cellular`, and `.wired` if `path.usesInterfaceType(.wiredEthernet)`. Note the `NWInterface` path check is `.wiredEthernet` but the emitted enum case is `.wired` (`Sources/Device/NetworkStatusService.swift:43–45`). If the list is empty, appends `.other`. |
 
 Fallback payload (on timeout): `status: .unsatisfied, isExpensive: false, isConstrained: false, interfaces: [.other]`.
 
@@ -815,6 +915,8 @@ Returns `true` immediately when the JS host reports ready; returns `false` on ti
 
 ### GatewayDisplayState
 
+A **top-level** `enum` in the same file (`Sources/Status/GatewayStatusBuilder.swift:4–9`), **not** nested inside `GatewayStatusBuilder`:
+
 ```swift
 enum GatewayDisplayState: Equatable {
     case connected
@@ -830,14 +932,16 @@ Reads `appModel.gatewayServerName`, `appModel.lastGatewayProblem`, `appModel.gat
 
 ### build(gatewayServerName:lastGatewayProblem:gatewayStatusText:)
 
+`gatewayStatusText` is first trimmed with `.trimmingCharacters(in: .whitespacesAndNewlines)` (`Sources/Status/GatewayStatusBuilder.swift:32`); the trimmed `text` is what the substring checks (via `localizedCaseInsensitiveContains`) run against.
+
 Decision table (checked in order):
 
 | Condition | Result |
 |---|---|
 | `gatewayServerName != nil` | `.connected` |
 | `lastGatewayProblem != nil && lastGatewayProblem.pauseReconnect == true` | `.error` |
-| `statusText` contains `"connecting"` or `"reconnecting"` (case-insensitive) | `.connecting` |
-| `statusText` contains `"error"` (case-insensitive) | `.error` |
+| trimmed `text` contains `"connecting"` or `"reconnecting"` (case-insensitive) | `.connecting` |
+| trimmed `text` contains `"error"` (case-insensitive) | `.error` |
 | Otherwise | `.disconnected` |
 
 ---

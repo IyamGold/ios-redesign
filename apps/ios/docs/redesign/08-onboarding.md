@@ -26,20 +26,24 @@ The initializer always sets the initial step to `.welcome` (`_step = State(initi
 private enum OnboardingStep: Int, CaseIterable {
     case intro      // rawValue 0 — legacy/unused entry point
     case welcome    // rawValue 1 — initial step; QR + manual
-    case mode       // rawValue 2 — manual setup code / mode picker
+    case mode       // rawValue 2 — renders OnboardingSetupStep (paste/apply setup code)
     case feedback   // rawValue 3 — connection progress / auth / pairing / error
     case success    // rawValue 4 — post-connection confirmation
 }
 ```
 
-Navigation title is `""` for all full-screen steps (`.intro`, `.welcome`, `.mode`, `.feedback`, `.success`); the `.navigationBarTitleDisplayMode(.inline)` is always set. The `canGoBack` predicate returns `false` for all current active steps (`.intro`, `.welcome`, `.success`, `.mode`, `.feedback`), meaning the back-button is never shown during the normal flow.
+Each case carries a `title` (`"Welcome"`, `"Connect Gateway"`, `"Gateway Setup"`, `""`, `"Connected"`) and a `previous` computed property (`Self(rawValue: rawValue - 1)`), used by the back-chevron (`OnboardingWizardView.swift:19–27, 15–17`).
+
+The `.mode` case does NOT render a mode picker. The live `switch self.step` maps `case .mode: self.setupStep`, and `setupStep` builds `OnboardingSetupStep` (`OnboardingWizardView.swift:189–200, 463–472`) — the paste-a-setup-code screen documented in Section 2.2. See Section 2.6 for the separate, *unused* `modeStep` view-builder (`OnboardingModeRow` picker) that is compiled but never reached.
+
+Navigation title is `""` for all full-screen steps because `isFullScreenStep` is true for `.intro`, `.welcome`, `.success`, `.mode`, and `.feedback`, so `.navigationTitle(self.isFullScreenStep ? "" : self.step.title)` always resolves to `""` in the live flow (`OnboardingWizardView.swift:140–143, 202–203`); `.navigationBarTitleDisplayMode(.inline)` is always set. The `canGoBack` predicate returns `false` for every step (it excludes `.intro`, `.welcome`, `.success`, `.mode`, and `.feedback` — i.e. all cases), so the nav-stack back-button is never shown during the normal flow (`OnboardingWizardView.swift:29–32`). In-flow back navigation is handled by each step's own back pill/chevron, not by this chrome button.
 
 ### 1.3 Layout Shell
 
 The whole wizard is wrapped in a `NavigationStack`. Over the top of it:
 
-- **Leading chrome button** (`.overlay(alignment: .topLeading)`): Back chevron if `step.canGoBack`; Close button if `allowSkip`; nothing otherwise. Positioned `.padding(.leading, 16)`, `.padding(.top, 10)`. Both use `OpenClawCloseButtonStyle`.
-- **Keyboard dismiss control** (`.safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0)`): A capsule pill button showing `keyboard.chevron.compact.down` SF Symbol at `OpenClawType.headline` weight. Visible only while a text field is focused (`focusedField != nil`). Fill: `.ultraThinMaterial`. Stroke: `OpenClawBrand.activationNeutralStroke` at `lineWidth: 0.6`. Shadow: `Color.black.opacity(0.08)`, radius 14, y-offset 4. Padding trailing 20, bottom 10. Transition: `.opacity.combined(with: .scale(scale: 0.96))`. Animation: `.smooth(duration: 0.16)`. Foreground: `OpenClawBrand.activationPrimaryAction`.
+- **Leading chrome button** (`.overlay(alignment: .topLeading)`): Back chevron if `step.canGoBack` (never true in the live flow — see Section 1.2); Close button (`Text("Close")`, `OpenClawType.subheadSemiBold`) if `allowSkip`; nothing otherwise. Positioned `.padding(.leading, 16)`, `.padding(.top, 10)`. Both use `OpenClawCloseButtonStyle`. The back-chevron variant is `Image(systemName: "chevron.left")` with `.font(OpenClawType.subheadSemiBold)` applied to the symbol (`OnboardingWizardView.swift:412–413`).
+- **Keyboard dismiss control** (`.safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0)`): A capsule pill button showing `keyboard.chevron.compact.down` SF Symbol at `OpenClawType.headline`. The icon label has a fixed `.frame(width: 50, height: 44)` with `.contentShape(Capsule(style: .continuous))` (`OnboardingWizardView.swift:438–441`). Visible only while a text field is focused (`focusedField != nil`). Button style `.plain`. Fill: `.ultraThinMaterial` in a `Capsule(style: .continuous)`. Stroke: `OpenClawBrand.activationNeutralStroke` at `lineWidth: 0.6`. Shadow: `Color.black.opacity(0.08)`, radius 14, x 0, y 4. Padding trailing 20, bottom 10. Transition: `.opacity.combined(with: .scale(scale: 0.96))`. Animation: `.smooth(duration: 0.16)` keyed on `focusedField`. Foreground: `OpenClawBrand.activationPrimaryAction`.
 - **TLS trust prompt alert**: Hosted on a `Color.clear` background layer (`.background { Color.clear.gatewayTrustPromptAlert() }`). This is separated from the scanner-error alert so they do not shadow each other.
 - **Scanner error alert**: Title "QR Scanner Unavailable", OK button (`OpenClawType.subheadSemiBold`), message body (`OpenClawType.subhead`).
 - **QR scanner sheet**: `.sheet(isPresented: $showQRScanner)` — see Section 4.
@@ -47,7 +51,7 @@ The whole wizard is wrapped in a `NavigationStack`. Over the top of it:
 
 ### 1.4 Persistent Timer
 
-`pairingAutoResumeTicker` is a class-level `Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()`. While on the `.feedback` step with a pairing issue and no active connection, this fires `attemptAutomaticPairingResumeIfNeeded()` every 2 seconds. Minimum inter-attempt interval is 6 seconds (`now.timeIntervalSince(last) < 6`).
+`pairingAutoResumeTicker` is a class-level `Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()` (`OnboardingWizardView.swift:113`). It fires `attemptAutomaticPairingResumeIfNeeded()` on every tick (`OnboardingWizardView.swift:168–170`). That method bails unless the scene is active, the step is `.feedback`, the issue needs pairing, and no connection is in flight; it then enforces a minimum 6-second inter-attempt interval before calling `resumeAfterPairingApprovalInBackground()` (`if let last = lastPairingAutoResumeAttemptAt, now.timeIntervalSince(last) < 6 { return }`, `OnboardingWizardView.swift:1216–1228`). So the ticker checks every 2 seconds but a resume attempt fires at most once per 6 seconds.
 
 ---
 
@@ -131,7 +135,7 @@ A `ZStack` containing:
 
 `VStack(alignment: .leading, spacing: 14)` with `.padding(.top, 60)` and `.padding(.horizontal, 24)`.
 
-Each field is a capsule with `height: 50`, `leading: 21`, `trailing: 16` padding:
+Each field is an `HStack(spacing: 11)` of `TextField` + trailing icon, a capsule with `height: 50`, `leading: 21`, `trailing: 16` padding. The `TextField` text uses `.font(.system(size: 17))`, `.textInputAutocapitalization(.never)`, `.autocorrectionDisabled()` (`OnboardingWizardSteps.swift:762–788`). The setup-code field placeholder is `"Paste code here"`; Host/Port use keyboard types `.URL` and `.numberPad` respectively (`OnboardingWizardSteps.swift:613–644`).
 
 - Fill (dark): `Color(red: 23/255, green: 23/255, blue: 23/255)`. Fill (light): `.white`.
 - Border (dark): `.clear`. Border (light): `Color.black.opacity(0.2)`, `lineWidth: 0.5`.
@@ -150,6 +154,18 @@ Each field is a capsule with `height: 50`, `leading: 21`, `trailing: 16` padding
 
 Debounce duration: `scanDuration = .milliseconds(800)`. Reveal delay after validation: `revealDelay = .milliseconds(100)`. Apply spinner duration: `applyDuration = .milliseconds(800)`.
 
+**Validation-state animation curves** (`OnboardingWizardSteps.swift:790–836`):
+
+| Transition | Animation |
+|---|---|
+| → `.idle` (field cleared) | `.smooth(duration: 0.2)` |
+| → `.scanning` (text entered, before debounce) | `.smooth(duration: 0.2)` |
+| → `.validated(revealsEndpoint: false)` (valid, pre-reveal) | `.smooth(duration: 0.2)` |
+| → `.validated(revealsEndpoint: true)` (endpoint reveal) | `.spring(duration: 0.35)` |
+| → `.invalid` | `.easeOut(duration: 0.15)` |
+
+**`beginApplying()` spinner animation:** `isApplying` is set `true` with `.smooth(duration: 0.2)` and back to `false` with `.smooth(duration: 0.2)` after `applyDuration` elapses, then `onApply` fires (`OnboardingWizardSteps.swift:838–853`).
+
 **Shake animation** (on invalid): `KeyframeTrack` — `CubicKeyframe(6, duration: 0.08)`, `CubicKeyframe(-6, duration: 0.06)`, `CubicKeyframe(4, duration: 0.08)`, `CubicKeyframe(0, duration: 0.06)`. Triggered by incrementing `shakeCount`. Suppressed when `accessibilityReduceMotion` is true.
 
 **Endpoint field reveal** (when `fieldsRevealed`):
@@ -157,16 +173,16 @@ Debounce duration: `scanDuration = .milliseconds(800)`. Reveal delay after valid
 - Reveal animation: `.spring(duration: 0.35)`.
 
 **Haptics:**
-- Valid code → `OpenClawHaptics.play(.secured2)`.
-- Invalid code → `OpenClawHaptics.play(.secured4)`.
+- Valid code that reveals a host/port endpoint → `OpenClawHaptics.play(.secured2)`, played immediately after `validation` becomes `.validated(revealsEndpoint: true)` (`OnboardingWizardSteps.swift:824`). A valid Apple-Review demo code resolves to `.validated(revealsEndpoint: false)` and plays no haptic.
+- Invalid code → `OpenClawHaptics.play(.secured4)`, inside `enterInvalidState()` alongside the shake (`OnboardingWizardSteps.swift:832`).
 
 **Icons:**
 
 | View | Asset | Size |
 |---|---|---|
-| `SetupScanningSpinner` | `Image("SetupSpinnerGlyph")`, template | 24×24 pt, rotates 360° with `.linear(duration: 0.9).repeatForever(autoreverses: false)` |
-| `SetupCheckIcon` | `Image("SetupCheckGlyph")` (light) or `Image("SetupCheckDarkGlyph")` (dark) | 24×24 pt |
-| `SetupErrorIcon` | `Image("SetupErrorGlyph")` (light) or `Image("SetupErrorDarkGlyph")` (dark) | 21×21 pt |
+| `SetupScanningSpinner` (`OnboardingWizardSteps.swift:856–872`) | `Image("SetupSpinnerGlyph")`, `renderingMode(.template)`, resizable, `scaledToFit`, `.foregroundStyle(Color.primary.opacity(0.8))` | 24×24 pt, rotates 360° with `.linear(duration: 0.9).repeatForever(autoreverses: false)` |
+| `SetupCheckIcon` (`OnboardingWizardSteps.swift:874–883`) | `Image("SetupCheckGlyph")` (light) or `Image("SetupCheckDarkGlyph")` (dark) | 24×24 pt |
+| `SetupErrorIcon` (`OnboardingWizardSteps.swift:885–894`) | `Image("SetupErrorGlyph")` (light) or `Image("SetupErrorDarkGlyph")` (dark) | 21×21 pt |
 
 **Apply code button:**
 
@@ -266,11 +282,12 @@ All state views use `.transition(.opacity)` for content transitions.
 
 #### 2.3.5 State: `.loading`
 
-`VStack(spacing: 31)` centered vertically with `.offset(y: -52)`:
+Outer `VStack(spacing: 31)` centered vertically (`maxWidth/maxHeight: .infinity`) with `.offset(y: -52)` (`OnboardingWizardSteps.swift:982–1003`):
 
-- `FeedbackLoaderSpinner`: `Image("FeedbackLoaderGlyph")`, 70×70 pt, rotates 360° with `.linear(duration: 1.2).repeatForever(autoreverses: false)`.
-- Title: `"Scanning your code"`, `.system(size: 30, weight: .medium)`, `Color.primary`, `lineLimit(1)`, `fixedSize(horizontal: true, vertical: false)`.
-- Status line (if non-empty after trim): `.system(size: 15)`, `.secondary`, centered, `maxWidth: 300 pt`.
+- `FeedbackLoaderSpinner`: `Image("FeedbackLoaderGlyph")`, resizable, `scaledToFit`, 70×70 pt, rotates 360° with `.linear(duration: 1.2).repeatForever(autoreverses: false)` (`OnboardingWizardSteps.swift:1381–1395`).
+- Inner `VStack(spacing: 10)` grouping the title and status line:
+  - Title: `"Scanning your code"`, `.system(size: 30, weight: .medium)`, `Color.primary`, `lineLimit(1)`, `fixedSize(horizontal: true, vertical: false)`.
+  - Status line (only if the trimmed `status` is non-empty): `.system(size: 15)`, `.secondary`, centered, `maxWidth: 300 pt`.
 
 No back pill. No bottom button. No progress bar.
 
@@ -317,7 +334,8 @@ The single credential binding routes the value to the token or password slot dep
 - Progress bar: 4 of 4 active.
 
 **`FeedbackCopyChip` details:**
-- `HStack(spacing: 3)`: Icon ZStack (16×16 pt) + Text.
+- `HStack(spacing: 3)`: Icon ZStack (16×16 pt) + Text (`"Copy"` → `"Copied!"`).
+- Text uses `.font(.system(size: 13))` (`OnboardingWizardSteps.swift:1335–1337`).
 - Icons cross-fade with scale (1→0.25) + blur (0→4 pt) on swap. Animation: `.smooth(duration: 0.3)`.
 - Text cross-fades with `.contentTransition(.opacity)`.
 - Chip padding: horizontal 7, vertical 5. Background: `RoundedRectangle(cornerRadius: 5, style: .continuous)`.
@@ -380,6 +398,8 @@ Content `VStack(spacing: 0)` at `.offset(y: -52)`:
 
 No user interaction is possible on this step. It is a terminal step.
 
+> **Which success view is live?** The wizard's `successStep` renders `OnboardingSuccessStepView` (`OnboardingWizardView.swift:619–621`) — the auto-advancing view described above. A *separate*, similarly named `OnboardingSuccessStep` struct also exists in `OnboardingWizardSteps.swift:411–470` but is **never instantiated** by the wizard (no reference to it in the live render path). It is a canvas-based (`OnboardingActivationCanvas`) design with `OpenClawActivationGlyph(size: 86)` + a checkmark badge, a `"You're connected"` title, verbatim `gatewayName` / optional `gatewayAddress` rows, and a `"Go to Chat"` button (`Label("Go to Chat", systemImage: "bubble.left.and.bubble.right.fill")`). A rebuilder should implement `OnboardingSuccessStepView`, not `OnboardingSuccessStep`; see Section 2.6.
+
 ---
 
 ### 2.5 Intro Step (`OnboardingIntroStep`)
@@ -413,7 +433,7 @@ Content `VStack(alignment: .leading, spacing: 0)`:
 
 4. **`Spacer(minLength: 40)`**
 
-5. **Continue button**: `OnboardingPrimaryButtonStyle` (= `OpenClawPrimaryActionButtonStyle`), `Text("Continue")`, `OpenClawType.subheadSemiBold`.
+5. **Continue button**, wrapped in `VStack(spacing: 14)` (`OnboardingWizardSteps.swift:269–277`): `OnboardingPrimaryButtonStyle` (= `OpenClawPrimaryActionButtonStyle`), `Text("Continue")`, `OpenClawType.subheadSemiBold`.
 
 **Panel styles (`OnboardingIntroPanelStyle`):**
 
@@ -432,6 +452,85 @@ Panel overlay (top, inside): `Color.white.opacity(0.42)`, `lineWidth: 0.5`, `.bl
 **`OnboardingIntroIcon`:** SF Symbol in circle (34×34 pt). Background: `Circle().fill(iconFill)`. Stroke: `Circle().stroke(stroke, lineWidth: 0.6)`. Icon font: `OpenClawType.subheadSemiBold`. Icon tint for safety rows: `OpenClawBrand.activationPrimaryAction`.
 
 **`OnboardingSecurityNotice`:** `OnboardingIntroPanel` with warning icon (`exclamationmark.triangle.fill`, tint `OpenClawBrand.warn`) + `VStack(alignment: .leading, spacing: 6)` — title `"Security notice"` (`OpenClawType.subheadSemiBold`) + concatenated body text describing capabilities (`OpenClawType.footnote`, `.secondary`).
+
+---
+
+### 2.6 Defined-But-Unused Surfaces (do not render in the live flow)
+
+The source compiles several mode-picker and success views that are **not reachable** from the live `switch self.step`. They are documented here so a rebuilder can recognize them and must NOT wire them into the flow (the live `.mode` step renders `OnboardingSetupStep` from Section 2.2, and the live success step renders `OnboardingSuccessStepView` from Section 2.4). A `grep` confirms no `self.modeStep` or `self.manualConnectionFieldsSection` call site exists.
+
+#### 2.6.1 `modeStep` @ViewBuilder (unused)
+
+**File:** `Sources/Onboarding/OnboardingWizardView.swift:516–571`
+
+A `Form`-style composition (never attached to any `List`/`Form` in the live tree) built from:
+
+1. `setupCodeSection` (see 2.6.4).
+2. A `Section` headed `"Manual Connection"` (`OpenClawType.footnoteSemiBold`, `.padding(.top, 12)`) containing:
+   - `OnboardingModeRow(title: "Home Network", subtitle: "LAN or Tailscale host", symbol: "house.and.flag", …)` → `selectMode(.homeNetwork)`.
+   - `OnboardingModeRow(title: "Remote Domain", subtitle: "VPS with domain", symbol: "globe", …)` → `selectMode(.remoteDomain)`.
+   - When `developerModeEnabled`: a "Developer mode" toggle row (`onboardingButtonToggle`, symbol `"wrench.and.screwdriver"`, tint `OpenClawBrand.activationPrimaryAction`) plus `OnboardingModeRow(title: "Same Machine (Dev)", subtitle: "For local iOS app development", symbol: "wrench.and.screwdriver", …)` → `selectMode(.developerLocal)`.
+   - The whole section is `.disabled(connectingGatewayID != nil)`.
+3. A trailing `Section` with a `"Continue"` button (`OpenClawType.subheadSemiBold`, `OpenClawPrimaryActionButtonStyle(height: 48, cornerRadius: 16)`, `listRowInsets EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16)`, clear row background, hidden separator) that is `.disabled(selectedMode == nil || connectingGatewayID != nil)` and navigates to `.feedback`.
+
+#### 2.6.2 `OnboardingModeRow`
+
+**File:** `Sources/Onboarding/OnboardingWizardSteps.swift:500–533`
+
+`Button` (`.buttonStyle(.plain)`) wrapping `HStack(spacing: 12)`:
+
+- Leading `OnboardingModeIcon(symbol:selected:)` (see 2.6.3).
+- `VStack(alignment: .leading, spacing: 2)`: title (`OpenClawType.subheadSemiBold`) + subtitle (`OpenClawType.footnote`, `.secondary`).
+- `Spacer()`.
+- Trailing selection indicator `Image(systemName:)`:
+  - Selected: `"checkmark.circle.fill"`, `.title3.weight(.semibold)`, foreground `OpenClawBrand.activationPrimaryAction`.
+  - Unselected: `"circle"`, `.title3.weight(.regular)`, foreground `Color(uiColor: .quaternaryLabel).opacity(0.55)`.
+- Row: `.padding(.vertical, 6)`, `.frame(minHeight: 52)`, `.contentShape(Rectangle())`.
+
+#### 2.6.3 `OnboardingModeIcon`
+
+**File:** `Sources/Onboarding/OnboardingWizardSteps.swift:472–498`
+
+`Image(systemName:)` at `OpenClawType.subheadSemiBold`, foreground `OpenClawBrand.activationPrimaryActionText` when selected else `.secondary`, in a `.frame(width: 34, height: 34)`:
+
+- Background: `RoundedRectangle(cornerRadius: 12, style: .continuous)` filled with `OpenClawBrand.activationPrimaryGradient` when selected, else `OpenClawBrand.activationNeutralGradient`; with a drop shadow `OpenClawBrand.activationGlow.opacity(0.18)` radius 5, x 0, y 2 when selected (`.clear` otherwise).
+- Overlay stroke: `RoundedRectangle(cornerRadius: 12, style: .continuous)` stroked with `Color.white.opacity(0.30)` when selected, else `OpenClawBrand.activationNeutralStroke`, `lineWidth: 0.5`.
+
+(This icon is also reused by the live Developer-mode toggle row's `onboardingButtonToggle`, always with `selected: false`.)
+
+#### 2.6.4 `setupCodeSection` (unused)
+
+**File:** `Sources/Onboarding/OnboardingWizardView.swift:635–678`
+
+A `Form` `Section` headed `"Setup Code"` (`OpenClawType.footnoteSemiBold`) with footer `"Use this if you have a setup code instead of scanning."` (`OpenClawType.footnote`):
+
+- `HStack(spacing: 12)`, `.frame(minHeight: 50)`:
+  - `onboardingTextField("Enter setup code", text: $setupCode, …)` — single-line, `.submitLabel(.go)`, submitting runs `applySetupCodeAndConnect()` when `canApplySetupCode`.
+  - Apply button (`.buttonStyle(.bordered)`, `.buttonBorderShape(.capsule)`, `.controlSize(.regular)`, tint `OpenClawBrand.activationPrimaryAction`): shows a small circular `ProgressView` while `connectingGatewayID == "setup-code"`, otherwise `Text("Apply")` (`OpenClawType.subheadSemiBold`). Disabled unless `canApplySetupCode` (non-empty trimmed code and no in-flight connect).
+- Optional `setupCodeStatus` row: `Text` at `OpenClawType.footnote`, `.secondary`, shown only when the status string is non-empty.
+
+`onboardingTextField` renders a prompt-styled `TextField` (`OpenClawType.subhead`, `.tertiary` prompt, no autocapitalization/autocorrection, focus-bound). `onboardingSecureField` wraps a `SecureField` with a decorative overlay placeholder (`.tertiary`, `.accessibilityHidden(true)`) plus an `.accessibilityLabel`.
+
+#### 2.6.5 `manualConnectionFieldsSection(title:)` (unused)
+
+**File:** `Sources/Onboarding/OnboardingWizardView.swift:685–814`
+
+A `Form` `Section` (header = `title`, `OpenClawType.footnoteSemiBold`) with:
+
+- `onboardingTextField("Host", …)`.
+- `onboardingTextField("Port", …)` with `.keyboardType(.numberPad)`.
+- `manualConnectionSecurityRows`: a `.pickerStyle(.segmented)` `Picker("Connection security", selection: manualTLSBinding)` with options `Text("Unencrypted").tag(false)` and `Text("Secure (TLS)").tag(true)` (both `OpenClawType.captionSemiBold`); `.disabled(manualTransport.requiresTLS)`. When `manualTransport.helperText` is non-nil, a helper `Text` (`OpenClawType.footnote`, `.secondary`) follows (`OnboardingWizardView.swift:727–745`).
+- `onboardingTextField("Discovery Domain (optional)", text: $discoveryDomain, …)`.
+- Only when `selectedMode == .remoteDomain`: `onboardingSecureField("Gateway Auth Token", …)` and `onboardingSecureField("Gateway Password", …)`.
+- `manualConnectButton` (`OnboardingWizardView.swift:796–814`): shows `HStack(spacing: 8)` of a circular `ProgressView` + `Text("Connecting…")` (`OpenClawType.subheadSemiBold`) while `connectingGatewayID == "manual"`, otherwise `Text("Connect")` (`OpenClawType.subheadSemiBold`); `.disabled(!canConnectManual || connectingGatewayID != nil)`.
+
+The TLS picker binding (`manualTLSBinding`) reads `manualTransport.effectiveTLS` and refuses to turn TLS off when `manualTransport.requiresTLS` is true (`OnboardingWizardView.swift:718–725`).
+
+#### 2.6.6 `OnboardingSuccessStep` struct (unused)
+
+**File:** `Sources/Onboarding/OnboardingWizardSteps.swift:411–470`
+
+Canvas-based (`OnboardingActivationCanvas`) alternative to the live `OnboardingSuccessStepView`. `VStack(spacing: 0)`: `Spacer(minLength: 54)`, then a `ZStack(alignment: .bottomTrailing)` of `OpenClawActivationGlyph(size: 86)` (shadow `OpenClawBrand.activationGlow.opacity(0.18)` radius 12, x 0, y 6) with a checkmark badge — `Image(systemName: "checkmark")` at `OpenClawType.headlineBold`, white, in a 30×30 `Circle().fill(OpenClawBrand.ok)` with a 3 pt `OpenClawBrand.activationCanvas` ring (`.padding(.bottom, 22)`). Then `"You're connected"` (`OpenClawType.title1`, `.padding(.bottom, 8)`), verbatim `gatewayName` (`OpenClawType.subheadSemiBold`, `.secondary`), optional verbatim `gatewayAddress` (`OpenClawType.footnote`, `.secondary`, `.padding(.top, 4)`), `Spacer(minLength: 40)`, and a `"Go to Chat"` button (`Label(…, systemImage: "bubble.left.and.bubble.right.fill")`, `OpenClawType.subheadSemiBold`, `OnboardingPrimaryButtonStyle`) calling `onGetStarted`.
 
 ---
 
@@ -459,10 +558,13 @@ A `UIViewControllerRepresentable` wrapping `QRScannerContainerViewController`:
 - Camera session starts in `viewDidAppear` (after UIKit presentation completes) to avoid race with sheet teardown.
 - Camera session stops in `viewWillDisappear` and on `dismantleUIViewController`.
 
-**Pre-condition checks:**
-- `DataScannerViewController.isSupported` → error if false: `"QR scanning is not supported on this device."`
-- `DataScannerViewController.isAvailable` → error if false: `"Camera scanning is currently unavailable."`
-- `dataScanner(_:becameUnavailableWithError:)` → error: `"Camera is not available on this device."`
+**Pre-condition checks** (`makeUIViewController`, `QRScannerView.swift:116–126`):
+- `DataScannerViewController.isSupported` → error if false: `"QR scanning is not supported on this device."` (`QRScannerView.swift:117–118`).
+- `DataScannerViewController.isAvailable` → error if false: `"Camera scanning is currently unavailable."` (`QRScannerView.swift:121–122`).
+- `Coordinator.dataScanner(_:becameUnavailableWithError:)` → `self.reportError("Camera is not available on this device.")` (`QRScannerView.swift:254–259`).
+- `startScanningIfNeeded()` catch → `"Could not start QR scanner."` (`QRScannerView.swift:192–200`).
+
+Errors are deduplicated by the Coordinator's `reportedError` flag (first error wins), and delivered on `MainActor` via `onError` (`QRScannerView.swift:212–218`).
 
 **Result delivery:**
 
@@ -474,10 +576,11 @@ A `UIViewControllerRepresentable` wrapping `QRScannerContainerViewController`:
 
 Manages the asynchronous gap between VisionKit teardown and SwiftUI sheet dismissal:
 
-- `beginScan()` increments `activeScanID` and returns it as a token.
-- `queue(_:scanID:)` stores the result only if the `scanID` matches the current active scan and no result is pending ("Camera and Photos can finish together; the first valid result owns this scan").
-- On sheet `onDismiss`, `processAfterDismissal(_:)` is called. It delays delivery by `defaultSettlingNanoseconds = 1_200_000_000` (1.2 seconds). The comment explains: "SwiftUI's onDismiss can precede VisionKit's AV capture teardown. Delay pairing UI briefly so it cannot race the scanner's camera shutdown."
-- `cancel()` increments `activeScanID` (invalidating any in-flight scan) and cancels the delivery task.
+- `beginScan()` first calls `self.cancel()` (which increments `activeScanID`, cancels the delivery task, and clears any pending result) and then returns the *current, now-incremented* `activeScanID` as the scan token. `beginScan()` itself does not increment; the increment happens inside `cancel()` (`QRScannerView.swift:61–65, 103–108`).
+- `isActive(scanID:)` returns `true` only when `scanID == activeScanID` AND `pendingResult == nil` (`QRScannerView.swift:67–69`).
+- `queue(_:scanID:)` stores the result only if `isActive(scanID:)` holds — i.e. the `scanID` matches the current active scan and no result is pending ("Camera and Photos can finish together; the first valid result owns this scan") (`QRScannerView.swift:71–77`).
+- On sheet `onDismiss`, `processAfterDismissal(_:)` is called. If there is no pending result it calls `cancel()` and returns `nil`; otherwise it clears the pending result, increments `activeScanID` (`&+= 1`), and schedules delivery after `defaultSettlingNanoseconds = 1_200_000_000` (1.2 seconds) (`QRScannerView.swift:79–101`). The comment explains: "SwiftUI's onDismiss can precede VisionKit's AV capture teardown. Delay pairing UI briefly so it cannot race the scanner's camera shutdown."
+- `cancel()` increments `activeScanID` (`&+= 1`, invalidating any in-flight scan), cancels and clears the delivery task, and clears the pending result (`QRScannerView.swift:103–108`).
 
 ### 3.4 Photo Library Fallback
 
@@ -509,15 +612,17 @@ All state persisted to `UserDefaults.standard`:
 
 **Launch gate (`shouldPresentOnLaunch`):** Returns `true` only when `onboarding.completed` is `false` AND no active gateway entry exists in `GatewaySettingsStore` AND `appModel.gatewayServerName == nil`.
 
-**Connection modes (`OnboardingConnectionMode`):**
+**Connection modes (`OnboardingConnectionMode`):** The enum itself (`OnboardingStateStore.swift:3–18`) is a bare `String`-raw-valued enum with only `title` — it has NO host/port/TLS properties. The per-mode endpoint defaults below are applied imperatively by `OnboardingWizardView.applyModeDefaults(_:)` when the user picks a mode, and partly by `initializeState()` on first appear (`OnboardingWizardView.swift:1596–1632, 1358–1387`).
 
-| Case | Raw value | Defaults |
-|---|---|---|
-| `.homeNetwork` | `"home_network"` | Host: `"openclaw.local"`, port 18789, TLS on |
-| `.remoteDomain` | `"remote_domain"` | Host: `""` (user-provided), port 18789, TLS on |
-| `.developerLocal` | `"developer_local"` | Host: `"localhost"`, port 18789, TLS off |
+| Case | Raw value | `title` | Defaults applied by `applyModeDefaults` |
+|---|---|---|---|
+| `.homeNetwork` | `"home_network"` | `"Home Network"` | If host is empty/`"openclaw.local"`/`"localhost"`, set host `"openclaw.local"`; TLS on; if port ≤ 0 or > 65535, port 18789 |
+| `.remoteDomain` | `"remote_domain"` | `"Remote Domain"` | If host is `"openclaw.local"`/`"localhost"`, clear host to `""`; TLS on; if port ≤ 0 or > 65535, port 18789 |
+| `.developerLocal` | `"developer_local"` | `"Same Machine (Dev)"` | If host is empty/`"openclaw.local"`/`"localhost"`, set host `"localhost"`; TLS off; if port ≤ 0 or > 65535, port 18789 |
 
-Developer Local mode is hidden unless `@AppStorage("onboarding.developerMode")` is `true`.
+Note the defaults are only coerced when the current host is "default-like" or out of range — a user-typed custom host/port survives a mode switch. When the current auth stable-ID changes as a result, `applyModeDefaults` clears the token/password fields (`clearManualCredentialFields`). In `initializeState()`, when no saved manual gateway exists, the initial fields are seeded to host `"openclaw.local"`, port 18789, TLS on; if `selectedMode == .developerLocal` and the host is still `"openclaw.local"`, it is rewritten to `"localhost"` with TLS off.
+
+Developer Local mode is hidden unless `@AppStorage("onboarding.developerMode")` is `true`. `initializeState()` also flips `developerModeEnabled` on when the persisted `lastMode()` is `.developerLocal`.
 
 **`markCompleted(mode:)`:** Persists `true` to `onboarding.completed`, stores the mode raw value, and stores `Int(Date().timeIntervalSince1970)` to `onboarding.last_success_time`.
 
@@ -593,7 +698,10 @@ All text in the wizard uses `OpenClawType` named styles or explicit system font 
 | `OpenClawBrand.activationPrimaryAction` | Tint color for whole NavigationStack |
 | `OpenClawBrand.activationNeutralSurface` | Command chip and panel fills |
 | `OpenClawBrand.activationNeutralStroke` | Panel/chip strokes |
-| `OpenClawBrand.ok` | Success checkmark circle fill |
+| `OpenClawBrand.ok` | Checkmark-badge circle fill in the unused `OnboardingSuccessStep` struct (Section 2.6.6); not used by the live `OnboardingSuccessStepView` |
+| `OpenClawBrand.activationPrimaryGradient` / `activationNeutralGradient` | `OnboardingModeIcon` background (Section 2.6.3) |
+| `OpenClawBrand.activationGlow` | `OnboardingModeIcon` / `OnboardingSuccessStep` glyph glow shadow |
+| `OpenClawBrand.activationPrimaryActionText` | Selected `OnboardingModeIcon` symbol tint |
 
 ### 6.4 Command Chip (`OnboardingCommandChip`)
 
@@ -603,7 +711,7 @@ Used in the intro step to display `"openclaw qr"`:
 - Height: 54 pt. Horizontal padding: 16.
 - Background: `RoundedRectangle(cornerRadius: 20, style: .continuous).fill(OpenClawBrand.activationNeutralSurface)`.
 - Stroke: `OpenClawBrand.activationNeutralStroke`, `lineWidth: 0.5`.
-- Copy button: `Image(systemName: "doc.on.doc")` → `"checkmark"` after copy. Transition: `.symbolEffect(.replace)`. Foreground: secondary (0.56 opacity) → `OpenClawBrand.activationPrimaryAction`. Resets after 1.1 seconds (`1_100_000_000 ns`). Animation in/out: `.smooth(duration: 0.14/.16)`.
+- Copy button: `Image(systemName: "doc.on.doc")` → `"checkmark"` after copy, at `OpenClawType.subheadSemiBold` with a `.frame(width: 38, height: 38)` tap target (`OnboardingWizardSteps.swift:198–204`). Transition: `.contentTransition(.symbolEffect(.replace))`. Foreground: `Color.secondary.opacity(0.56)` → `OpenClawBrand.activationPrimaryAction`. Resets after 1.1 seconds (`1_100_000_000 ns`). Animation in/out: `.smooth(duration: 0.14)` / `.smooth(duration: 0.16)`.
 
 ---
 

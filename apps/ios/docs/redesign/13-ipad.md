@@ -104,7 +104,7 @@ All six cases pass `.id(self.selectedSidebarDestination.id)` to force SwiftUI to
 
 ### `body` logic
 
-When `directRoute` is not nil the body calls `directDestination(for:)`, which calls `destination(for:)` and hides the navigation bar unless the route is `.agents` and no leading action is set. When `directRoute` is nil (overview mode) a `NavigationStack(path: navigationPath)` renders `overviewNavigation` — this mode is not used in the current iPad sidebar mapping.
+When `directRoute` is not nil the body calls `directDestination(for:)`, which calls `destination(for:)` and attaches a `.toolbar(…, for: .navigationBar)` modifier. The navigation bar is **hidden only when `route != .agents` AND `directHeaderLeadingAction(for: route) != nil`** (i.e. hidden when the route is not `.agents` and a leading action IS set); otherwise it stays `.visible` (`Sources/Design/AgentProTab.swift:183-188`). When `directRoute` is nil (overview mode) a `NavigationStack(path: navigationPath)` renders `overviewNavigation` — this mode is not used in the current iPad sidebar mapping.
 
 The body attaches a `.task(id: overviewTaskID)` that calls `refreshOverview(force: false)` whenever the gateway/operator connection, active agent ID, or scene phase changes. The task ID is built from:
 
@@ -149,7 +149,7 @@ This is the non-direct-route mode rendered on iPad when no `directRoute` is pass
 Top-level sections in order:
 
 1. **`rosterHeader`** — `VStack(alignment: .leading, spacing: 10)` with `.padding(.horizontal, 16)` `.padding(.top, 6)`
-2. **`agentFilters`** — `HStack(spacing: 10)` with `.padding(.horizontal, 16)`
+2. **`agentFilters`** — `HStack(spacing: 10)` with `.padding(.horizontal, 16)` (see detail below)
 3. **`agentsSection`** — `ProCard(padding: 0, radius: 16)` with `.padding(.horizontal, 16)`
 4. **`operationsSection`** — `VStack(alignment: .leading, spacing: 8)` with metric grid at `.padding(.horizontal, 16)`
 5. **`dreamingSection`** — `VStack(alignment: .leading, spacing: 8)` with `.padding(.horizontal, 16)`
@@ -165,13 +165,21 @@ Title text uses `OpenClawType.title2SemiBold`. Subtitle is `"\(sortedAgents.coun
 
 When `agentSearchPresented` is true a `TextField("Search agents", ...)` appears with `.transition(.move(edge: .top).combined(with: .opacity))`, font `OpenClawType.subhead`, `.textFieldStyle(.roundedBorder)`, `.frame(height: 38)`.
 
+### `agentFilters`
+
+`HStack(spacing: 10)` with `.padding(.horizontal, OpenClawProMetric.pagePadding)` (`Sources/Design/AgentProTab+Overview.swift:63-92`):
+- A segmented `Picker("Agent status", selection: agentRosterFilter)` (`.pickerStyle(.segmented)`) whose options are the `AgentRosterFilter` cases, each option `Text(filter.title)` in `OpenClawType.captionSemiBold`.
+- A conditional clear-filter `Button` shown only when `agentFiltersActive` is true. Label is `Image(systemName: "xmark.circle.fill")` with `OpenClawType.title3`, `.foregroundStyle(.secondary)`, `.frame(width: 44, height: 44)`, `.contentShape(Circle())`. Button style `.plain`, `.accessibilityLabel("Clear filters")`. Tapping runs `withAnimation(.snappy(duration: 0.18))` to reset `agentRosterFilter = .all` and `agentSearchText = ""`.
+
+`agentFiltersActive` (`Sources/Design/AgentProTab+Overview.swift:134-137`) = `agentRosterFilter != .all || !agentSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty`.
+
 ### Agent roster section
 
 `agentsSection` is a `ProCard(padding: 0, radius: 16)`.
 
 **Empty state:** `HStack(spacing: 12)` — `ProIconBadge(systemName: "person.2.slash", color: .secondary)` + `VStack` with title (`OpenClawType.subheadSemiBold`) and detail (`OpenClawType.caption`, `.secondary`), padded by 14.
 
-**Agent row:** `Button` with `.buttonStyle(.plain)`. Inner content is `HStack(alignment: .center, spacing: 12)` with `.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)`:
+**Agent row:** `Button` with `.buttonStyle(.plain)`. The button action is a no-op when the agent is already active (`guard !isActive else { return }`) and otherwise calls `appModel.setSelectedAgentId(agent.id)` (`Sources/Design/AgentProTab+Overview.swift:274-276`). Inner content is `HStack(alignment: .center, spacing: 12)` with `.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)`:
 - **Avatar** (`agentAvatar`): `ZStack(alignment: .bottomTrailing)` — outer `Circle().fill(agentTint.gradient)` 36×36 with `.overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 1))`. Badge text: font `OpenClawType.avatar(size: count > 2 ? 14 : 18)`, white, `minimumScaleFactor: 0.62`. Status dot: `Circle().fill(state.color)` 8×8 with `Circle().strokeBorder(Color(uiColor: .systemBackground), lineWidth: 2)`.
 - **Name + detail stack**: `VStack(alignment: .leading, spacing: 3)`, `.layoutPriority(1)`. Name: `OpenClawType.subheadSemiBold`. Detail: `OpenClawType.footnote`, `.secondary`, `lineLimit: 1`.
 - **Active checkmark**: `Image(systemName: "checkmark")` with `OpenClawType.subheadSemiBold`, `OpenClawBrand.accent`, frame 24×44, shown only when `isActive`.
@@ -193,22 +201,23 @@ Five tiles: Skills, Instances, Cron, Usage, Files — each rendered via `metricT
 `ProCard(padding: 12, radius: 16)` → `VStack(alignment: .leading, spacing: 10)`:
 - Top `HStack`: `ProIconBadge` + `Spacer()` + `ProValuePill(value:, color:)` + optional chevron `Image(systemName: "chevron.right")` (`OpenClawType.captionSemiBold`, `.secondary`).
 - Bottom `VStack(alignment: .leading, spacing: 2)`: title (`OpenClawType.captionSemiBold`), detail (`OpenClawType.caption2`, `.secondary`, `lineLimit: 2`, `.multilineTextAlignment(.leading)`).
-- `.frame(height: 94, alignment: .topLeading)`.
+- The outer `VStack` carries both `.frame(maxWidth: .infinity, alignment: .leading)` and `.frame(height: 94, alignment: .topLeading)` (`Sources/Design/AgentProTab+Overview.swift:441-442`).
 
 Each tile with a route is wrapped in a `NavigationLink(value: AgentRoute)`. Tapping navigates in the `NavigationStack`.
 
-**Value strings when disconnected:** all return `"offline"`. When loading: `"..."`. Computed values:
-- Skills: `"\(enabledCount)/\(totalCount)"` or `"live"`.
-- Instances: `"\(presence.count)"` or `"live"`.
-- Cron: `"\(cronStatus.jobs)"` if enabled, else `"off"`.
-- Usage: formatted as USD `"$0.00"` or compact token notation.
+**Value strings when disconnected:** all return `"offline"`. When connected but the snapshot is still loading (`overviewLoading`): `"..."`. Computed values (`Sources/Design/AgentProTab+Overview.swift:577-677`):
+- Skills: `"\(enabledCount)/\(totalCount)"`; fallback when the snapshot is nil and not loading is `"live"`.
+- Instances: `"\(presence.count)"`; fallback `"live"`.
+- Cron: `"\(cronStatus.jobs)"` if enabled, else `"off"`; fallback when snapshot nil is `"live"`.
+- Usage: USD-formatted total cost via `Self.currency(cost)`, else compact token notation via `Self.compactNumber(tokens)` when `totalTokens > 0`, else `"7d"`. The fallback when the snapshot is nil and not loading is also `"7d"` (NOT `"live"`).
+- Dreaming: `"on"` / `"off"` from `dreaming.enabled`; fallback when snapshot nil is `"live"`.
 - Files: `activeAgentID`.
 
 **Tile colors:** Skills/Usage/Files/Dreaming → `gatewayConnected ? OpenClawBrand.accent : .secondary`. Instances → `presence.isEmpty == false ? OpenClawBrand.accent : .secondary`. Cron → `cronStatus.enabled == true ? OpenClawBrand.accent : .secondary`.
 
 ### `agentMenuRow` (dreaming, cron preview rows)
 
-`HStack(spacing: 12)` → `ProIconBadge` + `VStack(alignment: .leading, spacing: 3)` (title: `OpenClawType.subheadSemiBold`, detail: `OpenClawType.caption`, `.secondary`, `lineLimit: 1`) + `Spacer(minLength: 8)` + value text (`OpenClawType.caption2SemiBold`, tinted by color, `lineLimit: 1`) + optional chevron.
+`HStack(spacing: 12)` → `ProIconBadge` + `VStack(alignment: .leading, spacing: 3)` (title: `OpenClawType.subheadSemiBold`, detail: `OpenClawType.caption`, `.secondary`, `lineLimit: 1`) + `Spacer(minLength: 8)` + value text (`OpenClawType.caption2SemiBold`, tinted by color, `lineLimit: 1`) + optional chevron (`"chevron.right"`, `OpenClawType.captionSemiBold`, `.secondary`). The whole `HStack` has `.padding(.vertical, 10)` (`Sources/Design/AgentProTab+Overview.swift:376`).
 
 ### Dreaming section
 
@@ -216,7 +225,11 @@ Each tile with a route is wrapped in a `NavigationLink(value: AgentRoute)`. Tapp
 
 ### Cron section
 
-`cronSection`: `ProCard(padding: 0, radius: 16)`. Up to 4 recent cron jobs (`recentCronJobs`) sorted by `nextRunAtMs` ascending, then by `updatedatms` descending for jobs with no next run. Each job row (`cronJobRow`) is:
+`cronSection`: `VStack(alignment: .leading, spacing: 8)` → `ProSectionHeader(title: "Scheduled Work")` → `ProCard(padding: 0, radius: 16)` (`Sources/Design/AgentProTab+Overview.swift:228-255`). The card is `.padding(.horizontal, OpenClawProMetric.pagePadding)`.
+
+**Empty state** (when `recentCronJobs` is empty): the entire card body is a single `NavigationLink(value: AgentRoute.cron)` (`.buttonStyle(.plain)`) wrapping `emptyCronRow` with `.padding(14)`. `emptyCronRow` is `HStack(spacing: 12)` → `ProIconBadge(systemName: "clock.badge.questionmark", color: .secondary)` + `VStack(alignment: .leading, spacing: 3)` with title (`gatewayConnected ? "No scheduled jobs" : "Cron unavailable"`, `OpenClawType.subheadSemiBold`) and detail (`gatewayConnected ? "The gateway has no visible cron jobs." : "Connect a gateway to load scheduled work."`, `OpenClawType.caption`, `.secondary`) + `Spacer()` (`Sources/Design/AgentProTab+Overview.swift:446-460`).
+
+**Populated state:** up to 4 recent cron jobs (`recentCronJobs`) sorted by `nextRunAtMs` ascending, then by `updatedatms` descending for jobs with no next run. Each job row (`cronJobRow`) is:
 - `HStack(spacing: 12)` with `.padding(.vertical, 10)` `.padding(.horizontal, 14)`.
 - Icon: `"clock.arrow.circlepath"` if `job.enabled`, else `"pause.circle"`. Color: `accent` if enabled, else `.secondary`.
 - Name: `OpenClawType.subheadSemiBold`, lineLimit 1. Detail: `OpenClawType.caption`, `.secondary`, lineLimit 1 (uses `nextRunAtMs` relative time, else description, else agentId, else id).
@@ -261,7 +274,7 @@ Sections in order:
 `ProCard(radius: 16)` → `VStack(alignment: .leading, spacing: 12)`:
 - Header: `HStack(alignment: .firstTextBaseline)` — active agent name (`OpenClawType.headline`), skill policy summary (`OpenClawType.caption`, `.secondary`), `ProValuePill` showing `agentSkillFilter == nil ? "all" : "\(count)"` in `OpenClawBrand.accent`.
 - Buttons: `HStack(spacing: 8)` — "Enable All", "Disable All" (`.destructive` role), "Reset" — all `.bordered` `.small`. "Reset" disabled when `agentSkillFilter == nil`.
-- Status/error text: `OpenClawType.caption2`, status in `OpenClawBrand.accent`, error in `OpenClawBrand.warn`.
+- Status/error text: two independent `if let` blocks (`Sources/Design/AgentProTab+Skills.swift:51-60`) that can both show at once — `skillMutationStatusText` in `OpenClawType.caption2` `OpenClawBrand.accent`, and `skillMutationErrorText` in `OpenClawType.caption2` `OpenClawBrand.warn`.
 
 ### `skillsFilterField`
 
@@ -278,7 +291,7 @@ Sections in order:
 - Error text in `OpenClawBrand.warn`.
 - Results list: up to 8 results, `clawHubResultRow(_:)`.
 
-`clawHubResultRow`: `HStack(alignment: .top, spacing: 10)` + `ProIconBadge("sparkles")` + `VStack` (display name `OpenClawType.subheadSemiBold`, summary `OpenClawType.caption`, `.secondary`, `lineLimit: 2`) + install `Button` (icon: `"hourglass"` if installing, else `"square.and.arrow.down"`, `.bordered`, `.mini`). Rows have `.padding(.vertical, 10)`, dividers between rows at `.padding(.leading, 42)`.
+`clawHubResultRow` (`Sources/Design/AgentProTab+Skills.swift:159-184`): `HStack(alignment: .top, spacing: 10)` + `ProIconBadge(systemName: "sparkles", color: OpenClawBrand.accent)` + `VStack(alignment: .leading, spacing: 3)` (display name `OpenClawType.subheadSemiBold`, `lineLimit: 1`; summary = `result.summary ?? result.slug`, `OpenClawType.caption`, `.secondary`, `lineLimit: 2`) + `Spacer(minLength: 8)` + install `Button` (icon: `"hourglass"` if `installing` (= `clawHubInstallSlug == result.slug`), else `"square.and.arrow.down"`; `.buttonStyle(.bordered)`, `.controlSize(.small)`; disabled when `installing || !skillConfigBusyKeys.isEmpty`). The row has `.padding(.vertical, 10)`; dividers between rows at `.padding(.leading, 42)`.
 
 ### `skillsList`
 
@@ -288,7 +301,9 @@ Each `skillRow`:
 - `HStack(alignment: .top, spacing: 12)` with `.padding(.vertical, 10)` `.padding(.horizontal, 14)`.
 - Left: `ProIconBadge(systemName: isAllowed ? "checkmark.circle" : "nosign", color: status.color)`.
 - Center: `VStack(alignment: .leading, spacing: 4)` — display name (`OpenClawType.subheadSemiBold`, `lineLimit: 1`), description/source (`OpenClawType.caption`, `.secondary`, `lineLimit: 2`), missing requirements text in `OpenClawBrand.warn` (`OpenClawType.caption2`), install summary (`OpenClawType.caption2`, `.secondary`).
-- Right: `VStack(alignment: .trailing, spacing: 6)` — `skillToggle` (`.toggleStyle(.switch)`, `.controlSize(.mini)`), setup button (`.bordered`, `.mini`) when `canInstallSkillRequirements`, edit button (SF Symbol `"slider.horizontal.3"`, `.bordered`, `.mini`), status label (`OpenClawType.caption2SemiBold`, tinted by status color).
+- Right: `VStack(alignment: .trailing, spacing: 6)` — `skillToggle` (a **native** `Toggle` with `.labelsHidden()`, `.toggleStyle(.switch)`, `.controlSize(.mini)`, `.disabled(skillMutationBusy)`; `Sources/Design/AgentProTab+Skills.swift:348-360`), setup button (`.bordered`, `.mini`) when `canInstallSkillRequirements`, edit button (SF Symbol `"slider.horizontal.3"`, `.bordered`, `.mini`), status label (`OpenClawType.caption2SemiBold`, tinted by status color).
+
+> The list toggle is a native `Toggle`. The iOS-26 tap-swallowing Button workaround (`skillEditorToggleRow`, documented under the skill editor sheet) is used ONLY inside the sheet — do not apply it to this list row.
 - Dividers between rows at `.padding(.leading, 60)`.
 
 **Skill status → color mapping:**
@@ -307,7 +322,19 @@ Each `skillRow`:
 
 Presented over the current view via `.sheet(item: skillEditorSelection)`.
 
-`skillEditorSheet` is a `NavigationStack` → `ZStack` (background) → `ScrollView` → `VStack(alignment: .leading, spacing: 16)` padded `.vertical: 18`. Sections: header card, controls card, setup card, metadata card. `.navigationTitle(skill.displayName)` `.navigationBarTitleDisplayMode(.inline)`. Cancel toolbar button: `Text("Close")` `OpenClawType.subheadSemiBold`, `.cancellationAction`.
+`skillEditorSheet` is a `NavigationStack` → `ZStack` (background) → `ScrollView` → `VStack(alignment: .leading, spacing: 16)` padded `.vertical: 18`. Four sections in order (`Sources/Design/AgentProTab+Skills.swift:422-431`): `skillEditorHeader`, `skillEditorControls`, `skillEditorSetup`, `skillEditorMetadata`. `.navigationTitle(skill.displayName)` `.navigationBarTitleDisplayMode(.inline)`. Cancel toolbar button: `Text("Close")` `OpenClawType.subheadSemiBold`, `.cancellationAction`.
+
+**`skillEditorSetup` card** (`Sources/Design/AgentProTab+Skills.swift:558-586`): `ProCard(radius: 16)` → `VStack(alignment: .leading, spacing: 10)`:
+- `"Setup"` headline (`OpenClawType.headline`).
+- If `skill.missingSummary` is present: `Text("Missing: \(missing)")` in `OpenClawType.caption`, `OpenClawBrand.warn`; otherwise `Text("No missing requirements reported.")` in `OpenClawType.caption`, `.secondary`.
+- If `skill.install?.first` exists: an install `Button` with `Label(install.label, systemImage: "wrench.and.screwdriver")` (`OpenClawType.captionSemiBold`), `.buttonStyle(.bordered)`, `.controlSize(.small)`, disabled when `isSkillConfigBusy(skill) || install.id == nil`.
+- Card `.padding(.horizontal, OpenClawProMetric.pagePadding)`.
+
+**`skillEditorMetadata` card** (`Sources/Design/AgentProTab+Skills.swift:588-602`): `ProCard(radius: 16)` → `VStack(alignment: .leading, spacing: 8)`:
+- `detailMetric(label: "Key", value: skill.effectiveSkillKey)`.
+- `detailMetric(label: "Source", value: normalized(skill.source) ?? "unknown")`.
+- When `normalized(skill.filePath)` is non-nil: `Text(filePath)` in `OpenClawType.monoCaption2`, `.secondary`, `.textSelection(.enabled)`.
+- Card `.padding(.horizontal, OpenClawProMetric.pagePadding)`.
 
 `skillEditorToggleRow`: Due to a known iOS 26 bug where native Toggle rows can ignore visible-row taps inside sheets, the toggle is implemented as a `Button` calling `onToggle(!isOn)` with a label showing `OpenClawToggleIndicator(isOn:)`. The `Button` is `.plain` style, `.accessibilityLabel(title)`, `.accessibilityValue(isOn ? "On" : "Off")`. Do not simplify this to a native Toggle without verifying the bug is fixed.
 
@@ -340,8 +367,8 @@ Instantiated from `AgentProTab.instancesDestination` with props forwarded from t
 
 Sections in order:
 1. **`header`** — conditional on `headerLeadingAction`: `OpenClawAdaptiveHeaderRow(title: "Instances", subtitle: instancesDetail, titleFont: OpenClawType.title3SemiBold, subtitleFont: OpenClawType.subheadMedium)` with `OpenClawSidebarHeaderLeadingSlot(action:)`. `.padding(.horizontal, 16)`.
-2. **`summaryCard`** — `ProCard` with `HStack(spacing: 12)`: `ProIconBadge("display", color: instancesColor)` + `VStack` (title `OpenClawType.headline`, detail `OpenClawType.caption`, `.secondary`) + `Spacer(minLength: 8)` + `ProValuePill`. `.padding(.horizontal, 16)`.
-3. **`totalsCard`** — `ProCard` with `VStack(alignment: .leading, spacing: 12)`: "Presence" label (`OpenClawType.headline`) + `ProValuePill` in header, then `HStack(spacing: 10)` with three `detailMetric` tiles: Connected, Agents, Gateway.
+2. **`summaryCard`** — `ProCard` (default padding) with `HStack(spacing: 12)`: `ProIconBadge(systemName: "display", color: instancesColor)` + `VStack(alignment: .leading, spacing: 3)` (title `"Instances"` `OpenClawType.headline`, detail = `instancesDetail` `OpenClawType.caption`, `.secondary`) + `Spacer(minLength: 8)` + `ProValuePill(value: instancesValue, color: instancesColor)`. `.padding(.horizontal, 16)` (`Sources/Design/AgentProNodesDestination.swift:53-69`).
+3. **`totalsCard`** — `ProCard` (default padding) with `VStack(alignment: .leading, spacing: 12)`: header `HStack` with `"Presence"` label (`OpenClawType.headline`) + `Spacer` + `ProValuePill(value: instancesValue, color: instancesColor)`, then `HStack(spacing: 10)` with three `detailMetric` tiles: Connected (`"\(presence.count)"`), Agents (`"\(agentCount)"`), Gateway (`gatewayConnected ? "online" : "offline"`) (`Sources/Design/AgentProNodesDestination.swift:71-88`). Both cards use `ProCard`'s default padding; no explicit padding value is passed.
 4. **`nodesList`** — `VStack(alignment: .leading, spacing: 8)` → `ProSectionHeader("Connected Instances")` → `ProCard(padding: 0)`.
 
 ### `detailMetric` helper
@@ -350,7 +377,7 @@ Sections in order:
 
 ### Node presence rows
 
-`nodePresenceRow`: `HStack(alignment: .top, spacing: 12)` with `.padding(.vertical, 10)` `.padding(.horizontal, 14)`. Fields: `ProIconBadge` (icon/color from `PresenceFormatting`) + `VStack` (label `OpenClawType.subheadSemiBold`, detail `OpenClawType.caption` `.secondary` `lineLimit: 2`, meta `OpenClawType.caption2` `.secondary` `lineLimit: 1`) + `Spacer(minLength: 8)` + state label (`OpenClawType.caption2SemiBold`, `PresenceFormatting.color`) + optional chevron (`OpenClawType.caption2Bold`, `.secondary`, `.padding(.top, 2)`).
+`nodePresenceRow`: `HStack(alignment: .top, spacing: 12)` with `.padding(.vertical, 10)` `.padding(.horizontal, 14)`. Fields: `ProIconBadge` (icon/color from `PresenceFormatting`) + `VStack(alignment: .leading, spacing: 4)` (label `OpenClawType.subheadSemiBold` `lineLimit: 1`, detail `OpenClawType.caption` `.secondary` `lineLimit: 2`, meta `OpenClawType.caption2` `.secondary` `lineLimit: 1`) + `Spacer(minLength: 8)` + state label (`OpenClawType.caption2SemiBold`, `PresenceFormatting.color`) + optional chevron (`OpenClawType.caption2Bold`, `.secondary`, `.padding(.top, 2)`) (`Sources/Design/AgentProNodesDestination.swift:135-145`).
 
 Meta string = `"instance \(instanceid)"` + first 2 tags + scopes count + roles count, joined by `" • "`.
 
@@ -408,9 +435,11 @@ Actions are disabled when `!gatewayConnected || dreamActionBusy != nil`. Active 
 
 ### `dreamingActionsCard`
 
-`ProCard` → `VStack(alignment: .leading, spacing: 12)`. Header: `HStack` with title/subtitle plus refresh `Button` (`.bordered`, `.small`) using `"hourglass"` or `"arrow.clockwise"` icon. Actions: `HStack(spacing: 8)` of `ForEach(DreamAction.allCases)` buttons. Status text: `OpenClawType.caption2`, `.secondary`, `lineLimit: 3`.
+`ProCard` → `VStack(alignment: .leading, spacing: 12)` (`Sources/Design/AgentProDreamingDestination.swift:168-215`). Header: `HStack` with a title/subtitle `VStack(alignment: .leading, spacing: 3)` — `"Maintenance"` (`OpenClawType.headline`) and subtitle `"Refresh reads live state. Maintenance actions update the gateway diary/artifacts."` (`OpenClawType.caption`, `.secondary`, `lineLimit: 2`) — plus `Spacer(minLength: 8)` and a refresh `Button` (`.bordered`, `.small`, disabled when `overviewLoading`) using `"hourglass"` when `overviewLoading` else `"arrow.clockwise"`. Actions: `HStack(spacing: 8)` of `ForEach(DreamAction.allCases)` buttons. Status text (`dreamActionStatusText`): `OpenClawType.caption2`, `.secondary`, `lineLimit: 3`.
 
 ### `dreamDiaryCard`
+
+**Outer structure** (`Sources/Design/AgentProDreamingDestination.swift:217-272`): `VStack(alignment: .leading, spacing: 8)` → `ProSectionHeader(title: "Dream Diary")` → `ProCard(padding: 0)` (`.padding(.horizontal, OpenClawProMetric.pagePadding)`). Note the `ProCard` padding is `0`; the inner content when the diary is found supplies its own `.padding(14)`. The found-with-content body is a `VStack(alignment: .leading, spacing: 12)` whose first child is a header `HStack`: `ProIconBadge(systemName: "book.pages", color: OpenClawBrand.accent)` + `VStack(alignment: .leading, spacing: 2)` (`diary.path` `OpenClawType.subheadSemiBold` `lineLimit: 1`, `dreamDiaryUpdatedLabel(diary)` `OpenClawType.caption` `.secondary`) + `Spacer(minLength: 8)` + (when `!days.isEmpty`) the `dreamDiaryDayMenu`. Below the header is either `dreamDiaryDayView(selectedDay)` or an `emptyDetailRow(icon: "calendar.badge.exclamationmark", title: "No day entries", …)`.
 
 Attempts to extract `overview.dreamDiary`. If found with content, parses markdown into `[DreamDiaryDay]` using `dreamDiaryDays(from:)`:
 - Strips HTML comment markers `<!-- openclaw:dreaming:diary:start -->` / `<!-- openclaw:dreaming:diary:end -->` if present.
@@ -418,15 +447,17 @@ Attempts to extract `overview.dreamDiary`. If found with content, parses markdow
 - Merges blocks with the same day title, appending bodies with `"\n\n---\n\n"`.
 - `hasDatedEntry` must be true; undated blocks are filtered out.
 
-**Day selector menu:** `Menu` with reversed day order (newest last → menu shows newest at top), calendar icon, styled as capsule with `Color.primary.opacity(0.055)` background, height 34.
+**Day selector menu** (`dreamDiaryDayMenu`, `Sources/Design/AgentProDreamingDestination.swift:274-302`): a `Menu` whose items are `ForEach(days.reversed())` (newest last in the array → menu shows newest at top) with `Label(day.title, systemImage: day.id == selected ? "checkmark.circle.fill" : "calendar")`. The menu label is `HStack(spacing: 6)` → `Image(systemName: "calendar")` + `Text(selectedDay?.title ?? "Day")` (`OpenClawType.captionSemiBold`, `lineLimit: 1`, `minimumScaleFactor: 0.75`), with `.foregroundStyle(.primary)`, `.padding(.horizontal, 10)`, `.frame(height: 34)`, `.background(Color.primary.opacity(0.055), in: Capsule())`.
 
-**Day body display:** `Text(day.body)` with `OpenClawType.monoSmall`, `.lineLimit(120)`, `.textSelection(.enabled)`. Background: `Color.primary.opacity(0.045)` in `RoundedRectangle(cornerRadius: 10, style: .continuous)`. `.padding(10)`.
+**Day body display** (`dreamDiaryDayView`, `Sources/Design/AgentProDreamingDestination.swift:304-326`): a `VStack(alignment: .leading, spacing: 8)` whose first child is a header `HStack(alignment: .firstTextBaseline)` — `Text(day.title)` (`OpenClawType.subheadSemiBold`, `lineLimit: 1`) + `Spacer(minLength: 8)` + `Text("\(day.entryCount) entry/entries")` (`OpenClawType.caption2SemiBold`, `OpenClawBrand.accent`; singular "entry" when `entryCount == 1`, else "entries"). Below it: `Text(day.body)` with `OpenClawType.monoSmall`, `.foregroundStyle(.primary)`, `.lineLimit(120)`, `.textSelection(.enabled)`, `.frame(maxWidth: .infinity, alignment: .leading)`. The whole `VStack` has `.padding(10)` and a `Color.primary.opacity(0.045)` background in `RoundedRectangle(cornerRadius: 10, style: .continuous)`.
 
 Default selected day: last day in list (chronologically latest).
 
 ### Dreaming entry rows
 
-`HStack(alignment: .top, spacing: 12)` with `.padding(.vertical, 10)` `.padding(.horizontal, 14)`. Icon: `"text.page"` in `OpenClawBrand.accent`. Title = last path component + `":\(startLine)"`. Snippet: `OpenClawType.caption`, `.secondary`, `lineLimit: 4`, `.textSelection(.enabled)`. Detail: promoted/recalled timestamps + recall count + grounded count, joined by `" • "`. Trailing: `totalSignalCount` as `OpenClawType.caption2SemiBold` in `OpenClawBrand.accent`. Dividers: `.padding(.leading, 60)`.
+Each `dreamingEntriesList` section is `VStack(alignment: .leading, spacing: 8)` → `ProSectionHeader(title:)` → `ProCard(padding: 0)`. **Empty state:** `emptyDetailRow(icon: "doc.text.magnifyingglass", title: emptyTitle, detail: gatewayConnected ? emptyDetail : "Connect a gateway to load dreaming entries.")` with `.padding(14)` (`Sources/Design/AgentProDreamingDestination.swift:344-351`).
+
+**Populated row:** `HStack(alignment: .top, spacing: 12)` with `.padding(.vertical, 10)` `.padding(.horizontal, 14)`. Icon: `"text.page"` in `OpenClawBrand.accent`. Title = last path component + `":\(startLine)"`. Snippet: `OpenClawType.caption`, `.secondary`, `lineLimit: 4`, `.textSelection(.enabled)`. Detail: promoted/recalled timestamps + recall count + grounded count, joined by `" • "`. Trailing: `totalSignalCount` as `OpenClawType.caption2SemiBold` in `OpenClawBrand.accent`. Dividers: `.padding(.leading, 60)`.
 
 ### Phase rows
 
@@ -606,10 +637,16 @@ Title: `"Workboard"`. Subtitle: `workboardSubtitle` = `"\(boardScopeLabel) / \(I
 3. `kanbanBoard` — horizontal scroll of `IPadWorkboardKanbanColumn`, each `frame(width: 282)`.
 
 **Compact layout**:
-1. `compactQueueControls` — card count + board scope menu + status chip scroll + New Card/Dispatch buttons.
+1. `compactQueueControls` — `ProCard` → `VStack(alignment: .leading, spacing: 9)` (`Sources/Design/IPadWorkboardScreen.swift:186-189`) with card count + board scope menu + status chip scroll + New Card/Dispatch buttons.
 2. `compactCardsPanel` — `ProPanelHeader` + `IPadWorkboardQueueRow` list.
 
 `isCompactWidth` = `horizontalSizeClass == .compact || verticalSizeClass == .compact`.
+
+### Board scope menu (wide `controlsCard`)
+
+`boardScopeMenu` (`Sources/Design/IPadWorkboardScreen.swift:355-390`) is an `HStack(spacing: 8)`: a `"Board"` label (`OpenClawType.captionSemiBold`, `.secondary`) + a `Menu`. The menu items are an `"All boards"` button (sets `selectedBoardID = ""`) followed by `ForEach(boardScopeOptions)` buttons (each `Text(boardScopeLabel(for:))` `OpenClawType.subhead`). The menu label is `HStack(spacing: 6)` → `Text(boardScopeLabel)` (`OpenClawType.subheadSemiBold`, `lineLimit: 1`) + `Image(systemName: "chevron.up.chevron.down")` (`OpenClawType.caption2Bold`), with `.frame(maxWidth: .infinity, alignment: .trailing)`. Menu styling: `.buttonStyle(.bordered)`, `.controlSize(.small)`, `.tint(neutralControlTint)`.
+
+The **compact** variant (`compactBoardScopeMenu`) is instead a standalone `Menu` (no leading "Board" label) using a `rectangle.stack` icon, height 32, cornerRadius `OpenClawRadius.xs`.
 
 ### Segmented picker (wide)
 
@@ -635,8 +672,10 @@ Visible kanban statuses: if `selectedStatus == "active"` → all statuses except
 
 - `Button(action: inspect)` (`.plain`) → `VStack(alignment: .leading, spacing: 7)`:
   - `HStack(alignment: .top, spacing: 10)`: `ProIconBadge` + `VStack` (title `subheadSemiBold` `lineLimit: 2`, detail `caption` `.secondary` `lineLimit: 3`).
-  - Labels (first 3): `OpenClawType.caption2Medium`, `.secondary`, `lineLimit: 1`.
+  - Labels row (shown only when `card.labels` is non-empty): `Text(card.labels.prefix(3).joined(separator: ", "))` in `OpenClawType.caption2Medium`, `.secondary`, `lineLimit: 1` (`Sources/Design/IPadWorkboardScreen.swift:1027-1031`).
 - Action `HStack(spacing: 8)`: session open button (if `sessionKey` non-empty), actions `Menu` (ellipsis icon, `.bordered`, `.mini`), `Spacer`, `ProValuePill`.
+
+**Detail text fallback chain (shared by `IPadWorkboardKanbanCard` and `IPadWorkboardQueueRow`):** both components compute their `detail` identically (`Sources/Design/IPadWorkboardScreen.swift:1098-1108` and `1247-1256`): trimmed `card.notes` if non-empty, else trimmed `card.sessionKey` if non-empty, else trimmed `card.agentId` if non-empty, else the literal `"Default agent"`.
 
 **Card icon/color mapping:**
 
@@ -734,11 +773,13 @@ recentSessions.padding(.horizontal, 16)
 
 ### `gatewayCard`
 
-`CommandPanel(isProminent: true, padding: 12)` → `VStack(alignment: .leading, spacing: 10)`. Card header: `Text("Gateway")` `OpenClawType.subheadSemiBold`, `.secondary`.
+`CommandPanel(isProminent: true, padding: 12)` → `VStack(alignment: .leading, spacing: 10)`. Card header: `cardHeader(title: "Gateway")`.
 
-Three `gatewayFact` tiles in `HStack(spacing: 0)` with `Divider().frame(height: 38)` between them. Connection / Address / Agents.
+> **Shared `cardHeader(title:)` helper** (`Sources/Design/CommandCenterTab.swift:290-297`): `HStack(spacing: 8)` → `Text(title)` (`OpenClawType.subheadSemiBold`, `.secondary`) + `Spacer(minLength: 8)`. This single helper renders all three Overview panel headers — `"Gateway"` (line 168), `"Agent session"` (line 219), and `"Recent sessions"` (line 234).
 
-`gatewayFact(icon:title:value:color:)`: `VStack(alignment: .leading, spacing: 6)` → icon `Image(systemName:)` (`OpenClawType.caption2Bold`, tinted) + title `Text` (`OpenClawType.caption2Medium`, `.secondary`) in `HStack(spacing: 5)`; value `Text` (`OpenClawType.captionSemiBold`, tinted for Connection else `.primary`, `lineLimit: 1`, `minimumScaleFactor: 0.72`). `.frame(maxWidth: .infinity, alignment: .leading)` `.padding(.horizontal, 10)`.
+Three `gatewayFact` tiles in `HStack(spacing: 0)` with `Divider().frame(height: 38)` between them (`Sources/Design/CommandCenterTab.swift:170-188`): Connection (icon `"network"`, color `gatewayStatusColor`), Address (icon `"server.rack"`, color `OpenClawBrand.accentForeground`), Agents (icon `"person.2.fill"`, color `OpenClawBrand.accentHotForeground`).
+
+`gatewayFact(icon:title:value:color:)` (`Sources/Design/CommandCenterTab.swift:195-214`): `VStack(alignment: .leading, spacing: 6)` → an `HStack(spacing: 5)` of icon `Image(systemName:)` (`OpenClawType.caption2Bold`, `.foregroundStyle(color)` — so the icon takes each tile's passed color above) + title `Text` (`OpenClawType.caption2Medium`, `.secondary`, `lineLimit: 1`); then value `Text` (`OpenClawType.captionSemiBold`, `.foregroundStyle(title == "Connection" ? color : .primary)`, `lineLimit: 1`, `minimumScaleFactor: 0.72`). `.frame(maxWidth: .infinity, alignment: .leading)` `.padding(.horizontal, 10)`.
 
 **Gateway status → color:**
 
@@ -789,9 +830,15 @@ Empty state: `CommandEmptyStateRow(icon:, title:, detail:)`.
 
 Full sessions browser. Accessible via sidebar `.sessions` destination or the "View more" link from `CommandCenterTab`.
 
-`ZStack` (background) → `ScrollView` → `VStack(alignment: .leading, spacing: 10)` `.padding(.top, 16)` `.padding(.bottom, 18)`. `.safeAreaPadding(.bottom, 96)`.
+`ZStack` (background) → `ScrollView` → `VStack(alignment: .leading, spacing: 10)` `.padding(.top, 16)` `.padding(.bottom, 18)`. `.safeAreaPadding(.bottom, 96)`. `.navigationTitle("Sessions")` `.navigationBarTitleDisplayMode(.inline)` (`Sources/Design/CommandCenterTab.swift:725-740`).
 
-Shows archived/active toggle (`.switch`, `.mini`) when `sessionControlsAvailable`. Groups sessions via `CommandSessionGrouping.sections(from:knownGroups:)`. Session rows use `CommandSessionRow` with `.commandSessionActions` modifier. Group section headers have `.contextMenu` for rename/create/delete.
+**Header** (rendered when `!usesNativeNavigationChrome`; NOT an `OpenClawAdaptiveHeaderRow`, `Sources/Design/CommandCenterTab.swift:782-797`): a custom `HStack(alignment: .top, spacing: 12)` with an optional `OpenClawSidebarHeaderLeadingSlot(action:)` (when `headerLeadingAction` is set) + a `VStack(alignment: .leading, spacing: 4)` holding `Text("Sessions")` (`OpenClawType.title2`) and `Text(headerDetail)` (`OpenClawType.captionMedium`, `.secondary`). `.padding(.horizontal, OpenClawProMetric.pagePadding)`.
+
+**`sessionsPanel`** (`Sources/Design/CommandCenterTab.swift:799-806`): `CommandPanel(padding: 0)` → `VStack(spacing: 0)`. Its internal panel header is an `HStack(spacing: 8)` whose label is `Text(showArchived ? "Archived sessions" : "Recent sessions")` in `OpenClawType.subheadBold` (note: `subheadBold`, not `subheadSemiBold`), followed by a loading `ProgressView` (`.controlSize(.small)`) and the archived toggle.
+
+Shows archived/active toggle (`.switch`, `.mini`) when `sessionControlsAvailable`. Groups sessions via `CommandSessionGrouping.sections(from:knownGroups:)`. Session rows use `CommandSessionRow` with `.commandSessionActions` modifier.
+
+**`sectionHeader(_:)`** (`Sources/Design/CommandCenterTab.swift:907-922`): the title is `Text(section.title)` in `OpenClawType.captionSemiBold`, `.secondary`, `.padding(.horizontal, 4)`. A `.contextMenu` with the group menu (Rename / New Group / Delete) is attached ONLY for custom category sections (`case .category(group)` with `sessionControlsAvailable`); the Pinned/Ungrouped built-in sections get no context menu.
 
 Group mutations update `SessionGroupStore` and patch all members (both active and archived) via `transport.patchSession`. Limit for full-store enumeration: 10,000 rows per list call.
 

@@ -13,7 +13,7 @@ All `Glyph` imagesets are SVG vector art rendered as SwiftUI `Image(name).render
 - `ChatAvatarImage` — PNG photo composite, rendered **Original** (`.renderingMode` not set), clipped to a 34×34 circle.
 - `ConnectionMascotImage`, `openclaw mascot` — PNG illustration, rendered **Original**.
 - `OnboardingDustCloud`, `OnboardingStars` — PNG art layers, rendered **Original**, `.scaledToFill()`.
-- `ChannelWhatsappGlyph`, `FeedbackTailscaleGlyph`, `SettingsChevronsUpDownGlyph` — PNG, rendered **Original** (brand marks / raster-only artwork).
+- `ChannelWhatsappGlyph`, `FeedbackTailscaleGlyph` — PNG, rendered **Original** (brand marks). `SettingsChevronsUpDownGlyph` is also a PNG but every call site overrides to `.renderingMode(.template)`, so it renders as a tintable template, not Original.
 
 ---
 
@@ -247,7 +247,7 @@ The `brandAsset(_:)` switch in `ChannelsScreenHost` maps lowercase channel IDs t
 | 50 | `SettingsBellGlyph` | `li_bell.svg` | Settings | Template SVG |
 | 51 | `SettingsBookGlyph` | `li_book-open.svg` | Settings | Template SVG |
 | 52 | `SettingsChevronRightGlyph` | `li_chevron-left.svg` | Settings | Template SVG; artwork faces right |
-| 53 | `SettingsChevronsUpDownGlyph` | `li_chevrons-up-down.png` | Settings | PNG, Original |
+| 53 | `SettingsChevronsUpDownGlyph` | `li_chevrons-up-down.png` | Settings | PNG; call sites override to `.renderingMode(.template)` |
 | 54 | `SettingsFileWarningGlyph` | `li_file-warning.svg` | Settings | Template SVG |
 | 55 | `SettingsRefreshGlyph` | `li_refresh-cw.svg` | Settings | Template SVG |
 | 56 | `SettingsShieldGlyph` | `shield.svg` | Settings | Bespoke SVG |

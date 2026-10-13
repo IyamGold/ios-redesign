@@ -118,6 +118,8 @@ struct CronJobRow: Identifiable, Equatable {
 **Active** = not-yet-run one-shots + still-enabled recurring jobs.
 **Completed** = one-shot jobs that have fired + recurring jobs the user disabled. (`CronJobsScreen.swift:39–45`)
 
+**Filter menu (right header button):** opens a `Menu` with one `Button` per `CronFilter.allCases` (Active, then Completed). Each button's label is a `Text(option.title)`, and when `self.filter == option` an `Image(systemName: "checkmark")` is appended inside the same label so the currently-selected filter shows a trailing checkmark in the menu. (`CronJobsScreen.swift:93–106`)
+
 ### View Hierarchy
 
 ```
@@ -232,6 +234,7 @@ All badges are 18 × 18 pt. (`CronJobsScreen.swift:189–215`)
 
 - RPC: `cron.list` with params `{"includeDisabled":true,"limit":100,"sortBy":"updatedAtMs","sortDir":"desc"}`, timeout 12 s
 - Sorted by `createdAt` descending after mapping
+- `createdAt` is constructed as `Date(timeIntervalSince1970: Double(job.createdatms) / 1000)` — the gateway's `createdatms` is in milliseconds and must be divided by 1000 before building the `Date`. (`CronJobsScreen.swift:333`)
 - `showsActions` = `appModel.gatewayServerName != nil` (gateway connected)
 - **Run** action: `cron.run` with `{"id":…,"mode":"force"}`, timeout 20 s, then reload
 - **Toggle** action: `cron.update` with `{"id":…,"patch":{"enabled":!current}}`, timeout 20 s, then reload
@@ -244,7 +247,7 @@ All badges are 18 × 18 pt. (`CronJobsScreen.swift:189–215`)
 - `title`: `job.name` trimmed; falls back to schedule label when empty. (`CronJobsScreen.swift:393–396`)
 - `descriptionText`: payload `message` key, then `text` key, then schedule label. (`CronJobsScreen.swift:399–405`, `409–419`)
 - Schedule label priority: `schedule.kind.capitalized` → `"Cron \(expr)"` → `"Every \(durationLabel(everyMs))"` → `"Schedule configured"`. (`CronJobsScreen.swift:371–389`)
-- Duration label: whole days → `"N day(s)"`, whole hours → `"N hour(s)"`, whole minutes → `"N minute(s)"`, else seconds. (`CronJobsScreen.swift:430–445`)
+- Duration label: milliseconds are divided by 1000 to whole seconds, then matched most-significant first — whole days → `"\(days) day\(days == 1 ? "" : "s")"`, whole hours → `"\(hours) hour..."`, whole minutes → `"\(minutes) minute..."`, else the seconds fallback `"\(seconds) second\(seconds == 1 ? "" : "s")"`. Each branch emits full singular/plural English ("1 day" vs "2 days"), not a bare "(s)" label. (`CronJobsScreen.swift:430–445`)
 
 ---
 
@@ -333,7 +336,7 @@ Button { onOpenEntry(entry) }
           │     ├── Spacer(minLength: 8)
           │     ├── Text(entry.dateLabel)        [13pt, primary.opacity(0.6), lineLimit 1] (if !empty)
           │     └── Image("SettingsChevronRightGlyph") [16×16, template, primary.opacity(0.6)]
-          └── Text(entry.snippet)               [13pt, primary.opacity(0.6), lineLimit 2, .leading]
+          └── Text(entry.snippet)               [13pt, primary.opacity(0.6), lineLimit 2, .multilineTextAlignment(.leading)]
 ```
 
 | Element | Detail |
@@ -348,6 +351,7 @@ Button { onOpenEntry(entry) }
 | Chevron asset | `SettingsChevronRightGlyph` |
 | Chevron size | 16 × 16 pt |
 | Snippet line limit | 2 |
+| Snippet alignment | `.multilineTextAlignment(.leading)` (explicit modifier on the snippet `Text`) (`DreamingScreen.swift:143–144`) |
 
 ### Empty State
 
@@ -362,11 +366,11 @@ Tapping an entry sets `selectedEntryID`, which triggers a `.sheet` with `present
 
 The sheet uses the same canvas/tile palette as the list screen. (`DreamingScreen.swift:277–421`)
 
-**Header:**
-- `safeAreaInset(edge: .top, spacing: 0)` containing a `ZStack(alignment: .top)`
-- Close button: `ChatCloseGlyph` (not `ChatBackGlyph`) at 22 × 22 inside 40 × 40 glass chrome circle
-- Close button padding: `.leading(25)`, `.top(22)`
-- Title text: `"Entry"`, 20pt medium, `Color.primary`, `lineLimit(1)`, `frame(maxWidth: 188)`, `.padding(.top, 29)`
+**Header:** (`DreamingScreen.swift:315–347`)
+- `safeAreaInset(edge: .top, spacing: 0)` containing a `ZStack(alignment: .top)`.
+- The close button sits inside an `HStack { Button … ; Spacer() }` — the trailing `Spacer()` pushes the button to the leading edge. The `.padding(.leading, 25).padding(.top, 22)` is applied to **that `HStack`**, not to the `Button` itself. (Applying it directly to the button yields a different layout.)
+- Close button: `ChatCloseGlyph` (not `ChatBackGlyph`) at 22 × 22 inside a 40 × 40 glass chrome circle (same fill/shadow as `glassChrome`).
+- Title text: `"Entry"`, 20pt medium, `Color.primary`, `lineLimit(1)`, `frame(maxWidth: 188)`, `.padding(.top, 29)`. The title is the `ZStack`'s second child, centered horizontally and pinned to the top by the `ZStack(alignment: .top)`.
 
 **Body:**
 ```
@@ -374,7 +378,7 @@ ScrollView
   VStack(alignment: .leading, spacing: 0)
     ├── Text(title)         [24pt medium, Color.primary]
     ├── Text(subheading)    [13pt, primary.opacity(0.6), .top(6)]
-    ├── Text(snippet)       [16pt, Color.primary, textSelection(.enabled), .top(20)]
+    ├── Text(snippet)       [16pt, Color.primary, textSelection(.enabled), .frame(maxWidth: .infinity, alignment: .leading), .top(20)]
     ├── metaCard            [.top(24)]
     └── Spacer(minLength: 40)
   .padding(.horizontal, 25)
@@ -382,7 +386,7 @@ ScrollView
 ```
 
 - `title`: first line of snippet; falls back to path basename
-- `subheading`: `categoryLabel + " · " + when` (when = `promotedAt ?? lastRecalledAt`)
+- `subheading`: built by joining `parts` with `" · "`, where `parts` starts as `[categoryLabel]` and appends `when` (= `promotedAt ?? lastRecalledAt`) only when that value is non-nil. So when both `promotedAt` and `lastRecalledAt` are nil the subheading is `categoryLabel` **alone** (no trailing `" · "`); otherwise it is `categoryLabel + " · " + when`. (`DreamingScreen.swift:357–362`)
 
 **Meta card:**
 ```
@@ -397,6 +401,8 @@ VStack(spacing: 14)
 .frame(maxWidth: .infinity)
 .background(RoundedRectangle(cornerRadius: 12, .continuous).fill(tileFill))
 ```
+
+The meta card's `VStack` uses `spacing: 14` between its rows and hairlines, `.padding(.horizontal, 15)`, `.padding(.vertical, 15)`, and `.frame(maxWidth: .infinity)`. (`DreamingScreen.swift:365–366`)
 
 **Meta row layout:**
 ```
@@ -417,7 +423,7 @@ Location value format: `"filename:startLine-endLine"` when `endLine > startLine`
 **Entry mapping:**
 - Snippet is trimmed; split by newlines
 - `title` = first line; falls back to path basename when snippet is empty
-- `snippet` = lines 2+ joined by space; falls back to full trimmed snippet when only one line
+- `snippet` = lines 2+ joined by a space; falls back to the full `trimmed` snippet when there is only one line. Because `title` is also the first (only) line in that case, a single-line entry ends up with **identical text in both `title` and `snippet`**. (`DreamingScreen.swift:245–246`)
 - `dateLabel` = `entry.promotedAt ?? entry.lastRecalledAt ?? ""`
 
 ---
@@ -534,7 +540,7 @@ HStack
 | Formatter | Logic |
 |---|---|
 | `tokenLabel(_:)` | ≥1 000 000: `"NM"` or `"N.1fM"` / ≥1 000: rounded `"NK"` / else: `"\(n)"` |
-| `costLabel(_:)` | nil or 0 → `"0$"` / else `"%.2f$"` |
+| `costLabel(_:)` | guard is `cost > 0`: any cost ≤ 0 (nil, `0`, **or negative**) → `"0$"`; else `"%.2f$"` (`UsageScreen.swift:199–201`) |
 | `dayLabel(_:)` | `"\(Month name) \(ordinal day)"` e.g. `"September 18th"` using `NumberFormatter(.ordinal)` |
 | `monthLabel(_:)` | Current year: `"\(Month name)"` only; other years: `"\(Month name) \(year)"` |
 | `monthMenuLabel(_:)` | Always `"\(Month name) \(year)"` (for the filter menu) |
@@ -639,9 +645,14 @@ HStack
 
 ### Instance List Card
 
-- Outer `VStack(spacing: 14)` containing rows + `OpenClawRowDivider` separators
-- `.padding(.vertical, 15)` around the VStack
-- Background: `RoundedRectangle(cornerRadius: 12, .continuous)` filled `cardFill` (black/white)
+(`InstancesScreen.swift:69–110`)
+
+- Outer `VStack(spacing: 14)` containing rows + `OpenClawRowDivider` separators (divider rendered only between rows, `index < instances.count - 1`).
+- `.padding(.vertical, 15)` around the VStack.
+- Background: `RoundedRectangle(cornerRadius: 12, .continuous)` filled `cardFill` (black/white).
+- Unlike the Usage `card {}` and `NodeDetailScreen` card, this instance-list `VStack` has **no** `.frame(maxWidth: .infinity, ...)` modifier; it takes its width from the enclosing leading-aligned `VStack` and the 24 pt page inset.
+
+The main scroll `VStack` applies only `.padding(.top, 4)` and `.padding(.horizontal, 24)` — there is **no** `.padding(.bottom, 40)` here, unlike the Cron/Dreaming/Usage screens which explicitly add a 40 pt bottom inset. (`InstancesScreen.swift:112–115`)
 
 ### Instance Row
 
@@ -681,17 +692,17 @@ HStack(spacing: 7)
 
 ### Node Detail Screen (`NodeDetailScreen`)
 
-Tapping a row pushes `NodeDetailScreen` inside the `NavigationStack`. It uses `SettingsDestinationChrome` (the standard Settings-tab destination chrome) for its header. (`InstancesScreen.swift:238–355`)
+Tapping a row pushes `NodeDetailScreen` inside the `NavigationStack`. It uses `SettingsDestinationChrome` (the standard Settings-tab destination chrome) for its header. The chrome `title` is `PresenceFormatting.label(entry)` and falls back to the string literal `"Instance"` when `label` returns nil. (`InstancesScreen.swift:238–355`, fallback at `246`)
 
-**Card layout** (mirrors Usage card structure):
-- `VStack(alignment: .leading, spacing: 14)`, `.padding(.vertical, 15)`
-- Horizontal inset on rows (`rowInset` = `.padding(.horizontal, 15)`) so `OpenClawRowDivider` spans card
+**Card layout** (mirrors Usage card structure, `InstancesScreen.swift:283–294`):
+- `VStack(alignment: .leading, spacing: 14)`, `.padding(.vertical, 15)`, plus `.frame(maxWidth: .infinity, alignment: .leading)` on the `VStack` (paralleling the Usage card).
+- Horizontal inset on rows (`rowInset` = `.padding(.horizontal, 15)`) so `OpenClawRowDivider` spans card.
 
 **Detail card rows:**
 
 | Row | Label | Value |
 |---|---|---|
-| Status | "Status" | `PresenceFormatting.state(entry)` in `OpenClawBrand.accent` (normal) or `OpenClawBrand.warn` (has reason) |
+| Status | "Status" | `PresenceFormatting.state(entry)` colored `PresenceFormatting.color(entry)` — `OpenClawBrand.accent` (no reason) or `OpenClawBrand.warn` (has reason) |
 | Instance | "Instance" | `entry.instanceid ?? "n/a"` |
 | Device | "Device" | `entry.deviceid ?? "n/a"` |
 | Host | "Host" | `entry.host ?? "n/a"` |
@@ -700,19 +711,24 @@ Tapping a row pushes `NodeDetailScreen` inside the `NavigationStack`. It uses `S
 | Version | "Version" | `entry.version ?? "n/a"` |
 | Mode | "Mode" | `entry.mode ?? "n/a"` |
 
-All value text: 16pt, `Color.primary.opacity(0.6)`, `lineLimit(1)`, `truncationMode(.middle)`, `textSelection(.enabled)`.
-Label text: 17pt, `Color.primary`.
-Status value: 16pt, `PresenceFormatting.color(entry)` — `OpenClawBrand.accent` when no reason field, `OpenClawBrand.warn` when reason is non-empty.
+**`detailRow` values** (Instance, Device, Host, IP, Platform, Version, Mode): 16pt, `Color.primary.opacity(0.6)`, `lineLimit(1)`, `truncationMode(.middle)`, `textSelection(.enabled)`. Value = `PresenceFormatting.normalized(value) ?? "n/a"`. (`InstancesScreen.swift:313–326`)
+Label text (all rows): 17pt, `Color.primary`.
+
+**`statusRow` is NOT a `detailRow`** and differs in two ways (`InstancesScreen.swift:301–311`):
+- Its value foreground is `PresenceFormatting.color(entry)` (brand `accent` when no reason, `warn` when reason non-empty) — **not** `Color.primary.opacity(0.6)`.
+- It applies **none** of `lineLimit(1)`, `truncationMode(.middle)`, or `textSelection(.enabled)`. Those modifiers belong only to `detailRow`.
+- Value text is 16pt; value = `PresenceFormatting.state(entry)`.
 
 **`OpenClawBrand` colors used in status:**
 - `accent` light: `rgb(183, 56, 51)` / dark: `rgb(198, 62, 56)`
 - `warn` light: `rgb(154, 87, 0)` / dark: `rgb(255, 214, 10)`
 
-**List sections** (Scopes, Roles, Tags):
-- Section header: 17pt medium, `primary.opacity(0.5)`, `.leading(15)` padding
-- Card with same styling
-- Empty state: `"None reported."` at 16pt, `primary.opacity(0.6)`
-- Values: 16pt, `Color.primary`, `textSelection(.enabled)`, separated by `OpenClawRowDivider`
+**List sections** (Scopes, Roles, Tags): (`InstancesScreen.swift:328–354`)
+- Each section is a `VStack(alignment: .leading, spacing: 6)` — the inner 6 pt spacing sits between the section header and its card (distinct from the outer scroll `VStack(spacing: 34)`).
+- Section header: 17pt medium, `primary.opacity(0.5)`, `.leading(15)` padding.
+- Card with same styling as the detail card above.
+- Empty state: `"None reported."` at 16pt, `primary.opacity(0.6)`, with `.frame(maxWidth: .infinity, alignment: .leading)`, row-inset 15 pt.
+- Values: 16pt, `Color.primary`, each with `.frame(maxWidth: .infinity, alignment: .leading)` and `.textSelection(.enabled)`, row-inset 15 pt, separated by `OpenClawRowDivider` (divider only between values, not after the last).
 
 Outer scroll: `VStack(alignment: .leading, spacing: 34)`, `.padding(.horizontal, 24)`, `.padding(.top, 4)`, `.padding(.bottom, 40)`.
 
@@ -726,7 +742,7 @@ Outer scroll: `VStack(alignment: .leading, spacing: 34)`, `.padding(.horizontal,
 | `detail(_:)` | `[ip, platform, version].compactMap.joined(separator: " • ")` or `text` or `"Presence beacon received."` |
 | `state(_:)` | `reason` if non-empty, else `mode` if non-empty, else `relativeTime(fromMilliseconds: ts)` |
 | `icon(_:)` | SF Symbol: `devicefamily` contains "phone" → `"iphone"`, "tablet"/"pad" → `"ipad"`, "desktop"/"mac" → `"desktopcomputer"`, else `"display"` |
-| `color(_:)` | `reason == nil` → `OpenClawBrand.accent`, else `OpenClawBrand.warn` |
+| `color(_:)` | `normalized(entry.reason) == nil` → `OpenClawBrand.accent`, else `OpenClawBrand.warn`. `normalized` trims whitespace and maps empty to nil, so a blank/whitespace-only `reason` counts as nil → accent (not warn). (`InstancesScreen.swift:210–211`) |
 
 `relativeTime` uses `.formatted(.relative(presentation: .named, unitsStyle: .abbreviated))`.
 
