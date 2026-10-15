@@ -23,8 +23,8 @@ public final class OpenClawChatViewModel {
     public internal(set) var showsThinkingPicker = true
     public private(set) var modelSelectionID: String = "__default__"
     public private(set) var modelChoices: [OpenClawChatModelChoice] = []
-    private var modelPickerFavorites: [String]
-    private var modelPickerRecents: [String]
+    var modelPickerFavorites: [String]
+    var modelPickerRecents: [String]
     public private(set) var slashCommands: [OpenClawChatCommandChoice] = []
     public private(set) var isLoadingSlashCommands = false
     public private(set) var slashCommandsErrorText: String?
@@ -69,6 +69,9 @@ public final class OpenClawChatViewModel {
 
     public private(set) var sessionId: String?
     public private(set) var streamingAssistantText: String?
+    /// Typed, append-only model of the in-flight assistant turn, folded from the gateway's typed events
+    /// by `foldLiveTurn`. Shadow state in Stage B (nothing renders it yet); iOS switches to it in Stage C.
+    public internal(set) var liveTurn: OpenClawChatLiveTurn?
 
     public private(set) var pendingToolCalls: [OpenClawChatPendingToolCall] = []
 
@@ -92,7 +95,7 @@ public final class OpenClawChatViewModel {
     let transcriptCache: (any OpenClawChatTranscriptCache)?
     let outbox: (any OpenClawChatCommandOutbox)?
     @ObservationIgnored
-    private let modelPickerStore: ChatModelPickerStore
+    let modelPickerStore: ChatModelPickerStore
     /// Per-message outbox display state; rows without an entry are normal
     /// transcript rows. Observable so bubbles update when flush progresses.
     public internal(set) var outboxStatesByMessageID: [UUID: OpenClawChatOutboxMessageState] = [:]
@@ -347,24 +350,6 @@ public final class OpenClawChatViewModel {
 
     public func refresh() {
         self.startBootstrap()
-    }
-
-    public var modelPickerSections: ChatModelPickerSections {
-        ChatModelPickerStore.sections(
-            choices: self.modelChoices,
-            favorites: self.modelPickerFavorites,
-            recents: self.modelPickerRecents)
-    }
-
-    public var isSelectedModelPinned: Bool {
-        self.modelSelectionID != Self.defaultModelSelectionID &&
-            self.modelPickerFavorites.contains(self.modelSelectionID)
-    }
-
-    public func toggleSelectedModelPinned() {
-        guard self.modelSelectionID != Self.defaultModelSelectionID else { return }
-        self.modelPickerStore.toggleFavorite(self.modelSelectionID)
-        self.modelPickerFavorites = self.modelPickerStore.favorites
     }
 
     public func resumeFromForeground() {
@@ -2187,6 +2172,9 @@ public final class OpenClawChatViewModel {
     }
 
     private func handleTransportEvent(_ evt: OpenClawChatTransportEvent) {
+        // Shadow-fold the typed events into `liveTurn` (Stage B). Runs after the legacy handlers below so
+        // run ownership (pendingRuns) is already updated; nothing renders liveTurn yet.
+        defer { self.foldLiveTurn(evt) }
         switch evt {
         case let .health(ok):
             applyTransportHealth(ok)
