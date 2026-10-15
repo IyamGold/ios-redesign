@@ -1818,6 +1818,7 @@ public final class OpenClawChatViewModel {
         self.sessionId = nil
         self.pendingToolCallsById = [:]
         self.updateStreamingAssistantText(nil)
+        self.liveTurn = nil
         self.resetSlashCommandCatalog()
         self.clearPendingRuns(reason: nil)
     }

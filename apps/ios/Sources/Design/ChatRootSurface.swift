@@ -45,35 +45,11 @@ struct ChatRootSurface: View {
     @State private var diskCachedChipKeys: Set<String> = []
     /// Armed on send; fires the reply-intro haptic once when the assistant's reply first appears.
     @State private var replyIntroArmed = false
-    /// The active run's tool-use preambles, shown live in the working indicator (not yet an in-transcript
-    /// trail). Flushed into the collapsed "steps" trail by `rebuildRows` once the run completes.
-    @State private var liveActivitySteps: [String] = []
     /// The `[embed]` canvas open in the viewer panel (tapped from an inline card).
     @State private var openEmbed: CanvasEmbed?
     /// Steps shown in the "Worked through N steps" detail sheet (nil = closed). A sheet keeps long runs
     /// from widening the transcript, which inline expansion did past ~3 steps.
     @State private var stepsSheet: ChatStepsPayload?
-    /// Id of the just-finalized assistant reply that should play the top-to-bottom reveal (nil = none).
-    /// Only set for a live answer (see `awaitingReplyReveal`), never on history load / session switch.
-    @State private var revealReplyID: String?
-    /// Armed while a run is in flight so the *next* new assistant row is treated as its live answer and
-    /// revealed. Distinguishes a real reply from a bulk history/session repopulation.
-    @State private var awaitingReplyReveal = false
-    /// The single source of truth for a live turn's UI stage. Forward-only within a turn and LATCHED over
-    /// the view model's `pendingRuns` flicker (which clears/re-adopts mid-turn) so the node/bubble/footprint
-    /// rendering never oscillates. Replaces deriving everything from the raw `isAssistantWorking`.
-    ///   idle      → nothing in flight
-    ///   thinking  → run started, no tool step yet (streamed text shows as the reply bubble — a plain reply,
-    ///               or a first preamble that briefly flashes here before its toolUse lands)
-    ///   tooling   → ≥1 tool preamble surfaced; streamed inter-tool preambles stay in the footprint node
-    ///   answering → the final answer is streaming after the tools (footprints collapse to the "Worked
-    ///               through N steps" row, the answer streams as the bubble)
-    @State private var turnPhase: TurnPhase = .idle
-    /// Set when a turn's answer row lands; blocks a trailing `pendingRuns` re-adopt from restarting a
-    /// phantom `thinking` phase after the reply is already shown. Reset on the next send.
-    @State private var turnJustCompleted = false
-
-    enum TurnPhase: Int { case idle, thinking, tooling, answering }
 
     /// Gates the "Thinking" node's *appearance* until the just-sent user bubble has finished its spring/
     /// layout settle. Without it the node mounts in the same transaction as the bubble and rides its
@@ -122,46 +98,44 @@ struct ChatRootSurface: View {
         self.viewModel.pendingRunCount > 0 || self.viewModel.isSending
     }
 
-    /// The live "footprint" shown while thinking. During the tool/footprint phase we surface the raw
-    /// streamed preamble text as it arrives (so preambles visibly stream as footprints), falling back to
-    /// the most recent finalized step, or "Thinking" before the first one lands. In a tool-free run this
-    /// stream is instead shown as the typewriter reply bubble (see `streamingReplyText`), so it never
-    /// leaks here.
-    private var activityLatestLine: String {
-        if self.turnPhase == .tooling,
-           let live = self.viewModel.streamingAssistantText?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !live.isEmpty
-        {
-            return live
+    /// Does the live turn carry non-answer activity (reasoning / preamble / tool) worth a thinking node?
+    /// A plain reply has none, so it streams as a bare bubble with no node above it.
+    private func liveHasActivity(_ turn: OpenClawChatLiveTurn) -> Bool {
+        turn.segments.contains { segment in
+            switch segment {
+            case .toolCall, .reasoning: true
+            case let .text(_, _, isPreamble): isPreamble
+            }
         }
-        return self.liveActivitySteps.last ?? "Thinking"
     }
 
-    /// The in-flight answer text to stream as a live "typewriter" bubble, or nil to keep the thinking node.
-    /// Gated on the phase, not the raw run state: only `.thinking` (a plain reply / first-preamble flash) or
-    /// `.answering` (the final answer past the last tool) stream here. In `.tooling` the streamed text is an
-    /// inter-tool preamble and stays in the footprint node.
-    private var streamingReplyText: String? {
-        guard self.turnPhase == .thinking || self.turnPhase == .answering,
-              self.viewModel.pendingToolCalls.isEmpty,
-              let text = self.viewModel.streamingAssistantText,
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return nil }
-        return text
+    /// The node's "latest activity" line: the running tool, else the latest reasoning/preamble text, else
+    /// a plain "Thinking". Read directly from typed segments — no phase/length guessing.
+    private func liveActivityLine(_ turn: OpenClawChatLiveTurn) -> String {
+        for segment in turn.segments.reversed() {
+            if case let .toolCall(tool) = segment, tool.state == .running {
+                return tool.name
+            }
+        }
+        for segment in turn.segments.reversed() {
+            switch segment {
+            case let .reasoning(_, text) where !text.isEmpty: return text
+            case let .text(_, text, true) where !text.isEmpty: return text
+            default: continue
+            }
+        }
+        return "Thinking"
     }
 
-    /// Minimum streamed length before an in-tool run promotes `.tooling → .answering`. Larger than a
-    /// typical one-line preamble so short inter-tool preambles don't false-promote before their toolUse
-    /// lands; the real answer crosses it within its first sentence or two.
-    private static let answeringPromoteThreshold = 160
-
-    /// Forward-only phase transition (except an explicit reset to `.idle`), latched over the pendingRuns
-    /// flicker so the UI stage never regresses mid-turn. Logged for the timeline capture.
-    private func setTurnPhase(_ next: TurnPhase) {
-        guard next == .idle || next.rawValue > self.turnPhase.rawValue else { return }
-        guard next != self.turnPhase else { return }
-        ChatTimeline.mark("view.phase \(self.turnPhase)->\(next)")
-        self.turnPhase = next
+    /// Completed "footprints" for the node: preamble lines + each tool's name, in turn order.
+    private func liveStepLines(_ turn: OpenClawChatLiveTurn) -> [String] {
+        turn.segments.compactMap { segment in
+            switch segment {
+            case let .toolCall(tool): tool.name
+            case let .text(_, text, true): text.isEmpty ? nil : text
+            default: nil
+            }
+        }
     }
 
     /// Where a pinned question comes to rest: ~120pt below the top so it clears the top bar / scrim.
@@ -283,8 +257,6 @@ struct ChatRootSurface: View {
             self.pinTurnID = nil
             self.pinScrollPending = false
             self.pinnedQuestionTop = nil
-            self.turnPhase = .idle
-            self.turnJustCompleted = false
             self.viewModel.load()
         }
         // Images: system photo picker (images only). Loaded items feed the shared attachment pipeline.
@@ -343,11 +315,10 @@ struct ChatRootSurface: View {
                                     : .opacity)
                     }
                     self.trailingIndicator
-                        // Fade the footprint/thinking node out as the "Worked through N steps" row + answer
-                        // fade in, and the streaming bubble out as its finalized row lands — no hard swap.
-                            .animation(.easeInOut(duration: 0.25), value: self.turnPhase)
-                            .animation(.easeInOut(duration: 0.25), value: self.streamingReplyText != nil)
-                            // Fade the node in once the user bubble has settled (see `nodeReady`).
+                        // Fade the live indicator in/out as the turn starts and ends (it hands off to the
+                        // finalized rows on completion), and the node in once the user bubble has settled.
+                            .animation(.easeInOut(duration: 0.25), value: self.viewModel.liveTurn == nil)
+                            .animation(.easeInOut(duration: 0.25), value: self.isAssistantWorking)
                             .animation(.easeInOut(duration: 0.25), value: self.nodeReady)
                     // Marks the bottom of the last real row (content coords). Placed before the spacer so
                     // `contentTailBottom - pinnedQuestionTop` is the newest turn's rendered height.
@@ -450,25 +421,11 @@ struct ChatRootSurface: View {
                 ChatTimeline.markThrottled(
                     "view.streamText",
                     "view.streamText len=\(self.viewModel.streamingAssistantText?.count ?? 0) "
-                        + "phase=\(self.turnPhase) replyBubble=\(self.streamingReplyText != nil) "
                         + "pin=\(self.pinTurnID != nil)")
-                // Past the last tool: once the answer is streaming in earnest, promote tooling→answering so
-                // the footprints collapse to the "Worked through N steps" row and the answer takes the bubble.
-                if self.turnPhase == .tooling,
-                   self.viewModel.pendingToolCalls.isEmpty,
-                   (self.viewModel.streamingAssistantText?.count ?? 0) >= Self.answeringPromoteThreshold
-                {
-                    self.setTurnPhase(.answering)
-                    self.rebuildRows() // flush footprints into the in-transcript row now
-                }
+                // The live indicator renders the growing answer in place; when a question is pinned the top
+                // anchor holds it, so only track the bottom for an unpinned reply.
                 if self.pinTurnID == nil {
                     self.scrollToBottom(proxy, animated: false, reason: "streamToken")
-                }
-                // Once shown as a live streaming bubble, the finalized row must NOT also play the wipe — the
-                // text is already fully revealed. Tool replies (footprint-only) keep `awaitingReplyReveal`
-                // armed, so their answer still reveals on completion.
-                if self.streamingReplyText != nil {
-                    self.awaitingReplyReveal = false
                 }
             }
             .onChange(of: self.assistantRowCount) { old, new in
@@ -478,16 +435,9 @@ struct ChatRootSurface: View {
             }
             .onChange(of: self.isAssistantWorking) { old, new in
                 ChatTimeline.mark("view.isAssistantWorking \(old)->\(new)")
-                // Reveal the typing indicator when a run starts (no message/token change fires here yet).
+                // Scroll the live indicator into view when a run starts (no token change fires here yet).
                 if new {
                     self.scrollToBottom(proxy, animated: false, reason: "workStart")
-                    // Arm the reveal: the next new assistant row is this run's answer, not history.
-                    self.awaitingReplyReveal = true
-                    // Enter the phase machine for a run this view didn't send (external/resumed), but never
-                    // restart a phantom `thinking` from a trailing pendingRuns re-adopt after the reply landed.
-                    if self.turnPhase == .idle, !self.turnJustCompleted {
-                        self.setTurnPhase(.thinking)
-                    }
                 }
                 // Run finished (pending cleared): only disarm the intro so a stale one can't fire later.
                 // No closing haptic — a one-word reply lands start+end together and double-buzzed.
@@ -565,32 +515,51 @@ struct ChatRootSurface: View {
             ChatAssistantMessage(
                 row: row,
                 colorScheme: self.colorScheme,
-                reveal: row.id == self.revealReplyID)
+                // The answer already streamed in place in the live indicator, so the finalized row is a
+                // seamless swap, not a reveal-wipe (which would double-animate the same text).
+                reveal: false)
         }
     }
 
     @ViewBuilder private var trailingIndicator: some View {
-        // Tool-free replies stream live as a paced typewriter bubble. Tool runs show the footprint (thinking
-        // node) with the live preamble text (see `activityLatestLine`); on completion the footprints settle
-        // into the in-transcript "Worked through N steps" row and the answer reveals — a plain opacity
-        // crossfade (below) makes that hand-off a fade, not a disappear/appear.
-        if let streamText = self.streamingReplyText {
-            StreamingReplyBubble(
-                fullText: streamText,
-                textColor: self.colorScheme == .dark ? .white : .black)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.bottom, 25)
-                .transition(.opacity)
-        } else if self.turnPhase != .idle, self.nodeReady {
-            ChatThinkingNode(
-                label: self.activityLatestLine,
-                steps: self.liveActivitySteps,
-                shimmer: true,
-                colorScheme: self.colorScheme)
+        // Driven entirely by the typed `liveTurn` — no phase/length guessing. The reasoning/preamble/tool
+        // steps render as a persistent node and the trailing answer streams in place as a bubble below it;
+        // both grow in order and NEVER get yanked. On completion the turn goes non-running and this hands
+        // off to the finalized transcript rows (steps collapse to "Worked through N steps" + answer row).
+        if let turn = self.viewModel.liveTurn, turn.state == .running {
+            self.liveTurnIndicator(turn)
+        } else if self.isAssistantWorking, self.nodeReady {
+            // Run started but no event folded yet — show the plain "Thinking" node so there's no gap.
+            ChatThinkingNode(label: "Thinking", steps: [], shimmer: true, colorScheme: self.colorScheme)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.bottom, 25)
                 .transition(.opacity)
         }
+    }
+
+    @ViewBuilder
+    private func liveTurnIndicator(_ turn: OpenClawChatLiveTurn) -> some View {
+        let answer = turn.trailingAnswerText?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasAnswer = !(answer ?? "").isEmpty
+        VStack(alignment: .leading, spacing: 10) {
+            // Node: shown while there is activity (tools/reasoning/preamble) or before any answer text — a
+            // plain reply with an answer and no activity skips it and streams as a bare bubble.
+            if self.liveHasActivity(turn) || !hasAnswer, self.nodeReady {
+                ChatThinkingNode(
+                    label: self.liveActivityLine(turn),
+                    steps: self.liveStepLines(turn),
+                    shimmer: turn.runningToolCount > 0 || !hasAnswer,
+                    colorScheme: self.colorScheme)
+            }
+            if hasAnswer, let text = turn.trailingAnswerText {
+                StreamingReplyBubble(
+                    fullText: text,
+                    textColor: self.colorScheme == .dark ? .white : .black)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, 25)
+        .transition(.opacity)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true, reason: String = "?") {
@@ -719,46 +688,21 @@ struct ChatRootSurface: View {
             }
             allEmbeds.append(contentsOf: embeds)
         }
-        // First tool preamble this turn moves the phase thinking→tooling (drives node vs bubble).
-        if !pendingProgress.isEmpty, self.turnPhase == .thinking {
-            self.setTurnPhase(.tooling)
-        }
-        // Footprints live in the node during thinking/tooling; they collapse to the in-transcript "Worked
-        // through N steps" row once the answer is streaming (.answering) or the turn is done (.idle). Gating
-        // on the PHASE (not the raw `isAssistantWorking`) is what stops the node↔row oscillation the
-        // pendingRuns flicker used to cause.
-        if self.turnPhase == .thinking || self.turnPhase == .tooling, !pendingProgress.isEmpty {
-            self.liveActivitySteps = pendingProgress
+        // While a live turn is streaming, ITS preamble/tool steps are shown by the live indicator, so keep
+        // the trailing persisted preambles OUT of the transcript rows — otherwise the same steps would show
+        // twice. Once the turn is no longer running, flush them as the collapsed "Worked through N steps"
+        // row (the resting history view). Reads the turn's typed state — no phase guessing.
+        if self.viewModel.liveTurn?.state == .running {
+            pendingProgress.removeAll()
+            pendingProgressTimestamp = nil
         } else {
             flushProgress()
-            self.liveActivitySteps = []
         }
         let nextRows = Self.withDaySeparators(result)
-        // Arm the top-to-bottom reveal for a freshly finalized answer: only when a run was in flight
-        // (`awaitingReplyReveal`) and the newest assistant text row is one we haven't shown before. This
-        // never fires on history load / session switch (nothing armed it).
         // Animate row insertions (spring settle + the per-row `.transition`) only during a live turn, so a
         // bulk history load / session switch repopulates instantly instead of cascading every row in.
-        let liveTurn = self.pinScrollPending || self.pinTurnID != nil || self.awaitingReplyReveal
+        let animateRowInsertion = self.pinScrollPending || self.pinTurnID != nil || self.viewModel.liveTurn != nil
         let oldIDs = Set(self.rows.map(\.id))
-        if let reply = nextRows.last(where: Self.isAnswerRow), !oldIDs.contains(reply.id) {
-            if self.awaitingReplyReveal {
-                self.revealReplyID = reply.id
-                self.awaitingReplyReveal = false
-                ChatTimeline.mark("view.reveal ARMED for new answer row")
-            }
-            // The turn's answer row has landed — end the live turn (hides node/bubble; the row is the reply).
-            // `turnJustCompleted` blocks a trailing pendingRuns re-adopt from restarting a phantom turn.
-            if self.turnPhase != .idle {
-                self.turnJustCompleted = true
-                self.setTurnPhase(.idle)
-                // Do NOT release the pin or scroll at reply end. Tearing down the reserved bottom spacer
-                // (≈a full viewport) and forcing a scroll-to-bottom is what snapped the transcript upward.
-                // Instead the finished turn stays where it landed — question near the top, reply below,
-                // with flexible off-screen space beneath it. Short replies get zero layout shift; a long
-                // reply just scrolls normally. The pin moves to the next question on the next send.
-            }
-        }
         // Fix A: identical projection → skip reassigning `self.rows` entirely. A safety-net history refetch
         // that changed nothing visible (see the pending-run probes) would otherwise reassign the whole
         // array and make LazyVStack re-diff — the idle-time blank-until-touch. Canvas index still updates.
@@ -776,9 +720,10 @@ struct ChatRootSurface: View {
         let removedIDs = oldIDs.subtracting(newIDs).count
         ChatTimeline.mark(
             "view.rebuildRows rows=\(nextRows.count) (prev=\(self.rows.count)) progress=\(progressCount) "
-                + "answers=\(answerCount) liveSteps=\(self.liveActivitySteps.count) idChurn=+\(addedIDs)/-\(removedIDs) "
-                + "working=\(self.isAssistantWorking) animated=\(liveTurn && nextRows.count != self.rows.count)")
-        if liveTurn, nextRows.count != self.rows.count {
+                + "answers=\(answerCount) idChurn=+\(addedIDs)/-\(removedIDs) "
+                +
+                "working=\(self.isAssistantWorking) animated=\(animateRowInsertion && nextRows.count != self.rows.count)")
+        if animateRowInsertion, nextRows.count != self.rows.count {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
                 self.rows = nextRows
             }
@@ -1306,10 +1251,6 @@ struct ChatRootSurface: View {
         self.pinScrollPending = true
         // Drop the retained top so the new question re-measures instead of sizing off the previous turn.
         self.pinnedQuestionTop = nil
-        // Fresh turn: enter the phase machine at `.thinking` and clear the completion guard.
-        self.turnJustCompleted = false
-        self.turnPhase = .thinking
-        ChatTimeline.mark("view.phase ->thinking (send)")
         // Hold the "Thinking" node back until the user bubble's spring settles (matches the row-insert /
         // pin spring duration), so it doesn't ride that spring and pop in early.
         self.nodeReady = false
