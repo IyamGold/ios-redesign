@@ -657,6 +657,17 @@ public final class OpenClawChatViewModel {
         self.markTimelineChanged()
     }
 
+    /// The `chat.delta` and `agent.assistant` streams both carry the FULL cumulative reply text for the
+    /// run, so they are two writers of one string. Apply either monotonically — only when the snapshot
+    /// advances the visible reply — so a slightly-shorter normalization from one source can no longer
+    /// regress a longer snapshot from the other mid-stream (the "streaming jitter"). A genuinely new run
+    /// blanks the text explicitly (adoptRun on run switch / terminal), so the next reply starts empty and
+    /// grows cleanly from there.
+    private func applyStreamingSnapshot(_ text: String) {
+        guard text.count > (self.streamingAssistantText?.count ?? 0) else { return }
+        self.updateStreamingAssistantText(text)
+    }
+
     func logDiagnostic(_ message: String) {
         self.diagnosticsLog?(message)
     }
@@ -875,10 +886,7 @@ public final class OpenClawChatViewModel {
         // A gateway snapshot from a lagging history/foreground refresh can trail the live WS deltas.
         // Streamed replies only grow, so adopt the snapshot only when it advances the visible reply;
         // never let a stale/shorter snapshot regress or blank a reply that is mid-stream.
-        let liveStreamedText = self.streamingAssistantText ?? ""
-        if bufferedText.count > liveStreamedText.count {
-            self.updateStreamingAssistantText(bufferedText)
-        }
+        self.applyStreamingSnapshot(bufferedText)
         self.logDiagnostic(
             "chat.ui adopted in-flight run sessionKey=\(self.sessionKey) "
                 + "runId=\(runId) bufferedTextLen=\(bufferedText.count)")
@@ -2449,7 +2457,8 @@ public final class OpenClawChatViewModel {
         case "assistant":
             if let text = evt.data["text"]?.value as? String {
                 ChatTimeline.markThrottled("agent.assistant", "agent.assistant len=\(text.count)")
-                self.updateStreamingAssistantText(text)
+                // Monotonic apply (same rule as chat.delta) — these two cumulative streams must not fight.
+                self.applyStreamingSnapshot(text)
             }
         case "lifecycle":
             self.handleAgentLifecycleEvent(evt, isPendingRun: isPendingRun)
