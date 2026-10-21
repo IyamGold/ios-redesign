@@ -95,4 +95,58 @@ struct ChatLiveTurnReducerTests {
         let afterRealTerminal = Turn.reduce(turn, .terminal(runId: "r1", state: .final))
         #expect(afterRealTerminal?.state == .final)
     }
+
+    @Test
+    func `position decides answer vs step even when isPreamble is wrong`() {
+        // Simulate the openai-responses late-phase case: the preamble is flagged non-preamble and the
+        // answer is flagged preamble. Position (text after the last tool) must still pick the answer.
+        let turn = self.reduce([
+            .assistantText(runId: "r1", itemId: "p1", isPreamble: false, text: "Let me check the fixtures."),
+            .toolStart(runId: "r1", toolCallId: "t1", name: "search_web", argsPreview: nil),
+            .toolResult(runId: "r1", toolCallId: "t1", isError: false),
+            .assistantText(runId: "r1", itemId: "a1", isPreamble: true, text: "Here is the answer."),
+        ])
+        #expect(turn?.answerSegmentID == "a1")
+        #expect(turn?.trailingAnswerText == "Here is the answer.")
+        #expect(turn?.stepTextIDs.contains("p1") == true)
+        #expect(turn?.stepTextIDs.contains("a1") == false)
+    }
+
+    @Test
+    func `text before a tool is never the answer`() {
+        // While a tool is still the last segment, the trailing preamble must NOT be treated as the answer.
+        let turn = self.reduce([
+            .assistantText(runId: "r1", itemId: "p1", isPreamble: true, text: "Looking it up."),
+            .toolStart(runId: "r1", toolCallId: "t1", name: "search_web", argsPreview: nil),
+        ])
+        #expect(turn?.answerSegmentID == nil)
+        #expect(turn?.trailingAnswerText == nil)
+        #expect(turn?.runningToolCount == 1)
+    }
+
+    @Test
+    func `reasoning-only turn has no answer and stays open`() {
+        let turn = self.reduce([
+            .reasoning(runId: "r1", text: "Thinking about it", at: 1000),
+        ])
+        #expect(turn?.answerSegmentID == nil)
+        #expect(turn?.trailingAnswerText == nil)
+        #expect(turn?.reasoning?.text == "Thinking about it")
+        #expect(turn?.reasoning?.isOpen == true)
+        guard case .reasoning? = turn?.segments.first else { Issue.record("reasoning should lead the turn"); return }
+    }
+
+    @Test
+    func `reasoning records start and closes on terminal`() {
+        var turn = Turn.reduce(nil, .reasoning(runId: "r1", text: "Hmm", at: 1000))
+        turn = Turn.reduce(turn, .reasoning(runId: "r1", text: "Hmm, let me check", at: 1500))
+        #expect(turn?.reasoning?.startedAt == 1000)
+        #expect(turn?.reasoning?.isOpen == true)
+        turn = Turn.reduce(turn, .terminal(runId: "r1", state: .final))
+        #expect(turn?.reasoning?.isOpen == false)
+        #expect(turn?.reasoning?.endedAt != nil)
+        // A short replay can't regress reasoning text.
+        let regressed = Turn.reduce(turn, .reasoning(runId: "r1", text: "Hmm", at: 1600))
+        #expect(regressed?.reasoning?.text == "Hmm, let me check")
+    }
 }

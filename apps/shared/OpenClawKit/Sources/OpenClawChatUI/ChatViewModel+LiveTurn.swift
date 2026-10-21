@@ -35,9 +35,9 @@ extension OpenClawChatViewModel {
                 .assistantText(runId: runId, itemId: itemId, isPreamble: isPreamble, text: text))
         case "thinking":
             guard let text = evt.data["text"]?.value as? String else { return }
-            let itemId = evt.data["itemId"]?.value as? String
+            // Single accumulating reasoning block per turn; carry the event timestamp for "Thought for Ns".
             self.liveTurn = OpenClawChatLiveTurn.reduce(
-                self.liveTurn, .reasoning(runId: runId, itemId: itemId, text: text))
+                self.liveTurn, .reasoning(runId: runId, text: text, at: evt.ts.map(Double.init)))
         case "tool":
             guard let phase = evt.data["phase"]?.value as? String,
                   let toolCallId = evt.data["toolCallId"]?.value as? String

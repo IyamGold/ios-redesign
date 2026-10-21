@@ -119,7 +119,7 @@ struct ChatRootSurface: View {
         }
         for segment in turn.segments.reversed() {
             switch segment {
-            case let .reasoning(_, text) where !text.isEmpty: return text
+            case let .reasoning(block) where !block.text.isEmpty: return block.text
             case let .text(_, text, true) where !text.isEmpty: return text
             default: continue
             }
