@@ -98,46 +98,6 @@ struct ChatRootSurface: View {
         self.viewModel.pendingRunCount > 0 || self.viewModel.isSending
     }
 
-    /// Does the live turn carry non-answer activity (reasoning / preamble / tool) worth a thinking node?
-    /// A plain reply has none, so it streams as a bare bubble with no node above it.
-    private func liveHasActivity(_ turn: OpenClawChatLiveTurn) -> Bool {
-        turn.segments.contains { segment in
-            switch segment {
-            case .toolCall, .reasoning: true
-            case let .text(_, _, isPreamble): isPreamble
-            }
-        }
-    }
-
-    /// The node's "latest activity" line: the running tool, else the latest reasoning/preamble text, else
-    /// a plain "Thinking". Read directly from typed segments — no phase/length guessing.
-    private func liveActivityLine(_ turn: OpenClawChatLiveTurn) -> String {
-        for segment in turn.segments.reversed() {
-            if case let .toolCall(tool) = segment, tool.state == .running {
-                return tool.name
-            }
-        }
-        for segment in turn.segments.reversed() {
-            switch segment {
-            case let .reasoning(block) where !block.text.isEmpty: return block.text
-            case let .text(_, text, true) where !text.isEmpty: return text
-            default: continue
-            }
-        }
-        return "Thinking"
-    }
-
-    /// Completed "footprints" for the node: preamble lines + each tool's name, in turn order.
-    private func liveStepLines(_ turn: OpenClawChatLiveTurn) -> [String] {
-        turn.segments.compactMap { segment in
-            switch segment {
-            case let .toolCall(tool): tool.name
-            case let .text(_, text, true): text.isEmpty ? nil : text
-            default: nil
-            }
-        }
-    }
-
     /// Where a pinned question comes to rest: ~120pt below the top so it clears the top bar / scrim.
     private var pinAnchor: UnitPoint {
         guard self.viewportHeight > 200 else { return .top }
@@ -522,44 +482,24 @@ struct ChatRootSurface: View {
     }
 
     @ViewBuilder private var trailingIndicator: some View {
-        // Driven entirely by the typed `liveTurn` — no phase/length guessing. The reasoning/preamble/tool
-        // steps render as a persistent node and the trailing answer streams in place as a bubble below it;
-        // both grow in order and NEVER get yanked. On completion the turn goes non-running and this hands
-        // off to the finalized transcript rows (steps collapse to "Worked through N steps" + answer row).
+        // The in-flight turn renders as ONE continuous collapsible stack (reasoning fold → step group →
+        // streaming answer) via `ChatTurnTimeline` — no node↔bubble split, no guessing. The only remaining
+        // discontinuity (the live→resting handoff) is removed in T4.
         if let turn = self.viewModel.liveTurn, turn.state == .running {
-            self.liveTurnIndicator(turn)
+            ChatTurnTimeline(
+                turn: turn,
+                nodeReady: self.nodeReady,
+                colorScheme: self.colorScheme,
+                textColor: self.colorScheme == .dark ? .white : .black)
+                .padding(.bottom, 25)
+                .transition(.opacity)
         } else if self.isAssistantWorking, self.nodeReady {
-            // Run started but no event folded yet — show the plain "Thinking" node so there's no gap.
+            // Run started but no event folded yet — show the plain "Thinking" shimmer so there's no gap.
             ChatThinkingNode(label: "Thinking", steps: [], shimmer: true, colorScheme: self.colorScheme)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.bottom, 25)
                 .transition(.opacity)
         }
-    }
-
-    @ViewBuilder
-    private func liveTurnIndicator(_ turn: OpenClawChatLiveTurn) -> some View {
-        let answer = turn.trailingAnswerText?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hasAnswer = !(answer ?? "").isEmpty
-        VStack(alignment: .leading, spacing: 10) {
-            // Node: shown while there is activity (tools/reasoning/preamble) or before any answer text — a
-            // plain reply with an answer and no activity skips it and streams as a bare bubble.
-            if self.liveHasActivity(turn) || !hasAnswer, self.nodeReady {
-                ChatThinkingNode(
-                    label: self.liveActivityLine(turn),
-                    steps: self.liveStepLines(turn),
-                    shimmer: turn.runningToolCount > 0 || !hasAnswer,
-                    colorScheme: self.colorScheme)
-            }
-            if hasAnswer, let text = turn.trailingAnswerText {
-                StreamingReplyBubble(
-                    fullText: text,
-                    textColor: self.colorScheme == .dark ? .white : .black)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.bottom, 25)
-        .transition(.opacity)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true, reason: String = "?") {
@@ -2040,7 +1980,7 @@ private struct AudioBubbleContent: View {
 /// then the live tool/preamble line (shimmering), and finally settling (static) into the in-transcript
 /// "Worked through N steps" trail. Same footprint throughout, so the states crossfade in place instead
 /// of rows popping in and out. `shimmer` marks the active phase; `steps.count > 1` makes it expandable.
-private struct ChatThinkingNode: View {
+struct ChatThinkingNode: View {
     let label: String
     let steps: [String]
     let shimmer: Bool
@@ -2610,7 +2550,7 @@ private struct ChatTextBlock {
 /// can't interrupt it and freeze the shimmer mid-cycle.
 /// A shimmering italic label — the "…in progress" affordance. Shared by the typing indicator and the
 /// agent-working activity element so their collapsed footprint is byte-identical.
-private struct ChatShimmerLabel: View {
+struct ChatShimmerLabel: View {
     let text: String
     private static let font = Font.system(size: 16).italic()
     /// Seconds for one left-to-right sweep.
