@@ -51,6 +51,13 @@ struct ChatRootSurface: View {
     /// from widening the transcript, which inline expansion did past ~3 steps.
     @State private var stepsSheet: ChatStepsPayload?
 
+    /// Answer rows already present, so a freshly-finalized reply can be told apart from history on load.
+    @State private var knownAnswerIDs: Set<String> = []
+    /// The one answer row that should play the top-to-bottom reveal once. Under pessimistic classification
+    /// the live indicator no longer streams untagged replies in place, so the reply "streams" here as it
+    /// settles from the shimmer at finality (empty id = nothing to reveal).
+    @State private var revealAnswerID: String = ""
+
     /// Gates the "Thinking" node's *appearance* until the just-sent user bubble has finished its spring/
     /// layout settle. Without it the node mounts in the same transaction as the bubble and rides its
     /// spring, popping in before the bubble sits in place. Default true so external/resumed runs (no local
@@ -429,9 +436,9 @@ struct ChatRootSurface: View {
     /// Open/close the custom steps overlay. Driving the state inside `withAnimation` is what actually
     /// animates the overlay's move/opacity transitions (an `.animation(value:)` on the chain does not
     /// reliably drive a conditionally-inserted overlay).
-    private func openStepsSheet(_ steps: [String]) {
+    private func openStepsSheet(_ steps: [String], reasoning: ChatStepsReasoning? = nil) {
         withAnimation(Self.stepsSheetSlide) {
-            self.stepsSheet = ChatStepsPayload(steps: steps)
+            self.stepsSheet = ChatStepsPayload(steps: steps, reasoning: reasoning)
         }
     }
 
@@ -466,7 +473,11 @@ struct ChatRootSurface: View {
                 steps: row.progressLines,
                 shimmer: false,
                 colorScheme: self.colorScheme,
-                onOpenSteps: { self.openStepsSheet(row.progressLines) })
+                onOpenSteps: {
+                    // Persisted thinking has no timing, so the resting receipt is a plain "Thought".
+                    let reasoning = row.reasoningText.map { ChatStepsReasoning(receipt: "Thought", text: $0) }
+                    self.openStepsSheet(row.progressLines, reasoning: reasoning)
+                })
         } else if let embed = row.canvasEmbed {
             CanvasEmbedCard(embed: embed, onOpen: { self.openEmbed = embed })
         } else if row.isUser {
@@ -475,9 +486,9 @@ struct ChatRootSurface: View {
             ChatAssistantMessage(
                 row: row,
                 colorScheme: self.colorScheme,
-                // The answer already streamed in place in the live indicator, so the finalized row is a
-                // seamless swap, not a reveal-wipe (which would double-animate the same text).
-                reveal: false)
+                // A freshly-finalized reply reveals once so it "streams" in as it settles from the shimmer at
+                // finality (untagged providers don't stream it in the live indicator). History rows don't.
+                reveal: row.id == self.revealAnswerID)
         }
     }
 
@@ -490,7 +501,8 @@ struct ChatRootSurface: View {
                 turn: turn,
                 nodeReady: self.nodeReady,
                 colorScheme: self.colorScheme,
-                textColor: self.colorScheme == .dark ? .white : .black)
+                textColor: self.colorScheme == .dark ? .white : .black,
+                onOpenSteps: { steps, reasoning in self.openStepsSheet(steps, reasoning: reasoning) })
                 .padding(.bottom, 25)
                 .transition(.opacity)
         } else if self.isAssistantWorking, self.nodeReady {
@@ -523,12 +535,17 @@ struct ChatRootSurface: View {
         // single collapsible "steps" row just above the answer, instead of N standalone replies.
         var pendingProgress: [String] = []
         var pendingProgressTimestamp: Double?
+        // The turn's persisted reasoning, concatenated across its tool-use messages, for the sheet's nested
+        // "Thought" group. Flushed with the steps trail it belongs to.
+        var pendingReasoning: [String] = []
         func flushProgress() {
             guard !pendingProgress.isEmpty else { return }
             result.append(ChatDisplayRow(
                 progressLines: pendingProgress,
+                reasoning: pendingReasoning.isEmpty ? nil : pendingReasoning.joined(separator: "\n\n"),
                 timestamp: pendingProgressTimestamp))
             pendingProgress.removeAll()
+            pendingReasoning.removeAll()
             pendingProgressTimestamp = nil
         }
         for message in self.viewModel.messages {
@@ -606,6 +623,9 @@ struct ChatRootSurface: View {
                Self.isToolUseTurn(message)
             {
                 pendingProgress.append(text)
+                if let reasoning = ChatMessageVisibleText.reasoningText(in: message) {
+                    pendingReasoning.append(reasoning)
+                }
                 pendingProgressTimestamp = message.timestamp
                 continue
             }
@@ -663,6 +683,15 @@ struct ChatRootSurface: View {
                 + "answers=\(answerCount) idChurn=+\(addedIDs)/-\(removedIDs) "
                 +
                 "working=\(self.isAssistantWorking) animated=\(animateRowInsertion && nextRows.count != self.rows.count)")
+        // A reply that just finalized — a new answer row appearing while a live turn is present — reveals
+        // once so it streams in as it settles from the shimmer. A cold history load has no live turn, so
+        // existing answers are recorded without revealing.
+        if self.viewModel.liveTurn != nil,
+           let fresh = nextRows.last(where: { Self.isAnswerRow($0) && !self.knownAnswerIDs.contains($0.id) })
+        {
+            self.revealAnswerID = fresh.id
+        }
+        self.knownAnswerIDs = Set(nextRows.filter(Self.isAnswerRow).map(\.id))
         if animateRowInsertion, nextRows.count != self.rows.count {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
                 self.rows = nextRows
@@ -1604,6 +1633,9 @@ private struct ChatDisplayRow: Identifiable, Equatable {
     let canvasEmbed: CanvasEmbed?
     /// Non-empty for a collapsed tool-use "steps" trail; each entry is one turn's preamble line.
     let progressLines: [String]
+    /// The turn's persisted reasoning, shown as the nested "Thought" group in the steps sheet; nil when the
+    /// provider saved no thinking. Only ever set on a `progressLines` row.
+    let reasoningText: String?
     /// Set for a centered day-divider row (e.g. "Today", "Monday", "Sep 3"); nil for message rows.
     let daySeparator: String?
 
@@ -1626,6 +1658,7 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.chips = chips
         self.canvasEmbed = nil
         self.progressLines = []
+        self.reasoningText = nil
         self.daySeparator = nil
     }
 
@@ -1640,6 +1673,7 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.chips = []
         self.canvasEmbed = nil
         self.progressLines = []
+        self.reasoningText = nil
         self.daySeparator = nil
     }
 
@@ -1654,10 +1688,11 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.chips = []
         self.canvasEmbed = canvasEmbed
         self.progressLines = []
+        self.reasoningText = nil
         self.daySeparator = nil
     }
 
-    init(progressLines: [String], timestamp: Double?) {
+    init(progressLines: [String], reasoning: String?, timestamp: Double?) {
         // Deterministic id from content so identical trails diff stably across rebuilds.
         self.id = "progress-\(progressLines.joined(separator: "|").hashValue)"
         self.isUser = false
@@ -1669,6 +1704,7 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.chips = []
         self.canvasEmbed = nil
         self.progressLines = progressLines
+        self.reasoningText = reasoning
         self.daySeparator = nil
     }
 
@@ -1683,6 +1719,7 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.chips = []
         self.canvasEmbed = nil
         self.progressLines = []
+        self.reasoningText = nil
         self.daySeparator = label
     }
 
@@ -1695,6 +1732,7 @@ private struct ChatDisplayRow: Identifiable, Equatable {
             && lhs.chips.count == rhs.chips.count
             && lhs.canvasEmbed?.id == rhs.canvasEmbed?.id
             && lhs.progressLines == rhs.progressLines
+            && lhs.reasoningText == rhs.reasoningText
             && lhs.daySeparator == rhs.daySeparator
     }
 }
@@ -2035,11 +2073,19 @@ struct ChatThinkingNode: View {
     }
 }
 
+/// The reasoning group shown at the top of the steps sheet: the "Thought for Ns" receipt + the full
+/// thought body (expandable). Nil when the turn had no reasoning (or none was persisted at rest).
+struct ChatStepsReasoning: Equatable {
+    let receipt: String
+    let text: String
+}
+
 /// Identifies the steps payload driving the "Worked through N steps" detail sheet. A fresh id per open
 /// keeps `.sheet(item:)` presenting even when the same run's steps are reopened.
 private struct ChatStepsPayload: Identifiable {
     let id = UUID()
     let steps: [String]
+    let reasoning: ChatStepsReasoning?
 }
 
 /// The "Worked through N steps" detail as a self-owned bottom-sheet overlay (system sheets can't go
@@ -2053,6 +2099,8 @@ private struct ChatStepsOverlay: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var dragOffset: CGFloat = 0
+    /// The nested "Thought for Ns" group is collapsed by default; tap to read the full reasoning.
+    @State private var reasoningExpanded = false
 
     /// Card fill is the app canvas (#F5F4FA light / #171717 dark), matching every other surface.
     private var canvas: Color {
@@ -2065,8 +2113,18 @@ private struct ChatStepsOverlay: View {
         (self.colorScheme == .dark ? Color.white : .black).opacity(0.5)
     }
 
-    private func title(_ steps: [String]) -> String {
-        "Worked through \(steps.count) step\(steps.count == 1 ? "" : "s")"
+    private var tint: Color {
+        (self.colorScheme == .dark ? Color.white : .black).opacity(0.55)
+    }
+
+    /// A reasoning-only turn has no work steps, so the sheet reads "Thought Process"; otherwise it counts
+    /// the tool/preamble steps.
+    private func title(_ payload: ChatStepsPayload) -> String {
+        if payload.steps.isEmpty, payload.reasoning != nil {
+            return "Thought Process"
+        }
+        let count = payload.steps.count
+        return "Worked through \(count) step\(count == 1 ? "" : "s")"
     }
 
     var body: some View {
@@ -2083,7 +2141,7 @@ private struct ChatStepsOverlay: View {
                         .transition(.opacity)
 
                     self.card(
-                        steps: payload.steps,
+                        payload: payload,
                         maxHeight: geo.size.height * 0.62,
                         bottomInset: geo.safeAreaInsets.bottom)
                         .offset(y: max(0, self.dragOffset))
@@ -2098,24 +2156,29 @@ private struct ChatStepsOverlay: View {
         .allowsHitTesting(self.payload != nil)
     }
 
-    private func card(steps: [String], maxHeight: CGFloat, bottomInset: CGFloat) -> some View {
+    private func card(payload: ChatStepsPayload, maxHeight: CGFloat, bottomInset: CGFloat) -> some View {
         VStack(spacing: 0) {
             Capsule()
                 .fill(Color.primary.opacity(0.25))
                 .frame(width: 40, height: 5)
                 .padding(.top, 8)
 
-            self.header(steps)
+            self.header(payload)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
-                    ForEach(steps.indices, id: \.self) { index in
+                    // Reasoning leads the sheet as a nested, expandable "Thought for Ns" group — the whole
+                    // process in one place, with the thought first and the work steps following.
+                    if let reasoning = payload.reasoning {
+                        self.reasoningGroup(reasoning)
+                    }
+                    ForEach(payload.steps.indices, id: \.self) { index in
                         HStack(alignment: .top, spacing: 12) {
                             Circle()
                                 .fill(self.bullet)
                                 .frame(width: 5, height: 5)
                                 .padding(.top, 8)
-                            Text(steps[index])
+                            Text(payload.steps[index])
                                 .font(.system(size: 16))
                                 .foregroundStyle(Color.primary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -2137,10 +2200,42 @@ private struct ChatStepsOverlay: View {
         .clipShape(.rect(topLeadingRadius: 47, topTrailingRadius: 47))
     }
 
-    private func header(_ steps: [String]) -> some View {
+    /// The nested "Thought for Ns" group: a tappable receipt row that expands to the full reasoning body.
+    /// Sits at the bullets' 40pt margin so it aligns with the work steps beneath it.
+    private func reasoningGroup(_ reasoning: ChatStepsReasoning) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { self.reasoningExpanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(reasoning.receipt)
+                        .font(.system(size: 16).italic())
+                        .foregroundStyle(self.tint)
+                    Image(systemName: self.reasoningExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(self.tint)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if self.reasoningExpanded {
+                Text(reasoning.text)
+                    .font(.system(size: 14))
+                    .foregroundStyle(self.tint)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func header(_ payload: ChatStepsPayload) -> some View {
         // Centered 19pt title over the leading glass X — the app's unified nav treatment.
         ZStack {
-            Text(self.title(steps))
+            Text(self.title(payload))
                 .font(.system(size: 19, weight: .medium))
                 .foregroundStyle(Color.primary)
             HStack {

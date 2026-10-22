@@ -3,8 +3,9 @@ import Foundation
 /// A single in-flight assistant turn modeled as an ordered, append-only list of typed segments —
 /// the structure the gateway already carries (typed `agent.*` events) but that the legacy client
 /// flattened into one mutable string + a guessing machine. Rendering reads this directly as one
-/// continuous collapsible timeline: a reasoning fold, preamble/tool steps, and the final answer that
-/// streams in place below them. Nothing is shown-then-yanked and nothing is re-classified by heuristic.
+/// continuous collapsible timeline: a single steps group (reasoning + preamble/tool footprints) that
+/// shimmers through the process, then the final answer streaming in place below it. Nothing is
+/// shown-then-yanked and nothing is re-classified by heuristic.
 ///
 /// Built only by `reduce(_:_:)` — one writer — so the two cumulative text sources can't fight.
 public struct OpenClawChatLiveTurn: Equatable, Sendable, Identifiable {
@@ -24,10 +25,16 @@ public struct OpenClawChatLiveTurn: Equatable, Sendable, Identifiable {
         self.state = state
     }
 
-    /// Position-based final-answer identity: the last `.text` that comes AFTER the last tool call (or the
-    /// last text overall when there are no tools). Everything else is a preamble/step. This is immune to
-    /// the gateway's late-bound `phase` — a preamble can never masquerade as the answer just because its
-    /// `phase: "commentary"` hadn't arrived yet.
+    /// The final answer's segment id, or nil while none is confirmed.
+    ///
+    /// Live: only text the gateway EXPLICITLY tagged `.answer` (`phase == "final_answer"`) is promoted.
+    /// Untagged trailing text — the norm on openai-completions/xai, which never tag phase while streaming —
+    /// is NOT the answer; it stays a shimmering step. A preamble is indistinguishable from the answer until
+    /// the turn ends (both are untagged trailing text), so promoting on faith is exactly what made a
+    /// preamble flash as a reply. Nothing is promoted mid-run unless the provider vouches for it.
+    ///
+    /// Terminal: the model is done, so the trailing text after the last tool IS the answer regardless of how
+    /// (or whether) it was tagged — it's revealed as the final reply.
     public var answerSegmentID: String? {
         let lastTool = self.segments.lastIndex {
             if case .toolCall = $0 {
@@ -39,8 +46,15 @@ public struct OpenClawChatLiveTurn: Equatable, Sendable, Identifiable {
         let start = lastTool.map { $0 + 1 } ?? 0
         guard start < self.segments.count else { return nil }
         for index in stride(from: self.segments.count - 1, through: start, by: -1) {
-            if case let .text(id, _, _) = self.segments[index] {
+            if case let .text(id, _, role) = self.segments[index], role == .answer {
                 return id
+            }
+        }
+        if self.state != .running {
+            for index in stride(from: self.segments.count - 1, through: start, by: -1) {
+                if case let .text(id, _, _) = self.segments[index] {
+                    return id
+                }
             }
         }
         return nil
@@ -88,12 +102,23 @@ public struct OpenClawChatLiveTurn: Equatable, Sendable, Identifiable {
     }
 }
 
+/// How the gateway classified a `.text` block, derived from the delivery `phase`. Only `.answer`
+/// (`phase == "final_answer"`) is promoted to the live reply. `.preamble` (`phase == "commentary"`) and
+/// `.unknown` (providers like openai-completions/xai that never tag phase while streaming) render as
+/// shimmering steps until the turn ends — a preamble is indistinguishable from the answer mid-run on
+/// untagged providers, so nothing is promoted on faith. See `answerSegmentID`.
+public enum OpenClawChatTextRole: String, Sendable, Equatable {
+    case preamble
+    case answer
+    case unknown
+}
+
 /// One typed part of a turn. `id` is stable across updates so SwiftUI keeps identity (no row churn).
 public enum OpenClawChatTurnSegment: Equatable, Sendable, Identifiable {
     case reasoning(OpenClawChatReasoningSegment)
-    /// Assistant prose. `isPreamble` is the server's `phase == "commentary"` hint; the authoritative
-    /// preamble-vs-answer split is positional (see `answerSegmentID`), so the view keys off that.
-    case text(id: String, text: String, isPreamble: Bool)
+    /// Assistant prose tagged with the gateway's delivery `role`, which decides preamble-vs-answer (see
+    /// `answerSegmentID`).
+    case text(id: String, text: String, role: OpenClawChatTextRole)
     case toolCall(OpenClawChatToolCallSegment)
 
     public var id: String {
@@ -149,8 +174,10 @@ public struct OpenClawChatToolCallSegment: Equatable, Sendable, Identifiable {
 /// The typed inputs the reducer folds. The view model maps raw transport events into these at the one
 /// fold site, keeping the reducer pure and unit-testable.
 public enum OpenClawChatLiveTurnEvent: Sendable, Equatable {
-    /// Cumulative text for one assistant message (`itemId`); resets per message server-side.
-    case assistantText(runId: String, itemId: String?, isPreamble: Bool, text: String)
+    /// Cumulative text for one assistant message (`itemId`); resets per message server-side. `role` is the
+    /// gateway's delivery phase mapped to a role (final_answer → .answer, commentary → .preamble, absent →
+    /// .unknown).
+    case assistantText(runId: String, itemId: String?, role: OpenClawChatTextRole, text: String)
     /// Cumulative reasoning text for the turn, with the event timestamp (epoch ms) for the receipt.
     case reasoning(runId: String, text: String, at: Double?)
     case toolStart(runId: String, toolCallId: String, name: String, argsPreview: String?)
@@ -189,9 +216,11 @@ extension OpenClawChatLiveTurn {
         }
 
         switch event {
-        case let .assistantText(_, itemId, isPreamble, text):
-            let key = itemId ?? "\(runId):answer:\(isPreamble ? "pre" : "final")"
-            Self.applyText(&turn.segments, id: key, text: text, isPreamble: isPreamble)
+        case let .assistantText(_, itemId, role, text):
+            // Fallback key omits the role so a phase that resolves mid-stream (unknown → answer) updates the
+            // same segment instead of forking a duplicate.
+            let key = itemId ?? "\(runId):text"
+            Self.applyText(&turn.segments, id: key, text: text, role: role)
         case let .reasoning(_, text, at):
             Self.applyReasoning(&turn.segments, runId: runId, text: text, at: at)
         case let .toolStart(_, toolCallId, name, argsPreview):
@@ -219,13 +248,14 @@ extension OpenClawChatLiveTurn {
         _ segments: inout [OpenClawChatTurnSegment],
         id: String,
         text: String,
-        isPreamble: Bool)
+        role: OpenClawChatTextRole)
     {
         if let index = textIndex(segments, id: id) {
             guard case let .text(_, existing, _) = segments[index], text.count >= existing.count else { return }
-            segments[index] = .text(id: id, text: text, isPreamble: isPreamble)
+            // Latest role wins so a phase resolving mid-stream (unknown → answer) can promote the segment.
+            segments[index] = .text(id: id, text: text, role: role)
         } else if !text.isEmpty {
-            segments.append(.text(id: id, text: text, isPreamble: isPreamble))
+            segments.append(.text(id: id, text: text, role: role))
         }
     }
 

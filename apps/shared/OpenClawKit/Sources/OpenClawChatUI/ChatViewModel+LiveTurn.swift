@@ -29,10 +29,16 @@ extension OpenClawChatViewModel {
         case "assistant":
             guard let text = evt.data["text"]?.value as? String else { return }
             let itemId = evt.data["itemId"]?.value as? String
-            let isPreamble = (evt.data["phase"]?.value as? String) == "commentary"
+            // Many providers (openai-completions/xai) never tag phase while streaming → .unknown, which the
+            // reducer treats as a shimmering step until finality rather than promoting it to the reply.
+            let role: OpenClawChatTextRole = switch evt.data["phase"]?.value as? String {
+            case "final_answer": .answer
+            case "commentary": .preamble
+            default: .unknown
+            }
             self.liveTurn = OpenClawChatLiveTurn.reduce(
                 self.liveTurn,
-                .assistantText(runId: runId, itemId: itemId, isPreamble: isPreamble, text: text))
+                .assistantText(runId: runId, itemId: itemId, role: role, text: text))
         case "thinking":
             guard let text = evt.data["text"]?.value as? String else { return }
             // Single accumulating reasoning block per turn; carry the event timestamp for "Thought for Ns".

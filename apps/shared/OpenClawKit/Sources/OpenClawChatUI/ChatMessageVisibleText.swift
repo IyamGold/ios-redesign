@@ -20,6 +20,17 @@ public enum ChatMessageVisibleText {
             .isEmpty
     }
 
+    /// The model's reasoning ("thinking") persisted on an assistant message, concatenated across content
+    /// blocks, or nil when none was saved. `visibleText` deliberately drops this; the steps sheet uses it to
+    /// show the "Thought" group at rest (openai-responses often persists no thinking → nil → no group).
+    public static func reasoningText(in message: OpenClawChatMessage) -> String? {
+        let parts = message.content.compactMap { content -> String? in
+            let thinking = content.thinking?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (thinking?.isEmpty == false) ? thinking : nil
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
     private static func primaryText(in message: OpenClawChatMessage) -> String {
         let parts = message.content.compactMap { content -> String? in
             let kind = (content.type ?? "text").lowercased()

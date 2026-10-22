@@ -1,34 +1,55 @@
 import OpenClawChatUI
 import SwiftUI
 
-/// Renders an assistant turn as ONE continuous, append-only vertical stack — the Claude/ChatGPT model —
-/// so the thinking process never has dead air, nothing is shown-then-yanked, and completion is a collapse
-/// in place rather than a node→rows swap. Order:
-///   1. a reasoning fold ("Thinking…" latest line live → "Thought for Ns" receipt),
-///   2. a step group (preamble lines + tool steps; shimmering while working, collapsing to
-///      "Worked through N steps"),
-///   3. the trailing answer, streaming in place below the steps.
+/// Renders an in-flight assistant turn as ONE continuous, append-only collapsible — the Claude/ChatGPT
+/// model. A SINGLE "steps" node shimmers through the whole process (reasoning → preambles → tool activity)
+/// as tidy latest-line items, so there's never dead air and a preamble never flashes as a full reply.
+/// When the real answer begins (`phase: final_answer`), the node settles to "Worked through N steps" and
+/// the answer streams in place below. Tapping the settled node opens the steps sheet, where the model's
+/// reasoning is the first nested "Thought for Ns" group followed by the tool/preamble steps.
 ///
-/// Stage T3 renders the LIVE turn (answer via `StreamingReplyBubble`); Stage T4 reuses this same view for
-/// completed/history turns (folds pre-collapsed, answer static) so the live→resting transition is a
-/// collapse on one identity.
+/// There is no longer a separate reasoning fold: reasoning and the work steps are one group, which is what
+/// keeps the thinking surface shimmering continuously (one node) instead of a reasoning receipt freezing
+/// above a second node that renders preambles as replies.
 struct ChatTurnTimeline: View {
     let turn: OpenClawChatLiveTurn
-    /// Gates the node/fold entrance until the just-sent user bubble has settled (matches the old
-    /// `nodeReady`), so the timeline doesn't ride the send spring and pop in early. The answer is ungated.
+    /// Gates the node's entrance until the just-sent user bubble has settled (matches the old `nodeReady`),
+    /// so the timeline doesn't ride the send spring and pop in early. The answer is ungated.
     let nodeReady: Bool
     let colorScheme: ColorScheme
     let textColor: Color
-    /// Resting-only: open the "Worked through N steps" sheet. Nil while live (steps aren't tappable).
-    var onOpenSteps: (([String]) -> Void)?
+    /// Opens the steps sheet (settled only). Carries the tool/preamble step lines + the reasoning group.
+    var onOpenSteps: ((_ steps: [String], _ reasoning: ChatStepsReasoning?) -> Void)?
 
-    /// The turn has moved past "working" — the answer is streaming or the run ended — so the reasoning and
-    /// step folds settle to their quiet receipts.
+    /// Wall-clock (ms) captured the instant the model stops thinking (first non-reasoning content appears),
+    /// so "Thought for Ns" shows a real duration — the reducer's terminal close can't measure it.
+    @State private var thinkingEndedAtMs: Double?
+
+    /// The turn has produced its final answer (or ended) — the node settles to its quiet receipt and the
+    /// answer streams below. Preambles/tools keep the node shimmering until this flips.
     private var isSettled: Bool {
         self.turn.state != .running || self.turn.answerSegmentID != nil
     }
 
-    /// Step footprints in turn order: preamble texts (every non-answer `.text`, positional) + tool names.
+    /// Any content beyond the reasoning block (a preamble, tool, or the answer). Its first appearance marks
+    /// the end of the "pure thinking" phase and freezes the "Thought for Ns" duration.
+    private var hasProcessContent: Bool {
+        self.turn.segments.contains { segment in
+            if case .reasoning = segment {
+                false
+            } else {
+                true
+            }
+        }
+    }
+
+    /// Still in the pure-thinking phase: reasoning is streaming and nothing else exists yet.
+    private var isThinkingLive: Bool {
+        guard let reasoning = self.turn.reasoning, !reasoning.text.isEmpty else { return false }
+        return self.turn.state == .running && !self.hasProcessContent
+    }
+
+    /// Tool/preamble step footprints in turn order (reasoning is NOT a step — it's the nested group).
     private var stepLines: [String] {
         self.turn.segments.compactMap { segment in
             switch segment {
@@ -39,43 +60,27 @@ struct ChatTurnTimeline: View {
         }
     }
 
-    /// The node's live "latest activity" line: a running tool wins, else the most recent step line.
-    private func stepLatestLine(_ steps: [String]) -> String {
-        for segment in self.turn.segments.reversed() {
-            if case let .toolCall(tool) = segment, tool.state == .running {
-                return tool.name
-            }
-        }
-        return steps.last ?? "Working"
-    }
-
-    private static func stepsLabel(_ count: Int) -> String {
-        "Worked through \(count) step\(count == 1 ? "" : "s")"
-    }
-
     var body: some View {
         let answer = self.turn.trailingAnswerText?.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasAnswer = !(answer ?? "").isEmpty
         let steps = self.stepLines
+        let reasoning = self.turn.reasoning.flatMap { $0.text.isEmpty ? nil : $0 }
+        let hasReasoning = reasoning != nil
+        let showNode = self.nodeReady
+            && (hasReasoning || !steps.isEmpty || (self.turn.state == .running && !hasAnswer))
 
         VStack(alignment: .leading, spacing: 10) {
-            if let reasoning = self.turn.reasoning, !reasoning.text.isEmpty, self.nodeReady {
-                ChatReasoningFold(
-                    reasoning: reasoning,
-                    isThinkingLive: !self.isSettled,
-                    colorScheme: self.colorScheme)
-            }
-
-            if !steps.isEmpty, self.nodeReady {
+            if showNode {
+                let payload = reasoning.map {
+                    ChatStepsReasoning(receipt: self.receipt(for: $0), text: $0.text)
+                }
+                let canOpen = self.isSettled && (hasReasoning || !steps.isEmpty)
                 ChatThinkingNode(
-                    label: self.isSettled ? Self.stepsLabel(steps.count) : self.stepLatestLine(steps),
+                    label: self.nodeLabel(steps: steps, reasoning: reasoning),
                     steps: steps,
                     shimmer: !self.isSettled,
                     colorScheme: self.colorScheme,
-                    onOpenSteps: self.isSettled ? { self.onOpenSteps?(steps) } : nil)
-            } else if self.turn.reasoning == nil, !hasAnswer, self.turn.state == .running, self.nodeReady {
-                // Live turn with nothing folded yet — a plain "Thinking" shimmer so the surface never freezes.
-                ChatThinkingNode(label: "Thinking", steps: [], shimmer: true, colorScheme: self.colorScheme)
+                    onOpenSteps: canOpen ? { self.onOpenSteps?(steps, payload) } : nil)
             }
 
             if hasAnswer, let text = self.turn.trailingAnswerText {
@@ -83,76 +88,58 @@ struct ChatTurnTimeline: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Reset per run so a previous turn's measured thinking duration never leaks into the next.
+        .onChange(of: self.turn.runId) { _, _ in self.thinkingEndedAtMs = nil }
+        .onChange(of: self.isThinkingLive) { _, live in
+            if !live, self.thinkingEndedAtMs == nil, self.turn.reasoning != nil {
+                self.thinkingEndedAtMs = Date().timeIntervalSince1970 * 1000
+            }
+        }
     }
-}
 
-/// The reasoning ("thinking") fold: a shimmering latest-thought line while the model thinks, settling to a
-/// quiet "Thought for Ns" receipt. Collapsed by default; tap to expand the full reasoning. Manual toggle
-/// wins over the auto state.
-private struct ChatReasoningFold: View {
-    let reasoning: OpenClawChatReasoningSegment
-    let isThinkingLive: Bool
-    let colorScheme: ColorScheme
+    /// Live: the latest activity line (running tool → latest step → latest thought → "Thinking").
+    /// Settled: "Worked through N steps" when there are steps, else the "Thought for Ns" receipt.
+    private func nodeLabel(steps: [String], reasoning: OpenClawChatReasoningSegment?) -> String {
+        if self.isSettled {
+            if !steps.isEmpty {
+                return Self.stepsLabel(steps.count)
+            }
+            if let reasoning {
+                return self.receipt(for: reasoning)
+            }
+            return Self.stepsLabel(0)
+        }
+        for segment in self.turn.segments.reversed() {
+            if case let .toolCall(tool) = segment, tool.state == .running {
+                return tool.name
+            }
+        }
+        if let last = steps.last {
+            return last
+        }
+        if let reasoning {
+            return Self.latestLine(of: reasoning.text)
+        }
+        return "Thinking"
+    }
 
-    @State private var expanded = false
-    /// Frozen "Thought for Ns" captured the moment thinking ends, so the receipt is stable even before the
-    /// terminal event stamps `endedAt`.
-    @State private var frozenReceipt: String?
-
-    private var tint: Color {
-        (self.colorScheme == .dark ? Color.white : .black).opacity(0.55)
+    private static func stepsLabel(_ count: Int) -> String {
+        "Worked through \(count) step\(count == 1 ? "" : "s")"
     }
 
     /// Last non-empty line of the reasoning — the "current thought" shown live.
-    private var latestLine: String {
-        let line = self.reasoning.text.split(whereSeparator: \.isNewline).last.map(String.init)
-        let trimmed = (line ?? self.reasoning.text).trimmingCharacters(in: .whitespaces)
+    private static func latestLine(of text: String) -> String {
+        let line = text.split(whereSeparator: \.isNewline).last.map(String.init)
+        let trimmed = (line ?? text).trimmingCharacters(in: .whitespaces)
         return trimmed.isEmpty ? "Thinking" : trimmed
     }
 
-    private func receipt() -> String {
-        let endMs = self.reasoning.endedAt ?? (Date().timeIntervalSince1970 * 1000)
-        guard let startMs = self.reasoning.startedAt, endMs > startMs else { return "Thought" }
+    /// "Thought for Ns" from the measured thinking window (frozen end), falling back to "Thought" when the
+    /// window can't be measured (e.g. no `startedAt`).
+    private func receipt(for reasoning: OpenClawChatReasoningSegment) -> String {
+        let endMs = self.thinkingEndedAtMs ?? reasoning.endedAt
+        guard let startMs = reasoning.startedAt, let endMs, endMs > startMs else { return "Thought" }
         let seconds = max(1, Int(((endMs - startMs) / 1000).rounded()))
         return seconds < 60 ? "Thought for \(seconds)s" : "Thought for \(seconds / 60)m \(seconds % 60)s"
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) { self.expanded.toggle() }
-            } label: {
-                HStack(spacing: 6) {
-                    if self.isThinkingLive {
-                        ChatShimmerLabel(text: self.latestLine)
-                    } else {
-                        Text(self.frozenReceipt ?? self.receipt())
-                            .font(.system(size: 16).italic())
-                            .foregroundStyle(self.tint)
-                            .lineLimit(1)
-                    }
-                    Image(systemName: self.expanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(self.tint)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            if self.expanded {
-                Text(self.reasoning.text)
-                    .font(.system(size: 14))
-                    .foregroundStyle(self.tint)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-            }
-        }
-        .onChange(of: self.isThinkingLive) { _, live in
-            // Freeze the duration the instant thinking ends (answer begins), before `endedAt` is stamped.
-            if !live, self.frozenReceipt == nil {
-                self.frozenReceipt = self.receipt()
-            }
-        }
     }
 }
