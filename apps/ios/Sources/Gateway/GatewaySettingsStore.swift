@@ -470,6 +470,27 @@ enum GatewaySettingsStore {
         return nil
     }
 
+    /// Store a client-owned Talk provider key (e.g. ElevenLabs / OpenAI realtime) in the device keychain.
+    /// An empty key deletes the entry. Returns false for an unrecognized provider id.
+    @discardableResult
+    static func saveTalkProviderApiKey(_ key: String, provider: String) -> Bool {
+        guard let providerId = self.normalizedTalkProviderID(provider) else { return false }
+        let account = self.talkProviderApiKeyAccount(providerId: providerId)
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return KeychainStore.delete(service: self.talkService, account: account)
+        }
+        return KeychainStore.saveString(trimmed, service: self.talkService, account: account)
+    }
+
+    @discardableResult
+    static func deleteTalkProviderApiKey(provider: String) -> Bool {
+        guard let providerId = self.normalizedTalkProviderID(provider) else { return false }
+        return KeychainStore.delete(
+            service: self.talkService,
+            account: self.talkProviderApiKeyAccount(providerId: providerId))
+    }
+
     static func loadGatewayRegistry() -> GatewayRegistry {
         guard let json = KeychainStore.loadString(
             service: self.gatewayService,

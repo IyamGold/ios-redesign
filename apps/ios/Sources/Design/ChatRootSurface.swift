@@ -120,7 +120,7 @@ struct ChatRootSurface: View {
 
     /// Rendered height of the newest turn (pinned question → last line), from the live probes.
     private var pinnedTurnHeight: CGFloat {
-        guard let top = self.pinnedQuestionTop else { return 0 }
+        guard let top = pinnedQuestionTop else { return 0 }
         return max(0, self.contentTailBottom - top)
     }
 
@@ -172,6 +172,12 @@ struct ChatRootSurface: View {
         ZStack {
             self.canvas.ignoresSafeArea()
             self.transcript
+            // Voice-session gradient (one design for STT + S2S), amplitude-reactive. Inside the ZStack so the
+            // top bar + composer (outer modifiers) stay ABOVE it — the voice button stays tappable to end the
+            // session, and the transcript shows through. Renders nothing when no session is active.
+            TalkVoiceOverlay(
+                isActive: self.appModel.talkMode.isEnabled,
+                level: self.appModel.talkMode.assistantLevel)
         }
         // Fades scrolling content out under the status bar / pills so it doesn't clash with the clock.
         .overlay(alignment: .top) { self.topScrim }
@@ -281,6 +287,7 @@ struct ChatRootSurface: View {
                                     ? .move(edge: .bottom).combined(with: .opacity)
                                     : .opacity)
                     }
+                    self.voiceTranscript
                     self.trailingIndicator
                         // Fade the live indicator in/out as the turn starts and ends (it hands off to the
                         // finalized rows on completion), and the node in once the user bubble has settled.
@@ -412,6 +419,17 @@ struct ChatRootSurface: View {
                     self.replyIntroArmed = false
                 }
             }
+            // A voice turn just committed (a "sent" user bubble, or the assistant's reply landed) — scroll it
+            // into view so the growing conversation stays pinned to the bottom during a session.
+            .onChange(of: self.appModel.talkMode.voiceTurns.count) { old, new in
+                self.scrollToBottom(proxy, animated: true, reason: "voiceTurn")
+                // A voice turn just committed — tap once. The user's bubble commits when they finish speaking;
+                // the assistant's turn commits when its spoken reply ENDS, so both tap at the moment the
+                // bubble lands. (Voice-overlay only — the real chat keeps its own reply-intro haptic.)
+                if new > old {
+                    OpenClawHaptics.tap()
+                }
+            }
         }
     }
 
@@ -492,11 +510,31 @@ struct ChatRootSurface: View {
         }
     }
 
+    /// The realtime (S2S) conversation, display-only: committed turns (both sides) plus the assistant's reply
+    /// streaming live. The realtime audio transcript isn't a `chat.send`, so it lives in `talkMode.voiceTurns`
+    /// rather than the gateway-synced `messages`, and renders here through the same bubble views.
+    @ViewBuilder private var voiceTranscript: some View {
+        ForEach(self.appModel.talkMode.voiceTurns) { turn in
+            self.messageView(for: ChatDisplayRow(voiceTurn: turn))
+                .padding(.bottom, 25)
+                .transition(turn.isUser
+                    ? .move(edge: .bottom).combined(with: .opacity)
+                    : .opacity)
+        }
+        let assistant = self.appModel.talkMode.liveAssistantTranscript
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !assistant.isEmpty {
+            self.messageView(for: ChatDisplayRow(voiceLiveAssistant: assistant))
+                .padding(.bottom, 25)
+                .animation(.easeOut(duration: 0.18), value: assistant)
+        }
+    }
+
     @ViewBuilder private var trailingIndicator: some View {
         // The in-flight turn renders as ONE continuous collapsible stack (reasoning fold → step group →
         // streaming answer) via `ChatTurnTimeline` — no node↔bubble split, no guessing. The only remaining
         // discontinuity (the live→resting handoff) is removed in T4.
-        if let turn = self.viewModel.liveTurn, turn.state == .running {
+        if let turn = viewModel.liveTurn, turn.state == .running {
             ChatTurnTimeline(
                 turn: turn,
                 nodeReady: self.nodeReady,
@@ -564,7 +602,7 @@ struct ChatRootSurface: View {
                     if self.diskCachedKeys.insert(key).inserted {
                         ChatImageDiskCache.store(images, key: key)
                     }
-                } else if let cached = self.imageCache[key] {
+                } else if let cached = imageCache[key] {
                     images = cached
                 } else {
                     // Cold start: rehydrate from disk on the first byte-less encounter, then memoize.
@@ -585,7 +623,7 @@ struct ChatRootSurface: View {
                     if self.diskCachedChipKeys.insert(key).inserted {
                         ChatChipDiskCache.store(chips, key: key)
                     }
-                } else if let cachedChips = self.chipCache[key],
+                } else if let cachedChips = chipCache[key],
                           cachedChips.contains(where: { $0.payload != nil })
                 {
                     chips = cachedChips
@@ -662,7 +700,7 @@ struct ChatRootSurface: View {
         // Animate row insertions (spring settle + the per-row `.transition`) only during a live turn, so a
         // bulk history load / session switch repopulates instantly instead of cascading every row in.
         let animateRowInsertion = self.pinScrollPending || self.pinTurnID != nil || self.viewModel.liveTurn != nil
-        let oldIDs = Set(self.rows.map(\.id))
+        let oldIDs = Set(rows.map(\.id))
         // Fix A: identical projection → skip reassigning `self.rows` entirely. A safety-net history refetch
         // that changed nothing visible (see the pending-run probes) would otherwise reassign the whole
         // array and make LazyVStack re-diff — the idle-time blank-until-touch. Canvas index still updates.
@@ -1035,7 +1073,7 @@ struct ChatRootSurface: View {
             self.recordingField
                 .frame(minHeight: 36)
                 .background { self.fieldPillBackground }
-        } else if let voiceNote = self.stagedVoiceNote {
+        } else if let voiceNote = stagedVoiceNote {
             StagedVoiceNoteField(
                 data: voiceNote.data,
                 durationSeconds: voiceNote.durationSeconds ?? 0)
@@ -1151,6 +1189,15 @@ struct ChatRootSurface: View {
             Image(systemName: "arrow.up")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.white)
+        } else if self.appModel.talkMode.isEnabled {
+            // Voice session active: the red button becomes a cancel affordance — tapping it ends the session
+            // (`onOpenTalk` toggles voice off). The waveform reads as "start", so swap in the ✕ glyph.
+            Image("ChatCloseGlyph")
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 18, height: 18)
+                .foregroundStyle(.white)
         } else {
             ChatWaveformGlyph()
         }
@@ -1192,7 +1239,7 @@ struct ChatRootSurface: View {
         // OpenClaw can read it (hidden in the UI — see rebuildRows). Ensure the transcript is ready:
         // use the one prepared on finish, else transcribe on the spot (first note may download the model).
         if self.viewModel.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           let note = self.stagedVoiceNote
+           let note = stagedVoiceNote
         {
             Task { @MainActor in
                 let transcript: String? = if let cached = self.voiceTranscripts[note.id] {
@@ -1238,7 +1285,7 @@ struct ChatRootSurface: View {
     }
 
     private func finishRecording() {
-        guard let recording = self.voiceRecorder.finish() else { return }
+        guard let recording = voiceRecorder.finish() else { return }
         OpenClawHaptics.tap()
         Task { @MainActor in
             await self.viewModel.addVoiceNoteAttachment(
@@ -1511,7 +1558,7 @@ private enum ChatImageDiskCache {
     static func load(key: String) -> [UIImage] {
         var result: [UIImage] = []
         var index = 0
-        while let data = try? Data(contentsOf: self.fileURL(key: key, index: index)),
+        while let data = try? Data(contentsOf: fileURL(key: key, index: index)),
               let image = UIImage(data: data)
         {
             result.append(image)
@@ -1576,7 +1623,7 @@ private enum ChatChipDiskCache {
     }
 
     static func load(key: String) -> [ChatAttachmentChip] {
-        guard let manifest = try? Data(contentsOf: self.manifestURL(key)),
+        guard let manifest = try? Data(contentsOf: manifestURL(key)),
               let entries = try? JSONDecoder().decode([Entry].self, from: manifest)
         else { return [] }
         return entries.enumerated().map { index, entry in
@@ -1610,7 +1657,7 @@ private struct ChatAttachmentChip: Identifiable {
     let durationSeconds: Double
 
     var fileExtension: String? {
-        guard let name = self.fileName else { return nil }
+        guard let name = fileName else { return nil }
         let ext = (name as NSString).pathExtension
         return ext.isEmpty ? nil : ext
     }
@@ -1666,6 +1713,39 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.id = "streaming"
         self.isUser = false
         self.text = streamingText
+        self.timestamp = nil
+        self.isError = false
+        self.isStreaming = true
+        self.images = []
+        self.chips = []
+        self.canvasEmbed = nil
+        self.progressLines = []
+        self.reasoningText = nil
+        self.daySeparator = nil
+    }
+
+    /// A completed realtime voice turn (display-only). Carries a timestamp so a committed user turn shows the
+    /// sent meta, matching a normal sent bubble.
+    init(voiceTurn: TalkVoiceTurn) {
+        self.id = voiceTurn.id
+        self.isUser = voiceTurn.isUser
+        self.text = voiceTurn.text
+        self.timestamp = voiceTurn.timestamp
+        self.isError = false
+        self.isStreaming = false
+        self.images = []
+        self.chips = []
+        self.canvasEmbed = nil
+        self.progressLines = []
+        self.reasoningText = nil
+        self.daySeparator = nil
+    }
+
+    /// The assistant's in-progress spoken reply during a realtime session — streams in place (stable id).
+    init(voiceLiveAssistant text: String) {
+        self.id = "voice-live-assistant"
+        self.isUser = false
+        self.text = text
         self.timestamp = nil
         self.isError = false
         self.isStreaming = true
@@ -2349,7 +2429,7 @@ private struct ChatFormattedText: View {
         self.blocks = parsed
         self.reveal = reveal
         self.lineCount = Self.revealLineCount(parsed)
-        self._revealFraction = State(initialValue: reveal ? 0 : 1)
+        _revealFraction = State(initialValue: reveal ? 0 : 1)
     }
 
     private var revealDuration: Double {
@@ -2824,7 +2904,7 @@ private struct ChatCameraPicker: UIViewControllerRepresentable {
         return picker
     }
 
-    func updateUIViewController(_ controller: UIImagePickerController, context: Context) {}
+    func updateUIViewController(_: UIImagePickerController, context _: Context) {}
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -2838,7 +2918,7 @@ private struct ChatCameraPicker: UIViewControllerRepresentable {
         }
 
         func imagePickerController(
-            _ picker: UIImagePickerController,
+            _: UIImagePickerController,
             didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any])
         {
             if let image = info[.originalImage] as? UIImage {
@@ -2847,7 +2927,7 @@ private struct ChatCameraPicker: UIViewControllerRepresentable {
             self.parent.dismiss()
         }
 
-        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+        func imagePickerControllerDidCancel(_: UIImagePickerController) {
             self.parent.dismiss()
         }
     }
@@ -2889,7 +2969,7 @@ private struct ChatRevealWipe: Shape {
     }
 
     func path(in rect: CGRect) -> Path {
-        let clamped = CGFloat(max(0, min(1, self.fraction)))
+        let clamped = CGFloat(max(0, min(1, fraction)))
         let top = -self.overshoot
         // At fraction 1 the front reaches height + overshoot, so the bottom feather clears the last line.
         let bottom = top + clamped * (rect.height + 2 * self.overshoot)

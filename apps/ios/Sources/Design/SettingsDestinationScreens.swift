@@ -568,6 +568,19 @@ struct VoiceSettingsScreen: View {
     @Binding var provider: String
     let providerOptions: [String]
     let hasAdminScope: Bool
+    /// The resolved route behind the provider label — drives which credential fields show.
+    let selectedRoute: TalkModeProviderSelection
+    @Binding var elevenLabsKey: String
+    @Binding var openAIKey: String
+    /// Raw realtime voice id ("" = gateway default).
+    @Binding var realtimeVoice: String
+    /// Live status from the gateway talk config + local keychain.
+    let voiceModeTitle: String
+    let activeVoiceDetail: String
+    let transportLabel: String
+    let keyStatus: String
+    /// Persist the key for the current route and re-apply the config.
+    let onSaveKey: () -> Void
     let onBack: () -> Void
     let onOpenWakeWords: () -> Void
 
@@ -602,6 +615,18 @@ struct VoiceSettingsScreen: View {
                             self.pickerRow("Provider", value: self.$provider, options: self.providerOptions)
                             OpenClawRowDivider()
                             self.wakeWordsRow
+                        }
+
+                        self.credentialsSection
+
+                        self.voiceSection("Status") {
+                            self.detailRow("Voice Mode", self.voiceModeTitle)
+                            OpenClawRowDivider()
+                            self.detailRow("Active", self.activeVoiceDetail)
+                            OpenClawRowDivider()
+                            self.detailRow("Transport", self.transportLabel)
+                            OpenClawRowDivider()
+                            self.detailRow("API Key", self.keyStatus)
                         }
                     }
                     .opacity(self.talkModeEnabled ? 1 : 0.4)
@@ -704,6 +729,119 @@ struct VoiceSettingsScreen: View {
         }
         .buttonStyle(.plain)
     }
+
+    /// Per-route credentials: System needs nothing, ElevenLabs/OpenAI take a client-owned key (kept in the
+    /// device keychain); OpenAI realtime also picks a voice.
+    @ViewBuilder private var credentialsSection: some View {
+        switch self.selectedRoute {
+        case .gatewayDefault:
+            self.voiceSection("Credentials") {
+                self.noteRow("System voice — no API key required.")
+            }
+        case .nativeElevenLabs:
+            self.voiceSection("ElevenLabs") {
+                self.secureKeyRow("API Key", key: self.$elevenLabsKey)
+                OpenClawRowDivider()
+                self.saveKeyRow
+            }
+        case .openAIRealtime:
+            self.voiceSection("OpenAI Realtime") {
+                self.secureKeyRow("API Key", key: self.$openAIKey)
+                OpenClawRowDivider()
+                self.realtimeVoiceRow
+                OpenClawRowDivider()
+                self.saveKeyRow
+            }
+        }
+    }
+
+    private func secureKeyRow(_ title: String, key: Binding<String>) -> some View {
+        self.rowInset(HStack {
+            Text(title)
+                .font(OpenClawType.body)
+                .foregroundStyle(Color.primary)
+            Spacer(minLength: 12)
+            ZStack(alignment: .trailing) {
+                if key.wrappedValue.isEmpty {
+                    // Decorative placeholder — the row title is the real (accessible) label.
+                    Text("Required")
+                        .font(OpenClawType.callout)
+                        .foregroundStyle(Color.primary.opacity(0.3))
+                        .accessibilityHidden(true)
+                }
+                SecureField("", text: key)
+                    .font(OpenClawType.callout)
+                    .multilineTextAlignment(.trailing)
+                    .textContentType(.password)
+                    .autocorrectionDisabled(true)
+                    .textInputAutocapitalization(.never)
+                    .submitLabel(.done)
+                    .onSubmit(self.onSaveKey)
+                    .accessibilityLabel(Text(title))
+            }
+            .frame(maxWidth: 200)
+        })
+    }
+
+    private var saveKeyRow: some View {
+        Button(action: self.onSaveKey) {
+            self.rowInset(HStack {
+                Text("Save API Key")
+                    .font(OpenClawType.body)
+                    .foregroundStyle(OpenClawBrand.accent)
+                Spacer(minLength: 0)
+            })
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var realtimeVoiceRow: some View {
+        self.rowInset(HStack {
+            Text("Realtime Voice")
+                .font(OpenClawType.body)
+                .foregroundStyle(Color.primary)
+            Spacer(minLength: 0)
+            Menu {
+                Button { self.realtimeVoice = "" } label: {
+                    Text("Gateway Default").font(OpenClawType.body)
+                }
+                ForEach(TalkModeRealtimeVoiceSelection.voices, id: \.self) { voice in
+                    Button { self.realtimeVoice = voice } label: {
+                        Text(TalkModeRealtimeVoiceSelection.label(for: voice)).font(OpenClawType.body)
+                    }
+                }
+            } label: {
+                self.pickerValue(
+                    self.realtimeVoice.isEmpty
+                        ? "Gateway Default"
+                        : TalkModeRealtimeVoiceSelection.label(for: self.realtimeVoice),
+                    withChevrons: true)
+            }
+        })
+    }
+
+    private func detailRow(_ title: String, _ value: String) -> some View {
+        self.rowInset(HStack {
+            Text(title)
+                .font(OpenClawType.body)
+                .foregroundStyle(Color.primary)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(OpenClawType.callout)
+                .foregroundStyle(Color.primary.opacity(0.6))
+                .multilineTextAlignment(.trailing)
+        })
+    }
+
+    private func noteRow(_ text: String) -> some View {
+        self.rowInset(HStack {
+            Text(text)
+                .font(OpenClawType.callout)
+                .foregroundStyle(Color.primary.opacity(0.6))
+            Spacer(minLength: 0)
+        })
+    }
 }
 
 /// Binds the redesigned Voice Settings to the real @AppStorage keys, mapping locale-id/provider-raw
@@ -713,7 +851,9 @@ struct VoiceSettingsScreenHost: View {
     let onOpenWakeWords: () -> Void
 
     @Environment(NodeAppModel.self) private var appModel
-    @AppStorage("talk.enabled") private var talkEnabled = false
+    // Canonical gate for the voice features below — NOT the live-session switch. Starting a live voice chat
+    // belongs to the composer's voice button; from Settings this only enables/disables the items beneath it.
+    @AppStorage("talk.featuresEnabled") private var talkFeaturesEnabled = false
     @AppStorage(VoiceWakePreferences.enabledKey) private var voiceWakeEnabled = false
     @AppStorage("talk.background.enabled") private var backgroundListening = false
     @AppStorage(TalkDefaults.speakerphoneEnabledKey) private var speakerphone =
@@ -721,13 +861,22 @@ struct VoiceSettingsScreenHost: View {
     @AppStorage(TalkSpeechLocale.storageKey) private var speechLocale = TalkSpeechLocale.automaticID
     @AppStorage(TalkModeProviderSelection.storageKey) private var providerRaw =
         TalkModeProviderSelection.gatewayDefault.rawValue
+    @AppStorage(TalkModeRealtimeVoiceSelection.storageKey) private var realtimeVoiceRaw = ""
+
+    // Client-owned keys live in the device keychain, loaded on appear. @State so edits are local until saved.
+    @State private var elevenLabsKey = ""
+    @State private var openAIKey = ""
 
     private static let languageOptions: [String] = TalkSpeechLocale.supportedOptions().map(\.label)
     private static let providerOptions: [String] = TalkModeProviderSelection.allCases.map(\.label)
 
+    private var selectedRoute: TalkModeProviderSelection {
+        TalkModeProviderSelection.resolved(self.providerRaw)
+    }
+
     var body: some View {
         VoiceSettingsScreen(
-            talkModeEnabled: self.$talkEnabled,
+            talkModeEnabled: self.$talkFeaturesEnabled,
             voiceWake: self.$voiceWakeEnabled,
             backgroundListening: self.$backgroundListening,
             speakerphone: self.$speakerphone,
@@ -736,10 +885,56 @@ struct VoiceSettingsScreenHost: View {
             provider: self.providerBinding,
             providerOptions: Self.providerOptions,
             hasAdminScope: self.appModel.hasOperatorAdminScope,
+            selectedRoute: self.selectedRoute,
+            elevenLabsKey: self.$elevenLabsKey,
+            openAIKey: self.$openAIKey,
+            realtimeVoice: self.realtimeVoiceBinding,
+            voiceModeTitle: self.appModel.talkMode.gatewayTalkVoiceModeTitle,
+            activeVoiceDetail: self.activeVoiceDetail,
+            transportLabel: self.appModel.talkMode.gatewayTalkTransportLabel,
+            keyStatus: self.keyStatus,
+            onSaveKey: self.saveKey,
             onBack: self.onBack,
             onOpenWakeWords: self.onOpenWakeWords)
-            .onChange(of: self.talkEnabled) { _, on in self.appModel.setTalkEnabled(on) }
+            .onAppear {
+                self.elevenLabsKey = GatewaySettingsStore.loadTalkProviderApiKey(provider: "elevenlabs") ?? ""
+                self.openAIKey = GatewaySettingsStore.loadTalkProviderApiKey(provider: "openai") ?? ""
+            }
             .onChange(of: self.voiceWakeEnabled) { _, on in self.appModel.setVoiceWakeEnabled(on) }
+    }
+
+    /// Local-key presence for the selected route (System needs none).
+    private var keyStatus: String {
+        switch self.selectedRoute {
+        case .gatewayDefault: "Not required"
+        case .nativeElevenLabs: self.elevenLabsKey.isEmpty ? "Missing" : "Configured"
+        case .openAIRealtime: self.openAIKey.isEmpty ? "Missing" : "Configured"
+        }
+    }
+
+    private var activeVoiceDetail: String {
+        let title = self.appModel.talkMode.gatewayTalkActiveModeTitle
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let subtitle = (self.appModel.talkMode.gatewayTalkActiveModeSubtitle ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if title.isEmpty {
+            return "Not active"
+        }
+        return subtitle.isEmpty ? title : "\(title) • \(subtitle)"
+    }
+
+    /// Persist the current route's key to the keychain and re-apply the config so the new key takes effect.
+    private func saveKey() {
+        switch self.selectedRoute {
+        case .nativeElevenLabs:
+            GatewaySettingsStore.saveTalkProviderApiKey(self.elevenLabsKey, provider: "elevenlabs")
+        case .openAIRealtime:
+            GatewaySettingsStore.saveTalkProviderApiKey(self.openAIKey, provider: "openai")
+        case .gatewayDefault:
+            break
+        }
+        OpenClawHaptics.tap()
+        Task { await self.appModel.talkMode.reloadConfig() }
     }
 
     private var languageBinding: Binding<String> {
@@ -758,8 +953,21 @@ struct VoiceSettingsScreenHost: View {
         Binding(
             get: { TalkModeProviderSelection.resolved(self.providerRaw).label },
             set: { label in
-                self.providerRaw = TalkModeProviderSelection.allCases.first { $0.label == label }?.rawValue
+                let raw = TalkModeProviderSelection.allCases.first { $0.label == label }?.rawValue
                     ?? TalkModeProviderSelection.gatewayDefault.rawValue
+                self.providerRaw = raw
+                // Apply so the route switch takes effect live (the old binding only wrote @AppStorage).
+                self.appModel.setTalkProviderSelection(raw)
+            })
+    }
+
+    private var realtimeVoiceBinding: Binding<String> {
+        Binding(
+            get: { self.realtimeVoiceRaw },
+            set: { value in
+                let resolved = TalkModeRealtimeVoiceSelection.resolvedOverride(value) ?? ""
+                self.realtimeVoiceRaw = resolved
+                self.appModel.setTalkRealtimeVoiceSelection(resolved)
             })
     }
 }

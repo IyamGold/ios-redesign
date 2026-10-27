@@ -63,6 +63,8 @@ targets:
       - path: Resources/Licenses
         type: folder
         buildPhase: resources
+      - path: Resources/Sounds
+        buildPhase: resources
       - path: Sources/Fonts
         buildPhase: resources
       - path: Resources/Localizable.xcstrings

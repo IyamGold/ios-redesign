@@ -28,6 +28,15 @@ private final class StreamFailureBox: @unchecked Sendable {
 // It's large, and splitting would force `private` -> `fileprivate` across many members.
 // We'll refactor into smaller files when the surface stabilizes.
 // swiftlint:disable type_body_length file_length
+
+/// One completed turn of a realtime (speech-to-speech) voice conversation, shown in the chat for display.
+struct TalkVoiceTurn: Identifiable, Equatable {
+    let id: String
+    let isUser: Bool
+    var text: String
+    let timestamp: Double
+}
+
 @MainActor
 @Observable
 final class TalkModeManager: NSObject {
@@ -46,6 +55,15 @@ final class TalkModeManager: NSObject {
     var statusText: String = "Off"
     /// 0..1-ish (not calibrated). Intended for UI feedback only.
     var micLevel: Double = 0
+    /// The assistant's OUTPUT voice loudness (0–1), smoothed — drives the amplitude-reactive voice gradient.
+    /// Fed from WebRTC inbound stats / relay + TTS output RMS; falls to ~0 when OpenClaw isn't speaking.
+    var assistantLevel: Double = 0
+    /// The assistant's in-progress spoken reply during a realtime (S2S) session — streams a live assistant
+    /// bubble; cleared (→ "") and committed to `voiceTurns` when the reply completes.
+    var liveAssistantTranscript: String = ""
+    /// Completed realtime turns, display-only (the realtime conversation isn't a `chat.send`, so it lives
+    /// here rather than in the gateway-synced `messages`). Reset when a new session starts.
+    var voiceTurns: [TalkVoiceTurn] = []
     var gatewayTalkConfigLoaded: Bool = false
     var gatewayTalkApiKeyConfigured: Bool = false
     var gatewayTalkDefaultModelId: String?
@@ -115,11 +133,19 @@ final class TalkModeManager: NSObject {
     private var prefetchedRealtimeSession: TalkRealtimeClientSession?
     private var realtimePrefetchTask: Task<Void, Never>?
     private var realtimePrefetchGeneration: UInt64 = 0
+    /// True while the voice-mode entry chime is playing: the realtime mic stays muted so the chime (played via
+    /// a separate player echo cancellation doesn't cover) can't be transcribed as spurious user turns.
+    private var suppressRealtimeMicForEntryChime = false
+    /// Backstop so a dropped chime-finished callback can never leave the mic muted forever.
+    private var entryChimeMuteBackstop: Task<Void, Never>?
 
     private var lastHeard: Date?
     private var lastTranscript: String = ""
+
     private var loggedPartialThisCycle: Bool = false
     private var lastSpokenText: String?
+    /// Monotonic id source for committed realtime `voiceTurns`.
+    private var voiceTurnSeq: Int = 0
     private var lastInterruptedAtSeconds: Double?
 
     private var defaultVoiceId: String?
@@ -227,7 +253,7 @@ final class TalkModeManager: NSObject {
         if self.realtimeSessionReadyAt == nil {
             self.realtimeSessionReadyAt = Date()
         }
-        self.markRealtimeActive()
+        markRealtimeActive()
     }
 
     private func scheduleRealtimeRestart(after delayNanoseconds: UInt64?, generation: Int) {
@@ -294,7 +320,7 @@ final class TalkModeManager: NSObject {
             activeDuration: activeDuration)
         self.rapidRealtimeRestartCount = attempt
         guard let delay = Self.realtimeRestartDelayNanoseconds(attempt: attempt) else {
-            let issue = self.realtimeIssue(
+            let issue = realtimeIssue(
                 message: "Realtime disconnected repeatedly.",
                 phase: "reconnect")
             self.pendingRealtimeIssue = issue
@@ -1134,6 +1160,13 @@ final class TalkModeManager: NSObject {
     }
 
     private func processTranscript(_ transcript: String, restartAfter: Bool) async {
+        // In a realtime (speech-to-speech) session the model already owns the turn over WebRTC and consults
+        // the agent itself — re-sending the transcribed text via chat.send would make the agent hear the same
+        // utterance twice. Just drop the partial (so the provisional bubble clears) and let realtime handle it.
+        guard self.realtimeSession == nil else {
+            self.lastTranscript = ""
+            return
+        }
         self.isListening = false
         self.isUserSpeechDetected = false
         self.captureMode = .idle
@@ -1278,6 +1311,8 @@ final class TalkModeManager: NSObject {
             sessionKey: mainSessionKey,
             delegate: self)
         self.realtimeSession = session
+        // Start muted if an entry chime is still playing — it would otherwise bleed into the mic as fake turns.
+        session.setMicrophoneMuted(self.suppressRealtimeMicForEntryChime)
         do {
             try await session.start(
                 provider: self.realtimeProvider,
@@ -3313,27 +3348,122 @@ extension TalkModeManager: TalkRealtimeWebRTCSessionDelegate {
         }
     }
 
-    func realtimeSession(_ session: TalkRealtimeWebRTCSession, didReceiveUserTranscript text: String) {
+    func realtimeSession(
+        _ session: TalkRealtimeWebRTCSession,
+        didReceiveUserTranscript text: String,
+        isFinal: Bool)
+    {
         guard session === self.realtimeSession else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        GatewayDiagnostics.log("talk.timeline realtime user transcript chars=\(trimmed.count)")
-        self.lastTranscript = trimmed
         self.lastHeard = Date()
+        if isFinal {
+            // Commit the finished turn as a chat bubble and clear the provisional (grow) bubble.
+            let full = trimmed.isEmpty
+                ? self.lastTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+                : trimmed
+            self.lastTranscript = ""
+            guard !full.isEmpty else { return }
+            self.commitVoiceTurn(isUser: true, text: full)
+        } else {
+            // Raw delta (keep spaces) so the committed turn's fallback text isn't run together.
+            guard !text.isEmpty else { return }
+            self.lastTranscript = self.mergeTranscriptDelta(self.lastTranscript, text)
+        }
     }
 
-    func realtimeSession(_ session: TalkRealtimeWebRTCSession, didReceiveAssistantTranscript text: String) {
+    func realtimeSession(
+        _ session: TalkRealtimeWebRTCSession,
+        didReceiveAssistantTranscript text: String,
+        isFinal: Bool)
+    {
         guard session === self.realtimeSession else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        GatewayDiagnostics.log("talk.timeline realtime assistant transcript chars=\(trimmed.count)")
-        self.lastSpokenText = trimmed
+        if isFinal {
+            let full = trimmed.isEmpty ? self.liveAssistantTranscript : trimmed
+            self.liveAssistantTranscript = ""
+            guard !full.isEmpty else { return }
+            self.lastSpokenText = full
+            self.commitVoiceTurn(isUser: false, text: full)
+        } else {
+            // Merge the RAW delta (not trimmed) — trimming each chunk strips the spaces between word pieces
+            // and collapses the reply into run-on text ("IwassayingElClasico…").
+            guard !text.isEmpty else { return }
+            self.liveAssistantTranscript = self.mergeTranscriptDelta(self.liveAssistantTranscript, text)
+        }
+    }
+
+    private func commitVoiceTurn(isUser: Bool, text: String) {
+        self.voiceTurnSeq += 1
+        self.voiceTurns.append(TalkVoiceTurn(
+            id: "voice-\(isUser ? "u" : "a")-\(self.voiceTurnSeq)",
+            isUser: isUser,
+            text: text,
+            timestamp: Date().timeIntervalSince1970))
+    }
+
+    /// Clear the display-only realtime conversation. Called when a FRESH voice session begins (not on
+    /// reconnect/resume) so the last session's turns stay readable until the user starts a new one.
+    func resetVoiceTranscript() {
+        self.voiceTurns = []
+        self.liveAssistantTranscript = ""
+        self.lastTranscript = ""
+    }
+
+    /// Mute the realtime mic for the voice-mode entry chime so it isn't transcribed as fake user turns. Called
+    /// before the session starts (applied on creation) and re-applied live if a session already exists. A
+    /// backstop auto-unmutes in case the chime-finished callback is ever dropped.
+    func beginEntryChimeMicSuppression() {
+        self.suppressRealtimeMicForEntryChime = true
+        self.realtimeSession?.setMicrophoneMuted(true)
+        self.entryChimeMuteBackstop?.cancel()
+        self.entryChimeMuteBackstop = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.endEntryChimeMicSuppression()
+        }
+    }
+
+    /// Unmute the realtime mic once the entry chime has finished playing.
+    func endEntryChimeMicSuppression() {
+        self.entryChimeMuteBackstop?.cancel()
+        self.entryChimeMuteBackstop = nil
+        self.suppressRealtimeMicForEntryChime = false
+        self.realtimeSession?.setMicrophoneMuted(false)
+    }
+
+    /// Merge a transcript piece robustly: a cumulative snapshot (starts with what we have) replaces; a stale
+    /// prefix is ignored; otherwise it's an incremental chunk and appends. Handles both realtime delta shapes
+    /// without double-counting.
+    private func mergeTranscriptDelta(_ current: String, _ piece: String) -> String {
+        if current.isEmpty {
+            return piece
+        }
+        if piece.hasPrefix(current) {
+            return piece
+        }
+        if current.hasPrefix(piece) {
+            return current
+        }
+        return current + piece
+    }
+
+    func realtimeSession(_ session: TalkRealtimeWebRTCSession, didUpdateAssistantAudioLevel level: Double) {
+        guard session === self.realtimeSession else { return }
+        self.applyAssistantLevel(level)
     }
 
     func realtimeSessionDidFinish(_ session: TalkRealtimeWebRTCSession) {
         guard session === self.realtimeSession else { return }
         self.realtimeSession = nil
+        self.assistantLevel = 0
         self.handleRealtimeSessionFinish()
+    }
+
+    /// Smooth the assistant output level toward the new sample so the pulse eases instead of flickering.
+    /// Shared by every amplitude source (WebRTC stats, relay/TTS RMS).
+    func applyAssistantLevel(_ raw: Double) {
+        let clamped = max(0, min(raw, 1))
+        self.assistantLevel = (self.assistantLevel * 0.6) + (clamped * 0.4)
     }
 }
 

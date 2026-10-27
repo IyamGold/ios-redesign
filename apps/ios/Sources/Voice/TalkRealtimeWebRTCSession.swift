@@ -10,8 +10,15 @@ import OSLog
 protocol TalkRealtimeWebRTCSessionDelegate: AnyObject {
     func realtimeSession(_ session: TalkRealtimeWebRTCSession, didChangeStatus status: String)
     func realtimeSession(_ session: TalkRealtimeWebRTCSession, didDetectInputSpeech active: Bool)
-    func realtimeSession(_ session: TalkRealtimeWebRTCSession, didReceiveUserTranscript text: String)
-    func realtimeSession(_ session: TalkRealtimeWebRTCSession, didReceiveAssistantTranscript text: String)
+    /// `isFinal` distinguishes a streaming delta (grow the live bubble) from the completed turn (commit it).
+    func realtimeSession(_ session: TalkRealtimeWebRTCSession, didReceiveUserTranscript text: String, isFinal: Bool)
+    func realtimeSession(
+        _ session: TalkRealtimeWebRTCSession,
+        didReceiveAssistantTranscript text: String,
+        isFinal: Bool)
+    /// The assistant's output voice loudness (0–1), polled from the inbound WebRTC audio stats — drives the
+    /// amplitude-reactive Talk visuals. ~0 when OpenClaw isn't speaking.
+    func realtimeSession(_ session: TalkRealtimeWebRTCSession, didUpdateAssistantAudioLevel level: Double)
     func realtimeSessionDidFinish(_ session: TalkRealtimeWebRTCSession)
 }
 
@@ -31,6 +38,12 @@ final class TalkRealtimeWebRTCSession: NSObject {
     private static let historyFallbackTimeoutSeconds = 5
     private static let stillWorkingDelaySeconds = 6
     private static let assistantPlaybackDrainGraceSeconds = 1.8
+    // Input VAD tuning. The server_vad default (threshold ~0.5, ~500ms silence) commits on faint ambient
+    // noise on a phone, which the transcription model then hallucinates into phantom user turns. Raise the
+    // trigger threshold and require a longer pause before committing a turn.
+    private static let vadThreshold = 0.7
+    private static let vadPrefixPaddingMs = 300
+    private static let vadSilenceDurationMs = 700
 
     private let gateway: GatewayNodeSession
     private let sessionKey: String
@@ -51,6 +64,13 @@ final class TalkRealtimeWebRTCSession: NSObject {
     private var assistantAudioActive = false
     private var assistantAudioFinishTask: Task<Void, Never>?
     private var ownsAudioSessionActivation = false
+    /// Polls inbound audio stats for the assistant's output loudness (drives amplitude-reactive visuals).
+    private var levelPollTask: Task<Void, Never>?
+    /// The outgoing mic track. Held so capture can be muted (track disabled → silence to OpenAI) during the
+    /// entry chime, which plays through a separate player WebRTC's echo cancellation doesn't cover.
+    private var localAudioTrack: RTCAudioTrack?
+    /// Desired mute state; applied to `localAudioTrack` as soon as it exists (it's created inside `start`).
+    private var microphoneMuted = false
 
     private struct ToolBuffer {
         var name: String
@@ -141,6 +161,9 @@ final class TalkRealtimeWebRTCSession: NSObject {
         let audioSource = factory.audioSource(with: constraints)
         let audioTrack = factory.audioTrack(with: audioSource, trackId: Self.audioTrackID)
         peer.add(audioTrack, streamIds: [Self.mediaStreamID])
+        // Honor any mute requested before the track existed (entry-chime suppression set on creation).
+        self.localAudioTrack = audioTrack
+        audioTrack.isEnabled = !self.microphoneMuted
 
         let channelConfig = RTCDataChannelConfiguration()
         let channel = peer.dataChannel(forLabel: Self.dataChannelLabel, configuration: channelConfig)
@@ -163,9 +186,18 @@ final class TalkRealtimeWebRTCSession: NSObject {
         self.delegate?.realtimeSession(self, didChangeStatus: "Listening")
     }
 
+    /// Mute/unmute the outgoing mic. Disabling the track sends silence, so sound played locally (the entry
+    /// chime, which echo cancellation doesn't cover) can't bleed into OpenAI's VAD as spurious user turns.
+    func setMicrophoneMuted(_ muted: Bool) {
+        self.microphoneMuted = muted
+        self.localAudioTrack?.isEnabled = !muted
+    }
+
     func stop() {
         let shouldNotify = !self.stopped
         self.stopped = true
+        self.levelPollTask?.cancel()
+        self.levelPollTask = nil
         self.cancelActiveToolCalls()
         self.toolBuffers.removeAll()
         self.dataChannel?.close()
@@ -186,6 +218,35 @@ final class TalkRealtimeWebRTCSession: NSObject {
     func applyAudioRoutePreferenceChanged() throws {
         try Self.configureAudioSession(activate: false)
         self.trace("audio route preference reapplied")
+    }
+
+    /// Polls the peer connection's inbound audio stats ~12/s and reports the assistant's output loudness.
+    /// Read-only and off the audio render path, so it can't perturb playback. Idempotent.
+    private func startAssistantLevelPolling() {
+        guard self.levelPollTask == nil else { return }
+        self.levelPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, let peer = self.peerConnection, !self.stopped else { return }
+                let level = await Self.readInboundAudioLevel(peer)
+                guard !Task.isCancelled, !self.stopped else { return }
+                self.delegate?.realtimeSession(self, didUpdateAssistantAudioLevel: level)
+                try? await Task.sleep(nanoseconds: 80_000_000)
+            }
+        }
+    }
+
+    /// The WebRTC `audioLevel` stat is normalized 0–1 per spec; guard against a raw 0–32768 variant too.
+    private nonisolated static func readInboundAudioLevel(_ peer: RTCPeerConnection) async -> Double {
+        await withCheckedContinuation { continuation in
+            peer.statistics { report in
+                var level = 0.0
+                for stat in report.statistics.values where stat.type == "inbound-rtp" {
+                    guard let raw = (stat.values["audioLevel"] as? NSNumber)?.doubleValue else { continue }
+                    level = max(level, raw > 1 ? raw / 32768.0 : raw)
+                }
+                continuation.resume(returning: min(1, max(0, level)))
+            }
+        }
     }
 
     private func releaseAudioSessionActivation() {
@@ -362,15 +423,17 @@ final class TalkRealtimeWebRTCSession: NSObject {
                 self.trace("server speech/transcript first delta")
             }
             if let text = event.delta ?? event.transcript {
-                self.delegate?.realtimeSession(self, didReceiveUserTranscript: text)
+                self.delegate?.realtimeSession(self, didReceiveUserTranscript: text, isFinal: false)
             }
         case "conversation.input_transcript.done",
              "conversation.item.input_audio_transcription.completed":
             if let text = event.transcript ?? event.text {
-                self.delegate?.realtimeSession(self, didReceiveUserTranscript: text)
+                self.delegate?.realtimeSession(self, didReceiveUserTranscript: text, isFinal: true)
             }
+        // Only the spoken-audio transcript drives the assistant bubble. `response.output_text.delta` is a
+        // SEPARATE text stream that carries the same words — consuming both interleaves them into garbled,
+        // doubled text. For S2S the audio transcript is what's actually said, so that's the single source.
         case "conversation.output_transcript.delta",
-             "response.output_text.delta",
              "response.audio_transcript.delta",
              "response.output_audio_transcript.delta":
             if !self.loggedFirstAssistantSignal {
@@ -378,14 +441,13 @@ final class TalkRealtimeWebRTCSession: NSObject {
                 self.trace("assistant first output signal type=\(event.type)")
             }
             if let text = event.delta ?? event.transcript ?? event.text {
-                self.delegate?.realtimeSession(self, didReceiveAssistantTranscript: text)
+                self.delegate?.realtimeSession(self, didReceiveAssistantTranscript: text, isFinal: false)
             }
         case "conversation.output_transcript.done",
-             "response.output_text.done",
              "response.audio_transcript.done",
              "response.output_audio_transcript.done":
             if let text = event.transcript ?? event.text {
-                self.delegate?.realtimeSession(self, didReceiveAssistantTranscript: text)
+                self.delegate?.realtimeSession(self, didReceiveAssistantTranscript: text, isFinal: true)
             }
         case "response.function_call_arguments.delta":
             self.bufferToolDelta(event)
@@ -918,6 +980,24 @@ final class TalkRealtimeWebRTCSession: NSObject {
         return String(data: data, encoding: .utf8)
     }
 
+    /// Tune input turn-detection + noise reduction once the data channel opens. Sent as a `session.update`;
+    /// unspecified `turn_detection` subfields (create/interrupt response) keep their server defaults, so only
+    /// sensitivity changes — barge-in behavior is unchanged.
+    private func sendInputAudioTuning() {
+        self.sendRealtimeEvent([
+            "type": "session.update",
+            "session": [
+                "turn_detection": [
+                    "type": "server_vad",
+                    "threshold": Self.vadThreshold,
+                    "prefix_padding_ms": Self.vadPrefixPaddingMs,
+                    "silence_duration_ms": Self.vadSilenceDurationMs,
+                ],
+                "input_audio_noise_reduction": ["type": "near_field"],
+            ],
+        ])
+    }
+
     private func sendRealtimeEvent(_ event: [String: Any]) {
         guard
             let channel = dataChannel,
@@ -979,6 +1059,7 @@ extension TalkRealtimeWebRTCSession: RTCPeerConnectionDelegate {
                 if !self.assistantAudioActive {
                     self.delegate?.realtimeSession(self, didChangeStatus: "Listening")
                 }
+                self.startAssistantLevelPolling()
             case .disconnected:
                 self.delegate?.realtimeSession(self, didChangeStatus: "Reconnecting")
             case .failed, .closed:
@@ -1007,6 +1088,7 @@ extension TalkRealtimeWebRTCSession: RTCDataChannelDelegate {
             guard !self.stopped else { return }
             switch dataChannel.readyState {
             case .open:
+                self.sendInputAudioTuning()
                 if !self.assistantAudioActive {
                     self.delegate?.realtimeSession(self, didChangeStatus: "Listening")
                 }

@@ -22,7 +22,6 @@ struct ChatProTab: View {
     @State private var viewModelPresentationAgentBadge = "M"
     @State private var viewModelHasVerifiedOfflineRoutingIdentity = false
     @State private var speech: OpenClawChatSpeechController?
-    @State private var showsTalkMode = false
     // One-shot guard for clearing an offline outbox the gateway can never replay (see recovery below).
     @State private var didRecoverUndeliverableOutbox = false
     let headerLeadingAction: OpenClawSidebarHeaderAction?
@@ -123,37 +122,39 @@ struct ChatProTab: View {
         Task { await self.appModel.purgeChatTranscriptCache(gatewayID: gatewayID) }
     }
 
+    /// Start/stop a voice session in place (the frames render over the chat via `TalkVoiceOverlay`), reusing
+    /// the same `setTalkEnabled` path the old Talk cover used — so realtime keeps working. Stopping releases
+    /// the mic (restoring Core Haptics). Voice config lives in Settings → Voice.
+    private func toggleVoiceSession() {
+        if self.appModel.talkMode.isEnabled {
+            self.appModel.setTalkEnabled(false)
+            return
+        }
+        guard !self.appModel.isAppleReviewDemoModeEnabled else { return }
+        let appModel = self.appModel
+        appModel.talkMode.resetVoiceTranscript()
+        appModel.talkMode.updateMainSessionKey(appModel.chatSessionKey)
+        // Mute the realtime mic for the entry chime: it plays through a separate player that WebRTC's echo
+        // cancellation doesn't cover, so otherwise it bleeds into the mic and OpenAI transcribes it as fake
+        // user turns. The chime's post-sound haptic and the unmute fire together when it ends.
+        appModel.talkMode.beginEntryChimeMicSuppression()
+        VoiceEarconPlayer.shared.playEntry { appModel.talkMode.endEntryChimeMicSuppression() }
+        appModel.setTalkEnabled(true)
+    }
+
     private var content: some View {
         Group {
             if let viewModel {
                 ChatRootSurface(
                     viewModel: viewModel,
                     onOpenSettings: { self.openSettings?() },
-                    onOpenTalk: { self.showsTalkMode = true },
+                    onOpenTalk: { self.toggleVoiceSession() },
                     onOpenDrawer: { self.onOpenDrawer?() })
             } else {
                 Color.clear
             }
         }
         .toolbar(.hidden, for: .navigationBar)
-        .fullScreenCover(isPresented: self.$showsTalkMode) {
-            ZStack(alignment: .topLeading) {
-                TalkProTab(
-                    ownsNavigationStack: true,
-                    openSettings: {},
-                    openVoiceSettings: {})
-                Button {
-                    self.showsTalkMode = false
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(Color.primary)
-                        .frame(width: 40, height: 40)
-                        .background { Circle().fill(.regularMaterial) }
-                }
-                .padding(.leading, 14)
-            }
-        }
     }
 
     @ViewBuilder
