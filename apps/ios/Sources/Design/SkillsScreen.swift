@@ -377,7 +377,9 @@ struct SkillPanelSheet: View {
                     Text(self.skill.name)
                         .font(.system(size: 24, weight: .medium))
                         .foregroundStyle(Color.primary)
-                        .padding(.top, 32)
+                        // Icon sits lower now (via the content top padding) so it no longer hugs the close
+                        // button; title/description stay a tight pair.
+                        .padding(.top, 24)
 
                     Text(self.skill.descriptionText)
                         .font(.system(size: 16))
@@ -406,10 +408,10 @@ struct SkillPanelSheet: View {
 
                     Spacer(minLength: 40)
                 }
-                // Spec: content column inset 24pt; icon tile sits 87pt from the sheet top, i.e. 25pt
-                // below the 62pt-tall header reserved by the top inset below.
+                // Content column inset 24pt. The top gap below the 62pt header is tuned so the icon→title
+                // spacing (24pt) is roughly mirrored above the icon, instead of it hugging the close button.
                 .padding(.horizontal, 24)
-                .padding(.top, 25)
+                .padding(.top, 36)
             }
         }
         // A top inset (not an overlay) so the header reserves its own height and the scroll content

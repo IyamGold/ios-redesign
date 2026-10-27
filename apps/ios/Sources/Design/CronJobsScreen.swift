@@ -24,6 +24,10 @@ struct CronJobsScreen: View {
     let onClose: () -> Void
     let onRun: (CronJobRow) async -> Void
     let onToggleEnabled: (CronJobRow) async -> Void
+    /// Transient confirmation/error after a Run/Disable tap — the gateway mutation is otherwise silent, so
+    /// without this a successful Run (which doesn't change the list) and a failed action look identical.
+    let statusMessage: String?
+    let statusIsError: Bool
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var filter: CronFilter = .active
@@ -80,6 +84,15 @@ struct CronJobsScreen: View {
                 .padding(.bottom, 40)
             }
         }
+        .overlay(alignment: .bottom) {
+            if let statusMessage {
+                self.statusToast(statusMessage)
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 24)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: self.statusMessage)
         .safeAreaInset(edge: .top, spacing: 0) {
             ZStack {
                 Text("Cron Jobs")
@@ -130,6 +143,29 @@ struct CronJobsScreen: View {
                         : Color(red: 245 / 255, green: 244 / 255, blue: 250 / 255).opacity(0.2))
             }
             .shadow(color: .black.opacity(0.15), radius: 25, x: 0, y: 0)
+    }
+
+    /// Brief feedback banner for a Run/Disable action (green confirmation or red error).
+    private func statusToast(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: self.statusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                .font(.system(size: 14, weight: .semibold))
+            Text(message)
+                .font(OpenClawType.callout)
+                .lineLimit(2)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(self.statusIsError
+                    ? Color(red: 197 / 255, green: 62 / 255, blue: 56 / 255)
+                    : Color(red: 52 / 255, green: 160 / 255, blue: 89 / 255))
+        }
+        .shadow(color: .black.opacity(0.2), radius: 20, x: 0, y: 6)
     }
 
     private func jobCard(_ job: CronJobRow) -> some View {
@@ -273,6 +309,13 @@ struct CronJobsScreenHost: View {
 
     @Environment(NodeAppModel.self) private var appModel
     @State private var jobs: [CronJob] = []
+    @State private var status: ActionStatus?
+    @State private var statusClearTask: Task<Void, Never>?
+
+    private struct ActionStatus: Equatable {
+        let text: String
+        let isError: Bool
+    }
 
     var body: some View {
         CronJobsScreen(
@@ -280,7 +323,9 @@ struct CronJobsScreenHost: View {
             showsActions: self.appModel.gatewayServerName != nil,
             onClose: self.onClose,
             onRun: { row in await self.run(row) },
-            onToggleEnabled: { row in await self.toggle(row) })
+            onToggleEnabled: { row in await self.toggle(row) },
+            statusMessage: self.status?.text,
+            statusIsError: self.status?.isError ?? false)
             .task { await self.load() }
     }
 
@@ -299,9 +344,15 @@ struct CronJobsScreenHost: View {
         guard let job = self.jobs.first(where: { $0.id == row.id }),
               let json = Self.encode(CronRunParams(id: job.id, mode: "force"))
         else { return }
-        _ = try? await self.appModel.operatorSession.request(
-            method: "cron.run", paramsJSON: json, timeoutSeconds: 20)
-        await self.load()
+        do {
+            _ = try await self.appModel.operatorSession.request(
+                method: "cron.run", paramsJSON: json, timeoutSeconds: 20)
+            await self.load()
+            // A forced run doesn't change the list, so confirm explicitly or it reads as a dead button.
+            self.showStatus("Queued \(row.title).", isError: false)
+        } catch {
+            self.showStatus("Couldn't run \(row.title): \(error.localizedDescription)", isError: true)
+        }
     }
 
     private func toggle(_ row: CronJobRow) async {
@@ -309,9 +360,27 @@ struct CronJobsScreenHost: View {
               let json = Self.encode(
                   CronUpdateParams(id: job.id, patch: CronUpdatePatch(enabled: !job.enabled)))
         else { return }
-        _ = try? await self.appModel.operatorSession.request(
-            method: "cron.update", paramsJSON: json, timeoutSeconds: 20)
-        await self.load()
+        let enabling = !job.enabled
+        do {
+            _ = try await self.appModel.operatorSession.request(
+                method: "cron.update", paramsJSON: json, timeoutSeconds: 20)
+            await self.load()
+            self.showStatus(enabling ? "Enabled \(row.title)." : "Disabled \(row.title).", isError: false)
+        } catch {
+            let verb = enabling ? "enable" : "disable"
+            self.showStatus("Couldn't \(verb) \(row.title): \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    /// Show a transient banner, auto-clearing after a few seconds.
+    private func showStatus(_ text: String, isError: Bool) {
+        self.status = ActionStatus(text: text, isError: isError)
+        self.statusClearTask?.cancel()
+        self.statusClearTask = Task {
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            guard !Task.isCancelled else { return }
+            self.status = nil
+        }
     }
 
     private static func encode(_ value: some Encodable) -> String? {

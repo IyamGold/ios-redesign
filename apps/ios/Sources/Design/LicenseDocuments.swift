@@ -78,7 +78,6 @@ struct LicensesScreen: View {
     let onBack: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.displayScale) private var displayScale
 
     private var documents: [LicenseDocument] {
         LicenseDocumentLoader.bundledDocuments()
@@ -107,16 +106,18 @@ struct LicensesScreen: View {
     }
 
     private var card: some View {
+        // Same grouped-list treatment as the rest of Settings: 17pt-spaced rows split by the shared
+        // background-toned `OpenClawRowDivider` (a subtle groove), not a visible hairline. Horizontal insets
+        // live on the rows so the divider spans the card edge-to-edge.
         VStack(spacing: 17) {
             ForEach(Array(self.documents.enumerated()), id: \.element.id) { index, document in
                 self.row(document)
                 if index < self.documents.count - 1 {
-                    self.divider
+                    OpenClawRowDivider()
                 }
             }
         }
-        .padding(.vertical, 14)
-        .padding(.horizontal, 15)
+        .padding(.vertical, 12)
         .openClawSectionBackground(self.cardFill)
         .padding(.horizontal, 24)
         .padding(.top, 4)
@@ -139,17 +140,12 @@ struct LicensesScreen: View {
                     .frame(width: 20, height: 20)
                     .foregroundStyle(Color.primary)
             }
+            // Leading 17 matches the Settings row inset; trailing 12 balances the chevron.
+            .padding(.leading, 17)
+            .padding(.trailing, 12)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-    }
-
-    /// 0.3 crisp single-pixel hairline centered between 17pt-spaced rows (shared Settings token).
-    private var divider: some View {
-        Rectangle()
-            .fill(Color.primary.opacity(0.3))
-            .frame(maxWidth: .infinity)
-            .frame(height: 1 / self.displayScale)
     }
 
     private var cardFill: Color {
