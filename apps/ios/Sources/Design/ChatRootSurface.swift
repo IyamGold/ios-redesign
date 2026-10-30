@@ -1,5 +1,7 @@
 import OpenClawChatUI
+import OpenClawProtocol
 import PhotosUI
+import QuickLook
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -50,6 +52,8 @@ struct ChatRootSurface: View {
     /// Steps shown in the "Worked through N steps" detail sheet (nil = closed). A sheet keeps long runs
     /// from widening the transcript, which inline expansion did past ~3 steps.
     @State private var stepsSheet: ChatStepsPayload?
+    /// Local temp URL of an agent `MEDIA:` file being previewed in QuickLook (nil = none open).
+    @State private var filePreviewURL: URL?
 
     /// Answer rows already present, so a freshly-finalized reply can be told apart from history on load.
     @State private var knownAnswerIDs: Set<String> = []
@@ -211,6 +215,8 @@ struct ChatRootSurface: View {
                 onClose: { self.openEmbed = nil })
                 .presentationCornerRadius(47)
         }
+        // QuickLook preview for a tapped agent `MEDIA:` file (fetched from the workspace on tap).
+        .quickLookPreview(self.$filePreviewURL)
         // "Worked through N steps" → a custom bottom-sheet overlay, NOT a system `.sheet`. iOS 26 renders
         // every sheet sizing (.form/.page/.fitted) as a horizontally-inset floating card with no public
         // API to pin it flush to the screen edges. Owning the card gives a true edge-to-edge, bottom-flush
@@ -498,6 +504,8 @@ struct ChatRootSurface: View {
                 })
         } else if let embed = row.canvasEmbed {
             CanvasEmbedCard(embed: embed, onOpen: { self.openEmbed = embed })
+        } else if let fileEmbed = row.fileEmbed {
+            FileEmbedCard(embed: fileEmbed, onOpen: { self.openFileEmbed(fileEmbed) })
         } else if row.isUser {
             ChatUserBubble(row: row, colorScheme: self.colorScheme)
         } else {
@@ -648,16 +656,23 @@ struct ChatRootSurface: View {
             }
             // Extract [embed] canvas shortcodes from assistant turns; they render as cards, not raw text.
             var embeds: [CanvasEmbed] = []
+            // Agent files arrive as documented `MEDIA:<path>` directives (gateway src/media/parse.ts);
+            // render them as file cards and strip the lines from the visible bubble, like [embed].
+            var fileEmbeds: [FileEmbed] = []
             if role == "assistant" {
                 let parsed = CanvasEmbedParser.parse(messageID: message.id.uuidString, text: text)
                 text = parsed.text
                 embeds = parsed.embeds
+                let parsedFiles = FileEmbedParser.parse(messageID: message.id.uuidString, text: text)
+                text = parsedFiles.text
+                fileEmbeds = parsedFiles.embeds
             }
             let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            guard hasText || !images.isEmpty || !chips.isEmpty || !embeds.isEmpty else { continue }
+            guard hasText || !images.isEmpty || !chips.isEmpty || !embeds.isEmpty || !fileEmbeds.isEmpty
+            else { continue }
             let isUser = role == "user"
             // A pure-text tool-use preamble collapses into the progress trail rather than its own row.
-            if !isUser, hasText, images.isEmpty, chips.isEmpty, embeds.isEmpty,
+            if !isUser, hasText, images.isEmpty, chips.isEmpty, embeds.isEmpty, fileEmbeds.isEmpty,
                Self.isToolUseTurn(message)
             {
                 pendingProgress.append(text)
@@ -673,6 +688,10 @@ struct ChatRootSurface: View {
             // detached row beneath the text + timestamp.
             for embed in embeds {
                 result.append(ChatDisplayRow(canvasEmbed: embed, timestamp: message.timestamp))
+            }
+            // File cards also render above the reply text, grouped with the answer like canvas cards.
+            for fileEmbed in fileEmbeds {
+                result.append(ChatDisplayRow(fileEmbed: fileEmbed, timestamp: message.timestamp))
             }
             if hasText || !images.isEmpty || !chips.isEmpty {
                 result.append(ChatDisplayRow(
@@ -849,6 +868,48 @@ struct ChatRootSurface: View {
         guard let raw = block.content?.value as? String else { return nil }
         let base64 = raw.firstIndex(of: ",").map { String(raw[raw.index(after: $0)...]) } ?? raw
         return Data(base64Encoded: base64)
+    }
+
+    /// Fetch an agent `MEDIA:` file from the workspace and present it in QuickLook. Reuses the Files
+    /// screen's `agents.workspace.get` + temp-file-with-real-name trick so QuickLook picks the renderer
+    /// from the extension.
+    private func openFileEmbed(_ embed: FileEmbed) {
+        OpenClawHaptics.tap()
+        let selected = self.appModel.selectedAgentId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let agentId = (selected?.isEmpty == false) ? selected! : "main"
+        Task {
+            let params = AgentsWorkspaceGetParams(agentid: agentId, path: embed.workspacePath)
+            guard let paramsJSON = try? AgentWorkspaceDirectoryList.encodeParams(params) else { return }
+            do {
+                let data = try await self.appModel.operatorSession.request(
+                    method: "agents.workspace.get",
+                    paramsJSON: paramsJSON,
+                    timeoutSeconds: 20)
+                let file = try JSONDecoder().decode(AgentsWorkspaceGetResult.self, from: data).file
+                let url = try Self.writeWorkspaceTempFile(file)
+                await MainActor.run { self.filePreviewURL = url }
+            } catch {
+                GatewayDiagnostics.log("chat file embed open failed path=\(embed.workspacePath): \(error)")
+            }
+        }
+    }
+
+    /// Writes fetched bytes to a uniquely-nested temp file that keeps the real filename (QuickLook renderer
+    /// selection is extension-driven). Mirrors `FilesGridScreen.writeTempFile`.
+    private static func writeWorkspaceTempFile(_ file: AgentsWorkspaceFile) throws -> URL {
+        let safeName = (file.name as NSString).lastPathComponent
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenClawChatFiles", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let fileURL = directory.appendingPathComponent(
+            safeName.isEmpty ? "file" : safeName, isDirectory: false)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if (file.encoding.value as? String) == "base64", let bytes = Data(base64Encoded: file.content) {
+            try bytes.write(to: fileURL, options: .atomic)
+        } else {
+            try file.content.write(to: fileURL, atomically: true, encoding: .utf8)
+        }
+        return fileURL
     }
 
     /// Stable per-turn key for the image cache. Prefers the idempotency key, which the gateway persists
@@ -1678,6 +1739,9 @@ private struct ChatDisplayRow: Identifiable, Equatable {
     let chips: [ChatAttachmentChip]
     /// Set for a `[embed]` canvas card projected from an assistant message; nil otherwise.
     let canvasEmbed: CanvasEmbed?
+    /// Set for an agent `MEDIA:` file card projected from an assistant message; nil otherwise.
+    /// Defaulted so the other inits don't each need to set it (mutually exclusive with canvasEmbed).
+    var fileEmbed: FileEmbed?
     /// Non-empty for a collapsed tool-use "steps" trail; each entry is one turn's preamble line.
     let progressLines: [String]
     /// The turn's persisted reasoning, shown as the nested "Thought" group in the steps sheet; nil when the
@@ -1767,6 +1831,22 @@ private struct ChatDisplayRow: Identifiable, Equatable {
         self.images = []
         self.chips = []
         self.canvasEmbed = canvasEmbed
+        self.progressLines = []
+        self.reasoningText = nil
+        self.daySeparator = nil
+    }
+
+    init(fileEmbed: FileEmbed, timestamp: Double?) {
+        self.id = fileEmbed.id
+        self.isUser = false
+        self.text = ""
+        self.timestamp = timestamp
+        self.isError = false
+        self.isStreaming = false
+        self.images = []
+        self.chips = []
+        self.canvasEmbed = nil
+        self.fileEmbed = fileEmbed
         self.progressLines = []
         self.reasoningText = nil
         self.daySeparator = nil
